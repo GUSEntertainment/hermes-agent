@@ -736,6 +736,30 @@ class TestAuthFailureAborts:
         assert c._last_compress_aborted is False
         assert len(result) < len(msgs)  # middle window dropped
 
+    def test_summary_failure_circuit_breaker_opens_after_repeated_failures(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        c.threshold_tokens = 10
+
+        for i in range(3):
+            c._record_compression_failure_cooldown(0.01, f"boom {i}")
+
+        assert c._summary_failure_count == 3
+        assert c._summary_failure_breaker_until > time.monotonic()
+        assert c.should_compress(999999) is False
+
+    def test_success_clears_summary_failure_circuit_breaker(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        c._record_compression_failure_cooldown(0.01, "boom")
+        c._record_compression_failure_cooldown(0.01, "boom")
+        assert c._summary_failure_count == 2
+
+        c._clear_compression_failure_cooldown()
+
+        assert c._summary_failure_count == 0
+        assert c._summary_failure_breaker_until == 0.0
+
     def test_generate_summary_flags_network_failure(self):
         """A connection/network error on the summary call flags
         _last_summary_network_failure (#29559)."""

@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 from pathlib import Path
 
 
@@ -23,6 +24,7 @@ class DisconnectedAdapters(dict):
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
+    monkeypatch.setenv("AGENT_OS_DESK_DIR", tempfile.mkdtemp(prefix="hermes-desk-test-"))
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay):
@@ -69,6 +71,18 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def _report_back_events(tid):
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind LIKE 'report_back_%' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        return [(row["kind"], row["payload"] or "") for row in rows]
+    finally:
+        conn.close()
+
+
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
     db_path = tmp_path / "shared-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -84,8 +98,66 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert "Kanban" in adapter.sent[0]["text"]
+    assert "Hey Chris" in adapter.sent[0]["text"]
+    assert f"Ref:" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_uses_human_cockpit_owner_not_backend_tag(tmp_path, monkeypatch):
+    db_path = tmp_path / "human-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    body = '''Do the delegated assistant follow-up.
+
+## Routing metadata
+
+```json
+{"owner_name": "Lauren", "executable_assignee": "assistantops"}
+```
+'''
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="assistant follow-up", body=body, assignee="assistantops")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    source_sends = [sent for sent in adapter.sent if sent["chat_id"] == "chat-1"]
+    assert len(source_sends) == 1
+    text = source_sends[0]["text"]
+    assert "Lauren finished this" in text
+    assert "@assistantops" not in text
+    assert "assistantops" not in text
+
+
+def test_kanban_notifier_maps_legacy_backend_profiles_to_visible_names(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-profile-map.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="engineering fix", assignee="builder")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    text = adapter.sent[0]["text"]
+    assert "Scarlett finished this" in text
+    assert "@builder" not in text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
@@ -171,6 +243,9 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+    report_back_events = _report_back_events(tid)
+    assert any(kind == "report_back_desk_updated" for kind, _payload in report_back_events)
+    assert any("canonical_before_telegram" in payload for _kind, payload in report_back_events)
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):

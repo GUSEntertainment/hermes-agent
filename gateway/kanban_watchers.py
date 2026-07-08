@@ -11,8 +11,10 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +25,132 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+_ROUTING_METADATA_RE = re.compile(
+    r"## Routing metadata\s*```json\s*(\{.*?\})\s*```",
+    re.DOTALL,
+)
+
+_PROFILE_DISPLAY_NAMES = {
+    "assistantops": "Lauren",
+    "lauren": "Lauren",
+    "builder": "Scarlett",
+    "scarlett": "Scarlett",
+    "codex-lane": "Scarlett",
+    "codex_lane": "Scarlett",
+    "research": "Riley",
+    "riley": "Riley",
+    "opslane": "Claire",
+    "claire": "Claire",
+    "qa": "Grace",
+    "monitor": "Ingrid",
+    "content-media": "Marion",
+    "content_media": "Marion",
+}
+
+
+def _task_routing_metadata(task: Any) -> dict[str, Any]:
+    """Extract safe cockpit routing metadata embedded in a Kanban task body."""
+    body = getattr(task, "body", None) if task is not None else None
+    if not isinstance(body, str) or "## Routing metadata" not in body:
+        return {}
+    match = _ROUTING_METADATA_RE.search(body)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(1))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _kanban_assignee_display_name(task: Any) -> str:
+    """Return a human-facing worker name, never a backend lane tag."""
+    meta = _task_routing_metadata(task)
+    for key in ("owner_name", "department_name"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().split("·", 1)[0].split("/", 1)[0].strip()
+    raw = (getattr(task, "assignee", "") or "").strip()
+    if not raw:
+        return ""
+    mapped = _PROFILE_DISPLAY_NAMES.get(raw.lower())
+    if mapped:
+        return mapped
+    return raw.replace("-", " ").replace("_", " ").title()
+
+
+_SENSITIVE_DEPARTMENT_PRIVACY_TIERS = {
+    "finance",
+    "legal",
+    "personnel",
+    "hiring",
+    "people",
+    "credentials",
+    "creator_only",
+    "creator-only",
+    "personal",
+    "family",
+    "restricted",
+    "sensitive",
+    "confidential",
+    "private",
+}
+
+
+def _department_report_event_key(event: Any) -> tuple[Any, str]:
+    return (getattr(event, "id", None), getattr(event, "kind", ""))
+
+
+def _format_department_report_back(decision: Any, task: Any, event: Any, board_slug: Optional[str]) -> str:
+    """Human-facing department-topic mirror message.
+
+    Telegram still shows the bot account as the transport sender, so the copy
+    leads with the department owner and a human update instead of backend task
+    names/card IDs.
+    """
+    destination = getattr(decision, "telegram_destination", {}) or {}
+    label = str(destination.get("topic_label") or getattr(decision, "department_id", "department")).strip()
+    owner = str(getattr(decision, "department_owner", "Margot") or "Margot").strip()
+    kind = str(getattr(decision, "event_kind", getattr(event, "kind", "status")) or "status")
+    summary = str(getattr(decision, "redacted_summary", "") or "").strip()
+    desk = str(getattr(decision, "desk_artifact_id", "") or "").strip()
+    ref = f"Ref: {board_slug}/{getattr(decision, 'task_id', '')}" if board_slug else f"Ref: {getattr(decision, 'task_id', '')}"
+    if kind == "completed":
+        lines = [
+            f"{owner} / {label}",
+            f"Hey Chris — I finished this and put the review trail in Desk.",
+        ]
+        if summary:
+            lines.append(summary[:700])
+        if desk:
+            lines.append(f"Desk: {desk}")
+        lines.append("I’ll monitor the next step and bring anything important back here.")
+        lines.append(ref)
+        return "\n".join(lines)
+    if kind == "blocked":
+        lines = [f"{owner} / {label}", "Hey Chris — I’m blocked and need a decision before I can move this forward."]
+        if summary:
+            lines.append(summary[:700])
+        if desk:
+            lines.append(f"Desk: {desk}")
+        lines.append(ref)
+        return "\n".join(lines)
+    if kind == "needs_approval":
+        lines = [f"{owner} / {label}", "Hey Chris — this is ready for your approval in Desk."]
+        if summary:
+            lines.append(summary[:700])
+        if desk:
+            lines.append(f"Desk: {desk}")
+        lines.append(ref)
+        return "\n".join(lines)
+    return "\n".join([f"{owner} / {label}", summary or "Status updated in Desk.", ref])
+
+
+def _department_artifacts_allowed(decision: Any) -> bool:
+    tier = str(getattr(decision, "privacy_tier", "normal") or "normal").strip().lower()
+    return tier not in _SENSITIVE_DEPARTMENT_PRIVACY_TIERS
 
 
 def _resolve_auto_decompose_settings(
@@ -279,6 +407,28 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                # Desk-first department report-back audit. This
+                                # happens before any Telegram send below, so the
+                                # app/Desk has the canonical update even if the
+                                # department mirror send fails later.
+                                report_back_decisions: dict[tuple[Any, str], Any] = {}
+                                try:
+                                    from gateway.kanban_report_back import record_report_back_dry_run
+                                    for ev in events:
+                                        decision = record_report_back_dry_run(
+                                            conn,
+                                            task=task,
+                                            event=ev,
+                                            board=slug,
+                                            dry_run=False,
+                                        )
+                                        if decision is not None:
+                                            report_back_decisions[_department_report_event_key(ev)] = decision
+                                except Exception as rb_exc:
+                                    logger.warning(
+                                        "kanban report-back audit failed for %s on board %s: %s",
+                                        sub["task_id"], slug, rb_exc,
+                                    )
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -290,6 +440,7 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "report_back_decisions": report_back_decisions,
                                 })
                         finally:
                             conn.close()
@@ -300,6 +451,7 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    report_back_decisions = d.get("report_back_decisions") or {}
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -339,10 +491,13 @@ class GatewayKanbanWatchersMixin:
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
+                        # human-facing worker that did the work. Cockpit cards
+                        # keep backend lane/profile names in assignee, but
+                        # Chris-facing follow-ups should say "Lauren" /
+                        # "Scarlett" instead of exposing @assistantops,
+                        # @engineering, builder, codex-lane, etc.
+                        who = _kanban_assignee_display_name(task)
+                        tag = f"{who}: " if who else ""
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -355,21 +510,29 @@ class GatewayKanbanWatchersMixin:
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
+                                handoff = lines[0][:260] if lines else payload_summary[:260]
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
+                                handoff = lines[0][:220] if lines else task.result[:220]
+                            msg_lines = [
+                                f"Hey Chris — {who or 'Margot'} finished this.",
+                            ]
+                            if handoff:
+                                msg_lines.append(handoff)
+                            msg_lines.append("I’ll keep an eye on the follow-up and bring anything important back here.")
+                            msg_lines.append(f"Ref: {board_slug or 'kanban'}/{sub['task_id']}")
+                            msg = "\n".join(msg_lines)
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason = str(ev.payload['reason'])[:220]
+                            msg_lines = [
+                                f"Hey Chris — {who or 'Margot'} is blocked and needs a decision before moving forward.",
+                            ]
+                            if reason:
+                                msg_lines.append(reason)
+                            msg_lines.append(f"Ref: {board_slug or 'kanban'}/{sub['task_id']}")
+                            msg = "\n".join(msg_lines)
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -442,6 +605,49 @@ class GatewayKanbanWatchersMixin:
                                     logger.debug(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
+                                    )
+                            decision = report_back_decisions.get(_department_report_event_key(ev))
+                            if decision is not None and getattr(decision, "telegram_allowed", False):
+                                try:
+                                    department_adapter = self._authorization_adapter(_Platform.TELEGRAM, None)
+                                    destination = getattr(decision, "telegram_destination", {}) or {}
+                                    department_chat_id = str(destination.get("chat_id") or "").strip()
+                                    department_topic_id = destination.get("topic_id")
+                                    if department_adapter is None or not department_chat_id or department_topic_id is None:
+                                        logger.debug(
+                                            "kanban report-back: no Telegram adapter/destination for %s",
+                                            sub["task_id"],
+                                        )
+                                    else:
+                                        department_metadata = {"thread_id": str(department_topic_id)}
+                                        await department_adapter.send(
+                                            department_chat_id,
+                                            _format_department_report_back(decision, task, ev, board_slug),
+                                            metadata=department_metadata,
+                                        )
+                                        logger.debug(
+                                            "kanban report-back: mirrored %s for %s to Telegram topic %s/%s",
+                                            kind,
+                                            sub["task_id"],
+                                            department_chat_id,
+                                            department_topic_id,
+                                        )
+                                        if kind == "completed" and _department_artifacts_allowed(decision):
+                                            await self._deliver_kanban_artifacts(
+                                                adapter=department_adapter,
+                                                chat_id=department_chat_id,
+                                                metadata=department_metadata,
+                                                event_payload=getattr(ev, "payload", None),
+                                                task=task,
+                                            )
+                                except Exception as dept_exc:
+                                    # Department mirrors are best-effort: never
+                                    # rewind the user's source subscription just
+                                    # because the secondary Telegram thread is
+                                    # temporarily unavailable or was deleted.
+                                    logger.warning(
+                                        "kanban report-back: department mirror failed for %s on board %s: %s",
+                                        sub["task_id"], board_slug, dept_exc,
                                     )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)

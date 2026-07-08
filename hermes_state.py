@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -166,14 +167,59 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_FTS_BASE_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+
+_FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+_FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
+
+
+def _parse_boolish(value: Any, default: bool = True) -> bool:
+    """Parse bool-like config/env values without importing config helpers."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _trigram_search_enabled() -> bool:
+    """Return whether the optional trigram FTS index should be maintained.
+
+    The regular unicode61 FTS table is enough for ordinary recall. The trigram
+    table exists for CJK/Thai substring search, but it can be several GB on
+    heavy gateway/cron profiles because inline FTS5 stores a shadow content copy
+    plus a dense overlapping-token index. Keep the historical default enabled
+    unless config explicitly opts out, so existing installs do not silently lose
+    CJK substring search during upgrade.
+    """
+    if os.getenv("HERMES_DISABLE_FTS_TRIGRAM") is not None:
+        return not _parse_boolish(os.getenv("HERMES_DISABLE_FTS_TRIGRAM"), default=False)
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        sessions_cfg = cfg.get("sessions") or {}
+        if isinstance(sessions_cfg, dict) and "enable_trigram_search" in sessions_cfg:
+            return _parse_boolish(sessions_cfg.get("enable_trigram_search"), default=True)
+    except Exception:
+        pass
+    return True
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1057,12 +1103,23 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _drop_fts_trigram_triggers(cursor: sqlite3.Cursor) -> None:
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+
+    @staticmethod
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        triggers: Tuple[str, ...] = _FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in triggers)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            triggers,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1382,6 +1439,7 @@ class SessionDB:
         cursor.executescript(DEFERRED_INDEX_SQL)
 
         fts5_available = self._sqlite_supports_fts5(cursor)
+        trigram_config_enabled = _trigram_search_enabled()
         fts_migrations_complete = True
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
@@ -1417,7 +1475,7 @@ class SessionDB:
                 # v11+ code drops and rebuilds both FTS tables below, so doing
                 # the v10-only trigram backfill first only burns startup time
                 # and WAL space before v11 throws the work away.
-                if fts5_available:
+                if fts5_available and trigram_config_enabled:
                     _fts_trigram_exists = self._fts_table_probe(
                         cursor, "messages_fts_trigram"
                     )
@@ -1433,7 +1491,7 @@ class SessionDB:
                             fts_migrations_complete = False
                     elif _fts_trigram_exists is None:
                         fts_migrations_complete = False
-                else:
+                elif not fts5_available:
                     fts_migrations_complete = False
             if current_version < 11:
                 # v11: re-index FTS5 tables to cover tool_name + tool_calls and
@@ -1475,9 +1533,11 @@ class SessionDB:
                                 "COALESCE(tool_calls, '') "
                                 "FROM messages"
                             )
-                        trigram_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        )
+                        trigram_ok = False
+                        if trigram_config_enabled:
+                            trigram_ok = self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
                         if trigram_ok:
                             cursor.execute(
                                 "INSERT INTO messages_fts_trigram(rowid, content) "
@@ -1565,13 +1625,19 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            expected_triggers = (
+                _FTS_TRIGGERS if trigram_config_enabled else _FTS_BASE_TRIGGERS
+            )
+            triggers_need_repair = (
+                self._fts_trigger_count(cursor, expected_triggers)
+                < len(expected_triggers)
+            )
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
             # back to LIKE.
-            if self._fts_enabled:
+            if self._fts_enabled and trigram_config_enabled:
                 trigram_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                 )
@@ -1581,6 +1647,30 @@ class SessionDB:
                         cursor,
                         include_trigram=trigram_enabled,
                     )
+            else:
+                self._trigram_available = False
+                # If trigram has been disabled after being created, stop future
+                # writes from repopulating it.  The virtual table itself is
+                # intentionally not dropped during schema init because doing so
+                # can unexpectedly block startup on a multi-GB DB; the explicit
+                # maintenance path can drop + VACUUM when the operator chooses.
+                self._drop_fts_trigram_triggers(cursor)
+                # A stray *empty* trigram table (left by a process whose config
+                # lacked the flag, e.g. a worker profile) is dropped eagerly:
+                # dropping an empty FTS5 table is instant, so the multi-GB
+                # startup concern above does not apply.
+                try:
+                    row = cursor.execute(
+                        "SELECT COUNT(*) FROM messages_fts_trigram"
+                    ).fetchone()
+                    if row and row[0] == 0:
+                        cursor.execute(
+                            "DROP TABLE IF EXISTS messages_fts_trigram"
+                        )
+                except sqlite3.OperationalError:
+                    pass  # table absent or tokenizer unavailable — nothing to heal
+                if self._fts_enabled and triggers_need_repair:
+                    self._rebuild_fts_indexes(cursor, include_trigram=False)
 
         self._conn.commit()
 
@@ -2324,6 +2414,29 @@ class SessionDB:
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def clear_expired_compression_locks(self, now: Optional[float] = None) -> int:
+        """Delete expired compression locks and return the number removed.
+
+        ``try_acquire_compression_lock`` already reclaims the lock for the
+        session being acquired.  This sweeper is a guarded, best-effort cleanup
+        path for diagnostics/startup/maintenance so stale rows from crashed
+        compressors don't accumulate forever or make incident review noisy.
+        """
+        cutoff = time.time() if now is None else float(now)
+
+        def _do(conn):
+            cur = conn.execute(
+                "DELETE FROM compression_locks WHERE expires_at < ?",
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
+
+        try:
+            return int(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("clear_expired_compression_locks failed: %s", exc)
+            return 0
 
     def update_session_meta(
         self,

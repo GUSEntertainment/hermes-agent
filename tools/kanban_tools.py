@@ -971,6 +971,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       messaging gateway before agent dispatch. The notification poller
       already keys off these, so we just register a row.
 
+    - **Stateless API server / cockpit**: the API server binds a
+      request-scoped ``platform="api_server"`` channel with
+      ``async_delivery=False`` because its HTTP response stream is gone by
+      the time a delegated Kanban worker finishes. Do NOT subscribe that
+      non-delivering API pseudo-chat. Instead, fall back to configured
+      gateway home channels (Telegram/Discord/Slack/etc.) so cockpit-created
+      delegated cards still close the loop with the human.
+
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
       a multi-tenant chat surface), but the agent subprocess inherits
@@ -1003,6 +1011,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         from gateway.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        try:
+            from gateway.session_context import async_delivery_supported
+        except Exception:
+            async_ok = True
+        else:
+            async_ok = async_delivery_supported()
+        if platform and chat_id and not async_ok:
+            return _auto_subscribe_home_channels(conn, task_id)
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
@@ -1047,6 +1063,115 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             _exc, platform, bool(chat_id),
         )
         return False
+
+
+def _auto_subscribe_home_channels(conn: Any, task_id: str) -> bool:
+    """Subscribe a task to configured async-capable gateway home channels.
+
+    Used when the origin session is a stateless control-plane surface such as
+    the API server/cockpit. Those surfaces can create Kanban work but cannot
+    receive a later push notification, so the durable callback target must be a
+    real messaging home channel. Best-effort and intentionally conservative:
+    skip non-delivering platforms and return False when no home is configured.
+    """
+    try:
+        from gateway.config import load_gateway_config
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return False
+    try:
+        gw_cfg = load_gateway_config()
+    except Exception:
+        return False
+    homes: list[tuple[str, str, str]] = []
+    for platform, pcfg in getattr(gw_cfg, "platforms", {}).items():
+        plat = getattr(platform, "value", str(platform)).lower()
+        if plat in {"api_server", "webhook"}:
+            continue
+        hc = getattr(pcfg, "home_channel", None)
+        if not hc or not getattr(hc, "chat_id", None):
+            continue
+        homes.append((plat, str(hc.chat_id), str(getattr(hc, "thread_id", "") or "")))
+    if not homes:
+        homes = _notification_targets_from_task(_kb, conn, task_id)
+    if not homes:
+        return False
+    subscribed = False
+    notifier_profile = os.environ.get("HERMES_PROFILE")
+    for plat, chat_id, thread_id in homes:
+        try:
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=plat,
+                chat_id=chat_id,
+                thread_id=thread_id or None,
+                notifier_profile=notifier_profile,
+            )
+            subscribed = True
+        except Exception:
+            logger.warning(
+                "_auto_subscribe_home_channels failed for %s/%s",
+                plat,
+                chat_id,
+                exc_info=True,
+            )
+    return subscribed
+
+
+def _notification_targets_from_task(kb: Any, conn: Any, task_id: str) -> list[tuple[str, str, str]]:
+    """Parse explicit return/source surfaces embedded on a task.
+
+    Safe-delegation/cockpit cards stamp Telegram provenance as
+    ``telegram:<chat_id>[:thread_id]`` in tenant or routing metadata. When no
+    configured home channel exists, those explicit task fields are still a
+    valid callback target and are better than silently subscribing the
+    non-delivering API server pseudo-chat.
+    """
+    try:
+        task = kb.get_task(conn, task_id)
+    except Exception:
+        task = None
+    if task is None:
+        return []
+
+    candidates: list[str] = []
+    body = getattr(task, "body", None)
+    if isinstance(body, str) and "## Routing metadata" in body:
+        import re as _re
+        match = _re.search(r"## Routing metadata\s*```json\s*(\{.*?\})\s*```", body, _re.DOTALL)
+        if match:
+            try:
+                meta = json.loads(match.group(1))
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict):
+                for key in ("return_surface", "source_surface"):
+                    value = meta.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidates.append(value.strip())
+    tenant = getattr(task, "tenant", None)
+    if isinstance(tenant, str) and tenant.strip():
+        candidates.append(tenant.strip())
+
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in candidates:
+        parts = raw.split(":")
+        if len(parts) < 2:
+            continue
+        platform = parts[0].strip().lower()
+        if platform in {"api_server", "webhook", "tui", ""}:
+            continue
+        chat_id = parts[1].strip()
+        if not chat_id:
+            continue
+        thread_id = parts[2].strip() if len(parts) >= 3 else ""
+        item = (platform, chat_id, thread_id)
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def _handle_unblock(args: dict, **kw) -> str:

@@ -547,6 +547,74 @@ class TestSessionLifecycle:
         assert SessionDB._is_trigram_unavailable_error(generic_err) is False
         assert SessionDB._is_trigram_unavailable_error(fts5_err) is False
 
+    def test_config_can_disable_trigram_index(self, tmp_path, monkeypatch):
+        """Config-gated trigram off keeps base FTS while avoiding the heavy table/triggers."""
+        monkeypatch.setattr(hermes_state, "_trigram_search_enabled", lambda: False)
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._fts_enabled is True
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts") is True
+            assert db._fts_table_exists("messages_fts_trigram") is False
+
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="hello without trigram")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+
+            assert len(db.search_messages("hello")) == 1
+            cjk = db.search_messages("大别山")
+            assert len(cjk) == 1
+            assert "大别山" in cjk[0]["snippet"]
+
+            assert db._conn is not None
+            triggers = {
+                r[0]
+                for r in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                ).fetchall()
+            }
+            assert {"messages_fts_insert", "messages_fts_delete", "messages_fts_update"}.issubset(triggers)
+            assert not any(name.startswith("messages_fts_trigram_") for name in triggers)
+        finally:
+            db.close()
+
+    def test_disabled_trigram_drops_stray_empty_table(self, tmp_path, monkeypatch):
+        """A stray empty trigram table (created by a process whose config lacked
+        the flag, e.g. a worker profile) is dropped on the next disabled init;
+        a populated one is preserved for the explicit maintenance path."""
+        # First init with trigram enabled creates the table.
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            db.close()
+
+        # Empty table + disabled flag → self-heal by dropping it.
+        monkeypatch.setattr(hermes_state, "_trigram_search_enabled", lambda: False)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts_trigram") is False
+        finally:
+            db.close()
+
+        # Populated table + disabled flag → kept (operator drops via maintenance).
+        monkeypatch.setattr(hermes_state, "_trigram_search_enabled", lambda: True)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="keep me indexed")
+        finally:
+            db.close()
+        monkeypatch.setattr(hermes_state, "_trigram_search_enabled", lambda: False)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            db.close()
+
     def test_db_initializes_without_trigram_tokenizer(self, tmp_path, monkeypatch):
         """SessionDB must not crash when FTS5 exists but trigram tokenizer is missing."""
         real_connect = sqlite3.connect

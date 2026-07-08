@@ -212,6 +212,8 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_SUMMARY_FAILURE_CIRCUIT_BREAKER_THRESHOLD = 3
+_SUMMARY_FAILURE_CIRCUIT_BREAKER_SECONDS = 300
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -688,6 +690,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+        self._summary_failure_count = 0
+        self._summary_failure_breaker_until = 0.0
         self._last_summary_error = None
         self._last_compress_aborted = False
         self.last_real_prompt_tokens = 0
@@ -723,6 +727,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0
+        self._summary_failure_count = 0
+        self._summary_failure_breaker_until = 0.0
         self._last_compress_aborted = False
         self._context_probed = False
         self._context_probe_persistable = False
@@ -791,6 +797,17 @@ class ContextCompressor(ContextEngine):
         cooldown_seconds: float,
         error: Optional[str],
     ) -> None:
+        self._summary_failure_count += 1
+        if self._summary_failure_count >= _SUMMARY_FAILURE_CIRCUIT_BREAKER_THRESHOLD:
+            cooldown_seconds = max(cooldown_seconds, _SUMMARY_FAILURE_CIRCUIT_BREAKER_SECONDS)
+            self._summary_failure_breaker_until = time.monotonic() + cooldown_seconds
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression summary circuit breaker opened after %d consecutive failures; "
+                    "auto-compression paused for %.0fs.",
+                    self._summary_failure_count,
+                    cooldown_seconds,
+                )
         cooldown_until = time.time() + cooldown_seconds
         self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
         self._last_summary_error = error
@@ -812,6 +829,8 @@ class ContextCompressor(ContextEngine):
 
     def _clear_compression_failure_cooldown(self) -> None:
         self._summary_failure_cooldown_until = 0.0
+        self._summary_failure_count = 0
+        self._summary_failure_breaker_until = 0.0
         self._last_summary_error = None
 
         session_db = getattr(self, "_session_db", None)
@@ -883,6 +902,8 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._ineffective_compression_count = 0
+        self._summary_failure_count = 0
+        self._summary_failure_breaker_until = 0.0
 
     # When the MINIMUM_CONTEXT_LENGTH floor meets/exceeds a small context
     # window, compacting at the percentage (50% → 32K of a 64K window) wastes
@@ -1042,6 +1063,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
+        self._summary_failure_count: int = 0
+        self._summary_failure_breaker_until: float = 0.0
         self._last_summary_error: Optional[str] = None
         # When summary generation fails and a static fallback is inserted,
         # record how many turns were unrecoverably dropped so callers
@@ -1158,6 +1181,16 @@ class ContextCompressor(ContextEngine):
                 logger.debug(
                     "Compression deferred — summary LLM in cooldown for %.0fs more",
                     _cooldown_remaining,
+                )
+            return False
+        _breaker_remaining = self._summary_failure_breaker_until - time.monotonic()
+        if _breaker_remaining > 0:
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression skipped — summary circuit breaker open after %d consecutive failures "
+                    "(%.0fs remaining). Use /compress to retry manually or /new to start fresh.",
+                    self._summary_failure_count,
+                    _breaker_remaining,
                 )
             return False
         # Anti-thrashing: back off if recent compressions were ineffective
@@ -2148,6 +2181,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         end: int,
     ) -> tuple[Optional[int], str]:
         """Find the newest handoff summary inside a compression window."""
+        # Compression windows are calculated from token-budget heuristics and
+        # can drift slightly outside the current message list after later
+        # pruning/sanitizing passes.  Clamp defensively so compaction never
+        # turns an over-budget conversation into an IndexError.
+        start = max(0, start)
+        end = min(len(messages), end)
         for idx in range(end - 1, start - 1, -1):
             content = messages[idx].get("content")
             if cls._is_context_summary_content(content):

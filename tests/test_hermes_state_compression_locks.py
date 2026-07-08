@@ -99,6 +99,19 @@ def test_non_expired_lock_is_held(db: SessionDB) -> None:
     assert db.try_acquire_compression_lock("sess1", "holder2") is False
 
 
+def test_clear_expired_compression_locks_sweeps_only_stale_rows(db: SessionDB, monkeypatch) -> None:
+    monkeypatch.setattr("hermes_state.time.time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock("expired", "holder1", ttl_seconds=5.0) is True
+    assert db.try_acquire_compression_lock("live", "holder2", ttl_seconds=50.0) is True
+
+    removed = db.clear_expired_compression_locks(now=1010.0)
+
+    assert removed == 1
+    assert db.get_compression_lock_holder("expired") is None
+    monkeypatch.setattr("hermes_state.time.time", lambda: 1010.0)
+    assert db.get_compression_lock_holder("live") == "holder2"
+
+
 # ----------------------------------------------------------------------
 # Empty / invalid input
 # ----------------------------------------------------------------------

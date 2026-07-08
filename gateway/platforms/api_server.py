@@ -1231,6 +1231,42 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @staticmethod
+    def _session_runtime_overrides(
+        user_config: Dict[str, Any],
+        session_key: Optional[str],
+    ) -> Dict[str, Any]:
+        """Return static API-server runtime overrides for a session key.
+
+        Control-plane clients such as the voice cockpit use a stable
+        ``X-Hermes-Session-Key`` and have different latency/tool-surface needs
+        than generic OpenAI-compatible API clients. Keep the default API-server
+        behavior unchanged, but allow config.yaml to opt a named session into a
+        smaller toolset, lower reasoning effort, shorter iteration budget, etc.
+
+        Supported shapes (first one wins):
+
+        ``api_server.session_overrides.<session_key>``
+        ``platform_session_overrides.api_server.<session_key>``
+        """
+        if not session_key or not isinstance(user_config, dict):
+            return {}
+        candidates: list[Any] = []
+        api_cfg = user_config.get("api_server")
+        if isinstance(api_cfg, dict):
+            overrides = api_cfg.get("session_overrides")
+            if isinstance(overrides, dict):
+                candidates.append(overrides.get(session_key))
+        platform_overrides = user_config.get("platform_session_overrides")
+        if isinstance(platform_overrides, dict):
+            api_overrides = platform_overrides.get("api_server")
+            if isinstance(api_overrides, dict):
+                candidates.append(api_overrides.get(session_key))
+        for item in candidates:
+            if isinstance(item, dict):
+                return dict(item)
+        return {}
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -1337,6 +1373,53 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
+        session_runtime = self._session_runtime_overrides(user_config, gateway_session_key)
+        if session_runtime:
+            toolsets = session_runtime.get("toolsets") or session_runtime.get("enabled_toolsets")
+            if isinstance(toolsets, (list, tuple, set)):
+                enabled_toolsets = sorted(str(t).strip() for t in toolsets if str(t).strip())
+            if session_runtime.get("max_turns") is not None:
+                try:
+                    max_iterations = int(session_runtime["max_turns"])
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "api_server session override ignored invalid max_turns for %s",
+                        gateway_session_key,
+                    )
+            elif session_runtime.get("max_iterations") is not None:
+                try:
+                    max_iterations = int(session_runtime["max_iterations"])
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "api_server session override ignored invalid max_iterations for %s",
+                        gateway_session_key,
+                    )
+            if "reasoning_effort" in session_runtime:
+                try:
+                    from hermes_constants import parse_reasoning_effort
+
+                    parsed = parse_reasoning_effort(session_runtime.get("reasoning_effort"))
+                    if parsed is not None:
+                        reasoning_config = parsed
+                except Exception:
+                    logger.warning(
+                        "api_server session override ignored invalid reasoning_effort for %s",
+                        gateway_session_key,
+                        exc_info=True,
+                    )
+            if session_runtime.get("service_tier"):
+                runtime_kwargs["service_tier"] = str(session_runtime["service_tier"])
+            if session_runtime.get("max_tokens") is not None:
+                try:
+                    runtime_kwargs["max_tokens"] = int(session_runtime["max_tokens"])
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "api_server session override ignored invalid max_tokens for %s",
+                        gateway_session_key,
+                    )
+            for flag in ("skip_context_files", "load_soul_identity", "skip_memory"):
+                if flag in session_runtime:
+                    runtime_kwargs[flag] = bool(session_runtime[flag])
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).

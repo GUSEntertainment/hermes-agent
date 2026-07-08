@@ -116,6 +116,22 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
+def _corrupt_db_response(exc: kanban_db.KanbanDbCorruptError) -> HTTPException:
+    """Return an actionable HTTP error for a board DB integrity failure.
+
+    Without this translation, FastAPI treats the fail-closed corruption guard
+    as an unhandled exception and the dashboard only sees a generic 500.
+    """
+    detail = {
+        "error": "kanban_db_corrupt",
+        "message": str(exc),
+        "db_path": str(exc.db_path),
+        "backup_path": str(exc.backup_path) if exc.backup_path is not None else None,
+        "reason": exc.reason,
+    }
+    return HTTPException(status_code=503, detail=detail)
+
+
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
@@ -130,9 +146,16 @@ def _conn(board: Optional[str] = None):
     """
     try:
         kanban_db.init_db(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        log.warning("kanban init_db failed: %s", exc)
+        raise _corrupt_db_response(exc) from exc
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
-    return kanban_db.connect(board=board)
+    try:
+        return kanban_db.connect(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        log.warning("kanban connect failed: %s", exc)
+        raise _corrupt_db_response(exc) from exc
 
 
 # ---------------------------------------------------------------------------

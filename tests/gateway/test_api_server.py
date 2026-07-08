@@ -442,6 +442,121 @@ class TestAdapterInit:
         # Fallback model overrides the config model, mirroring the native path.
         assert captured["model"] == "anthropic/claude-haiku"
 
+    def test_create_agent_applies_api_server_session_runtime_overrides(self, monkeypatch):
+        """A stable API session key (for example the voice cockpit) can opt into
+        a faster/lower-footprint runtime without changing generic API-server
+        clients."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://example.test/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "api_server": {
+                    "session_overrides": {
+                        "agent-os:cockpit": {
+                            "toolsets": ["kanban", "file", "terminal"],
+                            "reasoning_effort": "none",
+                            "max_turns": 30,
+                            "max_tokens": 192,
+                            "service_tier": "priority",
+                            "skip_context_files": True,
+                            "load_soul_identity": True,
+                        }
+                    }
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True, "effort": "medium"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"web", "memory"})
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            gateway_session_key="agent-os:cockpit",
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["enabled_toolsets"] == ["file", "kanban", "terminal"]
+        assert captured["reasoning_config"] == {"enabled": False}
+        assert captured["max_iterations"] == 30
+        assert captured["max_tokens"] == 192
+        assert captured["service_tier"] == "priority"
+        assert captured["skip_context_files"] is True
+        assert captured["load_soul_identity"] is True
+
+    def test_create_agent_ignores_session_runtime_overrides_for_other_keys(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://example.test/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "api_server": {
+                    "session_overrides": {
+                        "agent-os:cockpit": {
+                            "toolsets": ["kanban"],
+                            "reasoning_effort": "none",
+                            "max_turns": 30,
+                        }
+                    }
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True, "effort": "medium"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"web", "memory"})
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            gateway_session_key="other-client",
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["enabled_toolsets"] == ["memory", "web"]
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert captured["max_iterations"] == 90
+
     def test_create_agent_keeps_config_model_when_runtime_omits_it(self, monkeypatch):
         """Happy path (no fallback active): runtime_kwargs has no 'model', so the
         resolved gateway model is used unchanged. Regression guard for the pop."""

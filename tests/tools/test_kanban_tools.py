@@ -2040,8 +2040,10 @@ def test_board_param_in_all_schemas():
 # persistent delivery channel, the originating session should be
 # subscribed to the new task's completion/block events automatically.
 # - Gateway sessions: HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID set.
-# - TUI sessions: HERMES_SESSION_KEY (or HERMES_SESSION_ID) set, with
-#   the platform/chat_id ContextVars intentionally empty.
+# - API server / cockpit sessions: async_delivery=False, so subscribe the
+#   configured messaging home channel instead of the non-delivering API pseudo-chat.
+# - TUI sessions: HERMES_SESSION_KEY set, with the platform/chat_id ContextVars
+#   intentionally empty.
 # - CLI / cron / test sessions: no delivery channel -> no subscription.
 # - Config gate kanban.auto_subscribe_on_create: false -> no subscription
 #   even when the session has a delivery channel.
@@ -2100,6 +2102,99 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+
+
+def test_create_api_server_session_falls_back_to_home_channel(monkeypatch, worker_env):
+    """The API server/cockpit is request/response-only, so subscribing
+    platform='api_server' creates a row the gateway cannot deliver. When
+    async_delivery=False, kanban_create should subscribe configured messaging
+    homes instead."""
+    from types import SimpleNamespace
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+
+    fake_cfg = SimpleNamespace(
+        platforms={
+            "api_server": SimpleNamespace(
+                home_channel=SimpleNamespace(chat_id="api-home", thread_id="")
+            ),
+            "telegram": SimpleNamespace(
+                home_channel=SimpleNamespace(chat_id="chat-home", thread_id="topic-9")
+            ),
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_cfg)
+
+    tokens = set_session_vars(
+        platform="api_server",
+        chat_id="api-session-1",
+        session_key="api-session-1",
+        async_delivery=False,
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub api fallback",
+            "assignee": "peer",
+        })
+    finally:
+        clear_session_vars(tokens)
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-home"
+    assert subs[0]["thread_id"] == "topic-9"
+
+
+def test_create_api_server_falls_back_to_task_return_surface(monkeypatch, worker_env):
+    """If no home channel is configured, an explicit task return_surface
+    still gives cockpit delegation a safe callback target."""
+    from types import SimpleNamespace
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: SimpleNamespace(platforms={}))
+
+    body = '''Do the delegated thing.
+
+## Routing metadata
+
+```json
+{"return_surface": "telegram:-100123:42", "source_surface": "api_server:ignored"}
+```
+'''
+    tokens = set_session_vars(
+        platform="api_server",
+        chat_id="api-session-2",
+        session_key="api-session-2",
+        async_delivery=False,
+    )
+    try:
+        out = kt._handle_create({
+            "title": "auto-sub api task target",
+            "assignee": "peer",
+            "body": body,
+        })
+    finally:
+        clear_session_vars(tokens)
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "-100123"
+    assert subs[0]["thread_id"] == "42"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
