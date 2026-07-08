@@ -3672,6 +3672,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _resolve_channel_model_binding(self, source: Optional[SessionSource]) -> Optional[dict]:
+        """Resolve a configured channel/topic model binding for a source."""
+        if source is None:
+            return None
+        adapters = getattr(self, "adapters", {}) or {}
+        adapter = adapters.get(source.platform)
+        config_extra = getattr(getattr(adapter, "config", None), "extra", None)
+        if not isinstance(config_extra, dict):
+            return None
+        from gateway.platforms.base import resolve_channel_model
+
+        primary_id = str(source.thread_id or source.chat_id or "")
+        parent_id = None
+        if source.thread_id:
+            parent_id = str(source.parent_chat_id or source.chat_id or "") or None
+        elif source.parent_chat_id:
+            parent_id = str(source.parent_chat_id)
+        return resolve_channel_model(config_extra, primary_id, parent_id)
+
+    def _runtime_from_channel_model_binding(self, binding: dict) -> dict:
+        """Convert a channel_models binding into a session-style model override."""
+        model = str(binding.get("model") or "").strip()
+        provider = str(binding.get("provider") or "").strip()
+        if not model and not provider:
+            return {}
+
+        explicit_api_key = binding.get("api_key")
+        if not explicit_api_key:
+            key_env = str(binding.get("api_key_env") or binding.get("key_env") or "").strip()
+            if key_env:
+                explicit_api_key = os.getenv(key_env, "").strip() or None
+        explicit_base_url = binding.get("base_url")
+
+        override: dict[str, Any] = {"model": model} if model else {}
+        if provider:
+            from hermes_cli.runtime_provider import (
+                format_runtime_provider_error,
+                resolve_runtime_provider,
+            )
+
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=provider,
+                    explicit_base_url=explicit_base_url,
+                    explicit_api_key=explicit_api_key,
+                )
+            except Exception as exc:
+                raise RuntimeError(format_runtime_provider_error(exc)) from exc
+            override.update(
+                {
+                    "provider": runtime.get("provider"),
+                    "api_key": runtime.get("api_key"),
+                    "base_url": runtime.get("base_url"),
+                    "api_mode": runtime.get("api_mode"),
+                    "command": runtime.get("command"),
+                    "args": list(runtime.get("args") or []),
+                    "credential_pool": runtime.get("credential_pool"),
+                }
+            )
+        if binding.get("api_mode"):
+            override["api_mode"] = binding.get("api_mode")
+        if "max_tokens" in binding and binding.get("max_tokens") is not None:
+            try:
+                max_tokens = binding.get("max_tokens")
+                if max_tokens is not None:
+                    override["max_tokens"] = int(max_tokens)
+            except (TypeError, ValueError):
+                pass
+        context_length = binding.get("context_length")
+        if context_length is not None:
+            try:
+                override["context_length"] = int(context_length)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(binding.get("compression"), dict):
+            override["compression_config"] = dict(binding.get("compression") or {})
+        return {k: v for k, v in override.items() if v is not None}
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -3696,6 +3774,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        channel_override = False
+        if not override:
+            channel_binding = self._resolve_channel_model_binding(source)
+            if channel_binding:
+                override = self._runtime_from_channel_model_binding(channel_binding)
+                channel_override = bool(override)
+                if override:
+                    logger.info(
+                        "Channel model binding: session=%s channel=%s/%s -> model=%s provider=%s",
+                        resolved_session_key or "",
+                        getattr(source, "chat_id", "") if source else "",
+                        getattr(source, "thread_id", "") if source else "",
+                        override.get("model", model),
+                        override.get("provider"),
+                    )
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -3704,7 +3797,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
+                "context_length": override.get("context_length"),
+                "compression_config": override.get("compression_config"),
                 "credential_pool": override.get("credential_pool"),
+                "command": override.get("command"),
+                "args": list(override.get("args") or []),
             }
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
@@ -3771,10 +3868,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
 
-        if override and resolved_session_key:
-            model, runtime_kwargs = self._apply_session_model_override(
-                resolved_session_key, model, runtime_kwargs
-            )
+        if override:
+            if channel_override:
+                model = override.get("model", model)
+                for key in (
+                    "provider",
+                    "api_key",
+                    "base_url",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                    "max_tokens",
+                    "context_length",
+                    "compression_config",
+                ):
+                    val = override.get(key)
+                    if val is not None:
+                        runtime_kwargs[key] = val
+            elif resolved_session_key:
+                model, runtime_kwargs = self._apply_session_model_override(
+                    resolved_session_key, model, runtime_kwargs
+                )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),

@@ -2179,6 +2179,102 @@ def resolve_channel_prompt(
     return None
 
 
+def resolve_channel_model(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a per-channel/per-topic model binding from platform config.
+
+    Looks up ``channel_models`` in the adapter's ``config.extra`` dict.  The
+    primary key is the channel/thread/topic id, with an optional parent fallback
+    for forum threads. Values may be either a string model name or a mapping.
+    """
+    bindings = config_extra.get("channel_models") or {}
+    if not isinstance(bindings, dict):
+        return None
+
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        binding = bindings.get(str(key))
+        if binding is None:
+            continue
+        if isinstance(binding, str):
+            model = binding.strip()
+            return {"model": model} if model else None
+        if not isinstance(binding, dict):
+            continue
+        model = str(binding.get("model") or binding.get("default") or "").strip()
+        provider = str(binding.get("provider") or "").strip()
+        if not model and not provider:
+            continue
+        normalized: dict[str, Any] = {}
+        if model:
+            normalized["model"] = model
+        if provider:
+            normalized["provider"] = provider
+        for opt_key in (
+            "base_url",
+            "api_key",
+            "api_key_env",
+            "key_env",
+            "api_mode",
+            "max_tokens",
+            "context_length",
+        ):
+            if opt_key in binding and binding.get(opt_key) is not None:
+                normalized[opt_key] = binding.get(opt_key)
+        if isinstance(binding.get("compression"), dict):
+            normalized["compression"] = dict(binding.get("compression") or {})
+        return normalized or None
+    return None
+
+
+def resolve_channel_voice(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a per-channel/per-topic TTS voice binding from platform config."""
+    bindings = config_extra.get("channel_voices") or {}
+    if not isinstance(bindings, dict):
+        return None
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        binding = bindings.get(str(key))
+        if binding is None:
+            continue
+        if isinstance(binding, str):
+            voice_id = binding.strip()
+            return {"voice_id": voice_id} if voice_id else None
+        if not isinstance(binding, dict):
+            continue
+        voice_id = str(binding.get("voice_id") or "").strip()
+        provider = str(binding.get("provider") or "").strip()
+        if not voice_id and not provider:
+            continue
+        normalized: dict[str, Any] = {}
+        if voice_id:
+            normalized["voice_id"] = voice_id
+        if provider:
+            normalized["provider"] = provider
+        if "auto_tts" in binding and binding.get("auto_tts") is not None:
+            normalized["auto_tts"] = bool(binding.get("auto_tts"))
+        for opt_key in (
+            "model_id",
+            "stability",
+            "similarity_boost",
+            "style",
+            "use_speaker_boost",
+        ):
+            if opt_key in binding and binding.get(opt_key) is not None:
+                normalized[opt_key] = binding.get(opt_key)
+        return normalized or None
+    return None
+
+
 def resolve_channel_skills(
     config_extra: dict,
     channel_id: str,
