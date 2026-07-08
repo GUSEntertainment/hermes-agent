@@ -3012,6 +3012,13 @@ DEFAULT_CONFIG = {
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
         "min_interval_hours": 24,
+        # Optional CJK/substring FTS5 trigram index.  Useful for exact substring
+        # search in scripts where unicode61 tokenization is weak, but expensive:
+        # inline FTS5 stores another shadow content copy plus a dense overlapping
+        # token index.  Keep enabled by default for backwards-compatible search;
+        # heavy gateway/cron profiles that do not need CJK substring recall can
+        # set this false and drop the trigram table via maintenance.
+        "enable_trigram_search": True,
         # Legacy per-session JSON snapshot writer.  When true, the agent
         # rewrites ``~/.hermes/sessions/session_{sid}.json`` on every turn
         # boundary with the full message list.  state.db is canonical and
