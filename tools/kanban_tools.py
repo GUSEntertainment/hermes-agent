@@ -971,13 +971,14 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       messaging gateway before agent dispatch. The notification poller
       already keys off these, so we just register a row.
 
-    - **Stateless API server / cockpit**: the API server binds a
-      request-scoped ``platform="api_server"`` channel with
-      ``async_delivery=False`` because its HTTP response stream is gone by
-      the time a delegated Kanban worker finishes. Do NOT subscribe that
-      non-delivering API pseudo-chat. Instead, fall back to configured
-      gateway home channels (Telegram/Discord/Slack/etc.) so cockpit-created
-      delegated cards still close the loop with the human.
+    - **Stateless API server**: the API server binds a request-scoped
+      ``platform="api_server"`` channel with ``async_delivery=False`` because
+      its HTTP response stream is gone by the time a delegated Kanban worker
+      finishes. Do NOT subscribe that non-delivering API pseudo-chat. Generic
+      API-server clients fall back to configured gateway home channels
+      (Telegram/Discord/Slack/etc.). Command Center / cockpit sessions are the
+      exception: they already render in-app and use Desk voice-callback records,
+      so they intentionally do not get a duplicate Telegram-home subscription.
 
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
@@ -1018,6 +1019,22 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         else:
             async_ok = async_delivery_supported()
         if platform and chat_id and not async_ok:
+            # The Command Center/cockpit already has the live HTTP/SSE renderer
+            # and now claims Desk voice-callbacks from ~/.hermes/desk. Falling
+            # back to Telegram home here produces the exact duplicate ping Chris
+            # wants gone: one in-app reply plus one DM for the same turn. Keep
+            # non-cockpit API clients on the old home-channel fallback.
+            source = get_session_env("HERMES_SESSION_SOURCE", "")
+            session_key = (
+                get_session_env("HERMES_SESSION_KEY", "")
+                or os.environ.get("HERMES_SESSION_KEY", "")
+            )
+            if platform == "api_server" and (
+                str(session_key).startswith("agent-os:cockpit")
+                or str(source).startswith("agent-os:cockpit")
+                or "agent-os:cockpit" in str(source)
+            ):
+                return False
             return _auto_subscribe_home_channels(conn, task_id)
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are

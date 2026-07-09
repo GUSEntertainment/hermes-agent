@@ -272,6 +272,12 @@ def test_report_back_writes_desk_intake_record_with_artifact_copy(tmp_path, monk
         assert record["package"]["sourceSurface"] == "other"
         assert record["package"]["sourceSurfaceId"] == "agent-os:cockpit:voice"
         assert record["package"]["returnSurface"] == "agent-os:cockpit:voice-callback"
+        assert record["package"]["needsChris"] is True
+        assert record["package"]["followUpStatus"] == "needs_chris_review"
+        assert record["package"]["callback"]["returnSurface"] == "agent-os:cockpit:voice-callback"
+        assert record["package"]["callback"]["voicePing"] is True
+        assert record["package"]["callback"]["announcement"] == "Scarlett has voice artifact handoff ready for review. Want to hear it?"
+        assert len(record["package"]["callback"]["announcement"]) <= 240
         assert record["package"]["source_surface"] == "agent-os:cockpit:voice"
         assert record["artifacts"][0]["title"] == "draft.md"
         copied = desk_dir / record["versions"][0]["filePath"]

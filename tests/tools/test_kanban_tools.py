@@ -2040,8 +2040,10 @@ def test_board_param_in_all_schemas():
 # persistent delivery channel, the originating session should be
 # subscribed to the new task's completion/block events automatically.
 # - Gateway sessions: HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID set.
-# - API server / cockpit sessions: async_delivery=False, so subscribe the
+# - Generic API server sessions: async_delivery=False, so subscribe the
 #   configured messaging home channel instead of the non-delivering API pseudo-chat.
+# - Command Center/cockpit API sessions: no Telegram duplicate; Desk voice
+#   callback owns the return path.
 # - TUI sessions: HERMES_SESSION_KEY set, with the platform/chat_id ContextVars
 #   intentionally empty.
 # - CLI / cron / test sessions: no delivery channel -> no subscription.
@@ -2104,8 +2106,47 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
+def test_create_cockpit_api_session_does_not_dm_duplicate(monkeypatch, worker_env):
+    """Command Center turns render in-app and return via Desk voice callbacks.
+    Do not add a Telegram-home notify subscription for the same task.
+    """
+    from types import SimpleNamespace
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    fake_cfg = SimpleNamespace(
+        platforms={
+            "telegram": SimpleNamespace(
+                home_channel=SimpleNamespace(chat_id="chat-home", thread_id="topic-9")
+            ),
+        }
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_cfg)
+
+    tokens = set_session_vars(
+        platform="api_server",
+        source="agent-os:cockpit:/board:task-123",
+        chat_id="api-session-cockpit",
+        session_key="agent-os:cockpit",
+        async_delivery=False,
+    )
+    try:
+        out = kt._handle_create({
+            "title": "cockpit no duplicate dm",
+            "assignee": "peer",
+        })
+    finally:
+        clear_session_vars(tokens)
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
 def test_create_api_server_session_falls_back_to_home_channel(monkeypatch, worker_env):
-    """The API server/cockpit is request/response-only, so subscribing
+    """Generic API server is request/response-only, so subscribing
     platform='api_server' creates a row the gateway cannot deliver. When
     async_delivery=False, kanban_create should subscribe configured messaging
     homes instead."""

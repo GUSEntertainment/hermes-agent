@@ -88,6 +88,11 @@ _TOPIC_REGISTRY_CACHE: tuple[str, float, dict[str, Any]] | None = None
 _SAFE_DESK_ID_RE = re.compile(r"[^a-zA-Z0-9_.:-]+")
 _SAFE_FILE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _MAX_DESK_COPY_BYTES = 25 * 1024 * 1024
+_CALLBACK_RETURN_SURFACE = "agent-os:cockpit:voice-callback"
+_CALLBACK_ANNOUNCEMENT_MAX_CHARS = 240
+_PACKAGE_PRIORITIES = {"low", "normal", "high", "urgent"}
+_PATH_TOKEN_RE = re.compile(r"(?:~|/)[^\s,;:)]+")
+_MARKDOWN_TOKEN_RE = re.compile(r"[`*_#>\[\]()]")
 
 
 @dataclass(frozen=True)
@@ -425,6 +430,77 @@ def _artifact_kind(path: str) -> str:
     return "other"
 
 
+def _clean_spoken_fragment(value: Any, *, fallback: str = "work") -> str:
+    """Sanitize text that may be read aloud by the cockpit.
+
+    The app reads callback.announcement verbatim, so strip markdown, local
+    paths, media directives, callback ids, and line breaks before we write the
+    Desk record. This is intentionally conservative; better a plain sentence
+    than an orb reading `/Users/...` out loud.
+    """
+    text = str(value or "").strip() or fallback
+    text = re.sub(r"MEDIA:\S+", "", text)
+    text = _PATH_TOKEN_RE.sub("", text)
+    text = _EMAIL_RE.sub("someone", text)
+    text = re.sub(r"\b(?:t|run|job|pkg|art|ver)_[A-Za-z0-9_-]{6,}\b", "", text)
+    text = re.sub(r"\b[a-f0-9]{12,}\b", "", text, flags=re.I)
+    text = _MARKDOWN_TOKEN_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—:.;,")
+    return text or fallback
+
+
+def _truncate_spoken_sentence(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= _CALLBACK_ANNOUNCEMENT_MAX_CHARS:
+        return text
+    # Leave enough room for a clean offer ending.
+    offer = " Want to hear it?"
+    budget = _CALLBACK_ANNOUNCEMENT_MAX_CHARS - len(offer)
+    clipped = text[:budget].rsplit(" ", 1)[0].strip(" -–—:.;,")
+    return f"{clipped}.{offer}"[:_CALLBACK_ANNOUNCEMENT_MAX_CHARS]
+
+
+def _desk_callback_priority(metadata: dict[str, Any], payload: dict[str, Any]) -> str:
+    raw = _first_str(
+        payload.get("priority"),
+        payload.get("desk_priority"),
+        metadata.get("priority"),
+        metadata.get("desk_priority"),
+        default="normal",
+    ).lower()
+    return raw if raw in _PACKAGE_PRIORITIES else "normal"
+
+
+def _desk_callback_announcement(*, decision: ReportBackDecision, task: Any, event: Any, metadata: dict[str, Any]) -> str:
+    payload = _as_dict(getattr(event, "payload", None))
+    callback = _as_dict(payload.get("callback")) or _as_dict(metadata.get("callback"))
+    authored = _first_str(
+        callback.get("announcement"),
+        payload.get("announcement"),
+        payload.get("callback_announcement"),
+        payload.get("voice_announcement"),
+        metadata.get("announcement"),
+        metadata.get("callback_announcement"),
+        metadata.get("voice_announcement"),
+    )
+    if authored:
+        announcement = _clean_spoken_fragment(authored)
+        if not re.search(r"\?\s*$", announcement):
+            announcement = f"{announcement.rstrip('.!')} — want to hear it?"
+        return _truncate_spoken_sentence(announcement)
+
+    worker = _clean_spoken_fragment(decision.department_owner or decision.runtime_assignee or "Margot", fallback="Margot")
+    raw_title = getattr(task, "title", "") or decision.redacted_summary or "the update"
+    subject = _clean_spoken_fragment(raw_title, fallback="the update")
+    if decision.event_kind == "blocked":
+        announcement = f"{worker} needs a decision on {subject}. Want the blocker?"
+    elif decision.event_kind == "needs_approval":
+        announcement = f"{worker} needs approval on {subject}. Want to review it?"
+    else:
+        announcement = f"{worker} has {subject} ready for review. Want to hear it?"
+    return _truncate_spoken_sentence(announcement)
+
+
 def _completion_artifact_paths(event: Any) -> list[str]:
     payload = _as_dict(getattr(event, "payload", None))
     raw = payload.get("artifacts")
@@ -480,6 +556,17 @@ def write_desk_intake_record(
         privacy_tier = "creator_only"
 
     artifact_paths = _completion_artifact_paths(event)
+    callback_priority = _desk_callback_priority(extract_routing_metadata(task), _as_dict(getattr(event, "payload", None)))
+    callback_id = _safe_desk_id(
+        f"{decision.task_id}-{decision.event_kind}-{decision.idempotency_key}",
+        f"callback-{decision.idempotency_key}",
+    )
+    callback_announcement = _desk_callback_announcement(
+        decision=decision,
+        task=task,
+        event=event,
+        metadata=extract_routing_metadata(task),
+    )
     artifacts: list[dict[str, Any]] = []
     versions: list[dict[str, Any]] = []
     artifact_ids: list[str] = []
@@ -576,21 +663,28 @@ def write_desk_intake_record(
             "sourceRequestId": decision.task_id,
             "sourceSurface": desk_source_surface,
             "sourceSurfaceId": source_surface,
-            "returnSurface": decision.return_surface,
+            "returnSurface": _CALLBACK_RETURN_SURFACE,
             "project": f"Kanban/{board or 'default'}",
             "status": "returned" if decision.event_kind == "completed" else "needs_review",
-            "priority": "normal",
+            "priority": callback_priority,
             "summary": decision.redacted_summary or title,
             "createdAt": now_iso,
             "returnedAt": now_iso,
             "updatedAt": now_iso,
-            "needsChris": decision.event_kind in {"blocked", "needs_approval"},
+            "needsChris": True,
             "privacyTier": privacy_tier,
+            "followUpStatus": "needs_chris_review",
+            "callback": {
+                "returnSurface": _CALLBACK_RETURN_SURFACE,
+                "callbackId": callback_id,
+                "voicePing": True,
+                "announcement": callback_announcement,
+            },
             "tags": ["kanban", decision.department_id, decision.event_kind],
             "artifactIds": artifact_ids,
             "reviewNoteIds": [],
             "source_surface": decision.source_surface,
-            "return_surface": decision.return_surface,
+            "return_surface": _CALLBACK_RETURN_SURFACE,
         },
         "artifacts": artifacts,
         "versions": versions,

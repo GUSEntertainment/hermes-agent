@@ -4075,6 +4075,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        source: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4095,6 +4096,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return set_session_vars(
             platform="api_server",
+            source=source,
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
@@ -4139,6 +4141,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
+                source=(gateway_session_key or "") if str(gateway_session_key or "").startswith("agent-os:cockpit") else "",
             )
             try:
                 agent = self._create_agent(
