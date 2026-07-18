@@ -466,7 +466,11 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return ordinary triage tasks eligible for automatic decomposition.
+
+    Loop-escalated triage rows remain visible on the board but must be
+    explicitly unblocked before a decomposer can make work runnable again.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -474,4 +478,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id
+        for row in rows
+        if row.block_recurrences < kb.BLOCK_RECURRENCE_LIMIT
+    ]

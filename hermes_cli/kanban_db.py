@@ -2680,6 +2680,17 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                # ``initial_status='blocked'`` is an explicit hold, not a
+                # circuit-breaker artifact. Record the same sticky lifecycle
+                # marker as block_task() so recompute_ready() cannot silently
+                # treat a parent-free held card as ready work.
+                if task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "initial_status=blocked", "kind": None},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4825,7 +4836,11 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Explicitly resume a blocked, scheduled, or loop-escalated triage task.
+
+    Ordinary triage remains specification-only. A triage task is eligible here
+    only when the unblock-loop breaker placed it there, making this the sole
+    audited recovery path from that safety hold.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -4837,8 +4852,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? AND "
+            "(status IN ('blocked', 'scheduled') OR "
+            "(status = 'triage' AND block_recurrences >= ?))",
+            (task_id, BLOCK_RECURRENCE_LIMIT),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -4878,8 +4895,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') OR "
+            "(status = 'triage' AND block_recurrences >= ?))",
+            (new_status, task_id, BLOCK_RECURRENCE_LIMIT),
         )
         if cur.rowcount != 1:
             return False
@@ -4920,10 +4938,16 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, block_recurrences FROM tasks "
+            "WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # A triage row reached through the unblock-loop breaker is a safety
+        # hold, not ordinary underspecified intake. It may resume only through
+        # an explicit unblock; a specifier must not recreate the redispatch loop.
+        if int(existing["block_recurrences"] or 0) >= BLOCK_RECURRENCE_LIMIT:
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -5074,13 +5098,17 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, block_recurrences "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        # Loop-escalated triage is a human decision point. Do not create new
+        # runnable children before an operator explicitly unblocks the root.
+        if int(root_row["block_recurrences"] or 0) >= BLOCK_RECURRENCE_LIMIT:
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -5089,6 +5117,16 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # External holds on the triage root apply to every decomposed child.
+        # Without inherited edges, a parent-free leaf could become ready while
+        # the root's approval/dependency parent remained nonterminal.
+        root_parent_ids = [
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (task_id,),
+            ).fetchall()
+        ]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5146,6 +5184,22 @@ def decompose_triage_task(
                 )
                 _append_event(
                     conn, child_id, "linked",
+                    {"parent": parent_id, "child": child_id},
+                )
+
+        # Preserve every external root parent edge on each new child. Already
+        # terminal parents are retained as provenance as well as scheduling data.
+        for child_id in child_ids:
+            for parent_id in root_parent_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (parent_id, child_id),
+                )
+                _append_event(
+                    conn,
+                    child_id,
+                    "linked",
                     {"parent": parent_id, "child": child_id},
                 )
 

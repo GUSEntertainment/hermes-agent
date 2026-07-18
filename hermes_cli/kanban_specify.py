@@ -259,9 +259,10 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column.
+    """Return ordinary triage tasks eligible for automatic specification.
 
-    ``tenant`` narrows the sweep; ``None`` returns every triage task.
+    ``tenant`` narrows the sweep; loop-escalated triage remains a deliberate
+    safety hold until explicitly unblocked.
     """
     with kb.connect_closing() as conn:
         tasks = kb.list_tasks(
@@ -270,4 +271,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             include_archived=False,
         )
-    return [t.id for t in tasks]
+    return [
+        task.id
+        for task in tasks
+        if task.block_recurrences < kb.BLOCK_RECURRENCE_LIMIT
+    ]
