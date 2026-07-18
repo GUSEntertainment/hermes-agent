@@ -73,8 +73,13 @@ def resolve_cockpit_lane(value: Any, *, board: Optional[str] = None) -> CockpitL
         raise CockpitRoutingError("missing, malformed, or unknown cockpit user")
     expected_board = COCKPIT_USER_BOARDS[user]
     if board is not None and str(board).strip() != expected_board:
+        # Instructive on purpose: the model consuming this error must learn the
+        # correct move (drop the board arg) instead of concluding the user's
+        # permissions are broken and reporting a dead end to a human.
         raise CockpitRoutingError(
-            f"cockpit user {user!r} is not allowed to write board {board!r}"
+            f"cockpit user {user!r} is not allowed to write board {board!r}; "
+            f"their work routes to {expected_board!r} automatically — retry "
+            "WITHOUT the board argument (cockpit tasks never need one)"
         )
     return CockpitLane(
         user=user,
