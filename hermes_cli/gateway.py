@@ -3882,6 +3882,18 @@ def generate_launchd_plist() -> str:
         <string>{hermes_home}</string>
     </dict>
 
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
     <key>LimitLoadToSessionType</key>
     <array>
         <string>Aqua</string>

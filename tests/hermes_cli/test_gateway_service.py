@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -2458,6 +2459,15 @@ class TestProfileArg:
         assert "<key>LimitLoadToSessionType</key>" in plist
         assert "<string>Aqua</string>" in plist
         assert "<string>Background</string>" in plist
+
+    def test_launchd_plist_raises_open_file_limit_for_gateway_workload(self):
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        soft_limit = plist["SoftResourceLimits"]["NumberOfFiles"]
+        hard_limit = plist["HardResourceLimits"]["NumberOfFiles"]
+
+        assert soft_limit >= 8192
+        assert hard_limit >= soft_limit
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
