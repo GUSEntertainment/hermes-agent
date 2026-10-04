@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T20:35:45.446031+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-control",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-routing",
+      "files": [
+        {
+          "path": "plugins/capability_projection/resolver.py",
+          "before_sha256": "42a16acd9ee4ded7a7e582079d6bae6d9bf25cf7139a5010c00b37d86a22f307",
+          "after_sha256": "2a831372bc65c1803b9f2278be91ea875b1fd07c02cffdd827c66a530b11a46d"
+        },
+        {
+          "path": "tests/hermes_cli/test_capability_profile_current_routing.py",
+          "before_sha256": null,
+          "after_sha256": "c021aadc406128328052f788e6103f314b3c4a359a9d978274d5c09ae23d5158"
+        }
+      ],
+      "patch_sha256": "240f57c565c30ee36712446c55fef2ecd47e26a72d3d52e64f8c7e87c63f6390",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-controller-context-identity",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-controller",
+      "files": [
+        {
+          "path": "plugins/capability_projection/resolver.py",
+          "before_sha256": "42a16acd9ee4ded7a7e582079d6bae6d9bf25cf7139a5010c00b37d86a22f307",
+          "after_sha256": "2a831372bc65c1803b9f2278be91ea875b1fd07c02cffdd827c66a530b11a46d"
+        },
+        {
+          "path": "tests/hermes_cli/test_capability_profile_current_routing.py",
+          "before_sha256": null,
+          "after_sha256": "c021aadc406128328052f788e6103f314b3c4a359a9d978274d5c09ae23d5158"
+        }
+      ],
+      "patch_sha256": "240f57c565c30ee36712446c55fef2ecd47e26a72d3d52e64f8c7e87c63f6390",
+      "patch": "controller.patch"
+    }
+  }
+}

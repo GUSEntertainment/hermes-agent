@@ -1,0 +1,17 @@
+{
+  "scope": "Remove custom historical whole-profile fingerprint veto; preserve native identity and declared permissions",
+  "gateway": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-routing",
+  "controller": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-controller",
+  "focused_offline_tests": 11,
+  "member_isolation_tests": 10,
+  "both_lane_preflight": "passed",
+  "independent_review": "no blocker; policy, member binding, confinement and signatures byte-identical",
+  "models_or_workers_started_for_rollback": 0,
+  "upstream_comparison": "local origin/main 343500b3547e12530457c2fda60ec687e25118b4; not a full upstream replacement",
+  "limits": [
+    "Existing triage and explicit holds are preserved",
+    "Matrix registration and authority fields remain enforced",
+    "HMAC capsules bind scope/assignee/workspace/host/time, not profile fingerprints"
+  ],
+  "activation": "pending"
+}

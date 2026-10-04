@@ -1,0 +1,10 @@
+{
+  "read_only": true,
+  "all_twelve_heads_admitted_to_inventory": true,
+  "head_errors": {},
+  "profiles_loaded": 29,
+  "other_errors": {},
+  "matrix_unchanged_sha256": "02725912beb197845f9914e7a7bfb3c1ac6d13111ea141b1523e2c26add8c03a",
+  "workers_started": 0,
+  "model_calls": 0
+}
