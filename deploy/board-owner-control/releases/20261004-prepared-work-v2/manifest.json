@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T21:23:47.820953+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-v2",
+      "files": [
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": "b3ce0026d826228d0298fe248294f8721768e1d8a4252beeba80054952ceb523",
+          "after_sha256": "07ac6e91865505050ebc88a4f489c59fb64a8ae313c458a03c48976e35903c4b"
+        },
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "1e0c96bb259054f74b33b45aa4ecc207dac39a2d3a6f56fd2a0fbab7b8739199",
+          "after_sha256": "805792342e87d057b41e198c70098cee9f5ff19fea0f4842bd3be501f9deb1fb"
+        },
+        {
+          "path": "hermes_cli/owner_work_preparation.py",
+          "before_sha256": "6eb180d637afcc5687b219eef9f4af42e00913b85401d19c32ae4bef0e0bd21e",
+          "after_sha256": "cb9616ac059fc1cb837328d6f19233febfdcc1fdb5273bc1838b907a7c3deaaf"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": "86ef4f3f6473fceb1b558b77a4843065ba3646519965a7da8316042f5be46c79",
+          "after_sha256": "6db6dbfc9caf9bcbf457f89923623be7e19dc1d409b6fdf7239cad971782f752"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_budget.py",
+          "before_sha256": "de3dfc7c5558806b77359ecf5e84c49b1bf361a76376e855c12a1b43108483fc",
+          "after_sha256": "2ce6a54b26b10ec71926bcf4bd61a65ce18bb6207d13bfaa0831aa07a4d80ebb"
+        },
+        {
+          "path": "tests/tools/test_prepared_board_inspection.py",
+          "before_sha256": "eb78b4144c2d4323b5b1cdb635d7d3e94bf98e95ebae21cd9b12322fa1664bdd",
+          "after_sha256": "b82782c4fcd0afb06dccdae4d831501df5d2182499f79e34d3b3f5e7bb16b2a4"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "0aa9dc88cf147f71f06ad279ff55386042317a9ad6eb54244d226e3778177f82",
+          "after_sha256": "92005ef8ae2a71c0b28a984f82f411c7455f85685a6e8e81329f4ef436507c1d"
+        }
+      ],
+      "patch_sha256": "41dc745a36336441640047614e1964422c7e93f1d676ed08e15ac2a623a52cba",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-controller-v2",
+      "files": [
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "1e0c96bb259054f74b33b45aa4ecc207dac39a2d3a6f56fd2a0fbab7b8739199",
+          "after_sha256": "805792342e87d057b41e198c70098cee9f5ff19fea0f4842bd3be501f9deb1fb"
+        },
+        {
+          "path": "hermes_cli/owner_work_preparation.py",
+          "before_sha256": "6eb180d637afcc5687b219eef9f4af42e00913b85401d19c32ae4bef0e0bd21e",
+          "after_sha256": "cb9616ac059fc1cb837328d6f19233febfdcc1fdb5273bc1838b907a7c3deaaf"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": "86ef4f3f6473fceb1b558b77a4843065ba3646519965a7da8316042f5be46c79",
+          "after_sha256": "6db6dbfc9caf9bcbf457f89923623be7e19dc1d409b6fdf7239cad971782f752"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_budget.py",
+          "before_sha256": "de3dfc7c5558806b77359ecf5e84c49b1bf361a76376e855c12a1b43108483fc",
+          "after_sha256": "2ce6a54b26b10ec71926bcf4bd61a65ce18bb6207d13bfaa0831aa07a4d80ebb"
+        }
+      ],
+      "patch_sha256": "56c74885961db82304dc383f7ff798696835c5ec20a323e750b762c50cc5f675",
+      "patch": "controller.patch"
+    }
+  }
+}

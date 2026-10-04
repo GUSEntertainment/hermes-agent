@@ -1,0 +1,12 @@
+{
+  "offline_preparation_budget_tests": 56,
+  "offline_inspection_tests": 8,
+  "models_or_workers_started": 0,
+  "changes": [
+    "deduplicate prepared audit payloads with explicit complete event paging",
+    "compact prepared-worker defaults bound to actual active task/run/profile",
+    "allow explicit total-token plans up to2000000 while preserving lower operator ceilings and current budgets",
+    "explain cached inputs and independent turn/request/time budgets"
+  ],
+  "live_attempts_after_worker5296": 0
+}

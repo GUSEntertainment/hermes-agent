@@ -181,3 +181,11 @@ on the actual task's acceptance and review requirements.
 manifest and creates a separate receipt for each target. It changes only the
 Personal service's source path and working directory, checks candidate hashes,
 retains identity/configuration, and rolls back a failed startup.
+
+The v2 follow-up removes duplicated prepared-plan audit payloads from normal
+inspection. Full event payloads remain available through bounded explicit event
+paging. Prepared-worker defaults require the actual current task/run/profile.
+Explicit total budgets may be up to 2,000,000 tokens, still clamped by tighter
+operator settings; existing plans are never increased. Readiness explains that
+cached inputs count toward cumulative usage and that turn/request/time limits
+are independent. No live task is resumed by this update.

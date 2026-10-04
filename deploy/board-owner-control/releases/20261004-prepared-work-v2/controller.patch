@@ -1,0 +1,113 @@
+--- a/hermes_cli/kanban_completion.py
++++ b/hermes_cli/kanban_completion.py
+@@ -85,7 +85,7 @@
+         "max_attempts_per_input": (1, 1),
+         "worker_max_turns": (12, 64),
+         "worker_run_seconds": (60, 1800),
+-        "worker_total_tokens": (32000, 256000),
++        "worker_total_tokens": (32000, 2_000_000),
+         "worker_request_tokens": (8000, 128000),
+     }
+     for key, (lower, upper) in bounds.items():
+--- a/hermes_cli/owner_work_preparation.py
++++ b/hermes_cli/owner_work_preparation.py
+@@ -15,7 +15,7 @@
+                 'worker_budget_json')
+ _BUDGET_RANGES = {'max_runs_per_day': (1, 4), 'max_attempts_per_input': (1, 1),
+                   'worker_max_turns': (12, 64), 'worker_run_seconds': (60, 1800),
+-                  'worker_total_tokens': (32000, 256000), 'worker_request_tokens': (8000, 128000)}
++                  'worker_total_tokens': (32000, 2_000_000), 'worker_request_tokens': (8000, 128000)}
+ 
+ 
+ def select_toolsets(available, requirements):
+@@ -269,7 +269,15 @@
+                                 'requested': plan['budget']['worker_run_seconds'],
+                                 'effective': ceiling, 'source': 'task.max_runtime_seconds'})
+             effective['worker_run_seconds'] = ceiling
+-    return {'effective_budget': effective, 'budget_constraints': constraints}
++    return {'effective_budget': effective, 'budget_constraints': constraints,
++            'budget_guidance': [
++                'Total tokens accumulate input and output across calls; cached input tokens also count. '
++                'Token usage is not a dollar-cost estimate.',
++                'Turn, elapsed-time, per-request and total-token limits are independent; remaining turns '
++                'do not guarantee remaining token allowance.',
++                'Choose an explicit budget for the prepared work. Operator ceilings still apply; '
++                'reaching a limit does not increase it or authorize another attempt.',
++            ]}
+ 
+ 
+ def _readiness(conn, task, plan, member):
+--- a/tests/hermes_cli/test_owner_work_preparation.py
++++ b/tests/hermes_cli/test_owner_work_preparation.py
+@@ -219,6 +219,30 @@
+     assert receipt['readiness']['effective_budget'] == receipt['effective_budget']
+ 
+ 
++def test_larger_prepared_budget_has_accounting_guidance_and_keeps_operator_ceiling(board, monkeypatch):
++    from hermes_cli import kanban_completion as completion
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'worker_total_tokens': 600000}}})
++    monkeypatch.setattr(completion, 'policy', lambda: settings)
++    value = plan()
++    original_budget = dict(value['budget'])
++    value['budget']['worker_total_tokens'] = 2_000_000
++    receipt = run(board, value, dry_run=True)
++    assert receipt['plan']['budget']['worker_total_tokens'] == 2_000_000
++    assert receipt['effective_budget']['worker_total_tokens'] == 600000
++    assert receipt['effective_budget']['worker_request_tokens'] == original_budget['worker_request_tokens']
++    assert receipt['effective_budget']['worker_max_turns'] == original_budget['worker_max_turns']
++    assert receipt['effective_budget']['max_attempts_per_input'] == 1
++    guidance = ' '.join(receipt['readiness']['budget_guidance'])
++    assert 'cached input tokens also count' in guidance
++    assert 'limits are independent' in guidance
++    assert 'does not increase it or authorize another attempt' in guidance
++    assert receipt['budget_guidance'] == receipt['readiness']['budget_guidance']
++    value['budget']['worker_total_tokens'] = 2_000_001
++    with pytest.raises(ValueError, match='worker_total_tokens'):
++        run(board, value, dry_run=True)
++
++
+ def test_connection_board_ignores_current_ui_board(board, monkeypatch):
+     conn, tid, workspace = board
+     target = workspace.parent / 'kanban' / 'boards' / 'actual-board' / 'kanban.db'
+--- a/tests/hermes_cli/test_prepared_work_budget.py
++++ b/tests/hermes_cli/test_prepared_work_budget.py
+@@ -72,7 +72,7 @@
+     {**PLAN_BUDGET, 'worker_run_seconds': 59},
+     {**PLAN_BUDGET, 'worker_run_seconds': 1801},
+     {**PLAN_BUDGET, 'worker_total_tokens': 31999},
+-    {**PLAN_BUDGET, 'worker_total_tokens': 256001},
++    {**PLAN_BUDGET, 'worker_total_tokens': 2_000_001},
+     {**PLAN_BUDGET, 'worker_request_tokens': 7999},
+     {**PLAN_BUDGET, 'worker_request_tokens': 128001},
+     {**PLAN_BUDGET, 'worker_total_tokens': 32000, 'worker_request_tokens': 64000},
+@@ -96,6 +96,19 @@
+         'enabled': True, 'task_budgets': {'t_prepared': {'max_runs_per_day': 1}},
+     }}})
+     assert completion.task_limits(settings, value)['max_runs_per_day'] == 1
++
++
++@pytest.mark.parametrize('total', [256001, 600000, 2_000_000])
++def test_explicit_larger_budget_is_accepted_without_increasing_other_limits(total):
++    budget = {**PLAN_BUDGET, 'worker_total_tokens': total}
++    assert completion.task_limits({}, task(budget)) == {**budget, 'budget_scope': 'task:t_prepared'}
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'worker_total_tokens': 600000,
++        'task_budgets': {'t_prepared': {'worker_request_tokens': 96000}},
++    }}})
++    limits = completion.task_limits(settings, task(budget))
++    assert limits == {**budget, 'worker_total_tokens': min(total, 600000),
++                      'worker_request_tokens': 96000, 'budget_scope': 'task:t_prepared'}
+ 
+ 
+ @pytest.fixture
+@@ -136,7 +149,8 @@
+     completion.record_admission(conn, task_id, limits)
+     conn.execute("UPDATE tasks SET status='blocked',consecutive_failures=1,last_failure_error='prior failure' WHERE id=?", (task_id,))
+     conn.commit()
+-    store_prepared_plan(conn, task_id, budget={**PLAN_BUDGET, 'worker_max_turns': 24})
++    store_prepared_plan(conn, task_id, budget={**PLAN_BUDGET, 'worker_max_turns': 24,
++                                             'worker_total_tokens': 2_000_000})
+     refreshed = importlib.reload(completion)
+     assert refreshed.input_fingerprint(conn, task_id) == first
+     # After the rolling day expires, the same input still cannot retry.

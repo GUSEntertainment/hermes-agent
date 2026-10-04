@@ -1,0 +1,363 @@
+--- a/gateway/member_board_tools.py
++++ b/gateway/member_board_tools.py
+@@ -35,7 +35,7 @@
+ 
+ def show(args, **kwargs):
+     grant = _grant()
+-    if (type(args) is not dict or (set(args) - {"task_id", "history_limit", "comments_before_id"} or "task_id" not in args)
++    if (type(args) is not dict or (set(args) - {"task_id", "history_limit", "comments_before_id", "events_before_id", "include_event_payloads"} or "task_id" not in args)
+             or not isinstance(args["task_id"], str)
+             or not 1 <= len(args["task_id"]) <= 200):
+         raise ValueError("One bounded task_id is required; the workspace comes from your account")
+@@ -152,7 +152,7 @@
+     registry.register(name=SHOW_TOOL, toolset=toolset, schema={
+         "name": SHOW_TOOL,
+         "description": "Inspect a card, its dependencies, findings and exact recovery snapshot in your authenticated workspace.",
+-        "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1, "maxLength": 200}, "history_limit": {"type": "integer", "minimum": 1, "maximum": 20}, "comments_before_id": {"type": "integer", "minimum": 1}},
++        "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1, "maxLength": 200}, "history_limit": {"type": "integer", "minimum": 1, "maximum": 20}, "comments_before_id": {"type": "integer", "minimum": 1}, "events_before_id": {"type": "integer", "minimum": 1}, "include_event_payloads": {"type": "boolean", "description": "Retrieve original audit payloads only when needed; default view omits repeated prepared briefs."}},
+                        "required": ["task_id"], "additionalProperties": False},
+     }, handler=show, check_fn=enabled)
+     registry.register(name=COMMENT_TOOL, toolset=toolset, schema={
+--- a/hermes_cli/kanban_completion.py
++++ b/hermes_cli/kanban_completion.py
+@@ -85,7 +85,7 @@
+         "max_attempts_per_input": (1, 1),
+         "worker_max_turns": (12, 64),
+         "worker_run_seconds": (60, 1800),
+-        "worker_total_tokens": (32000, 256000),
++        "worker_total_tokens": (32000, 2_000_000),
+         "worker_request_tokens": (8000, 128000),
+     }
+     for key, (lower, upper) in bounds.items():
+--- a/hermes_cli/owner_work_preparation.py
++++ b/hermes_cli/owner_work_preparation.py
+@@ -15,7 +15,7 @@
+                 'worker_budget_json')
+ _BUDGET_RANGES = {'max_runs_per_day': (1, 4), 'max_attempts_per_input': (1, 1),
+                   'worker_max_turns': (12, 64), 'worker_run_seconds': (60, 1800),
+-                  'worker_total_tokens': (32000, 256000), 'worker_request_tokens': (8000, 128000)}
++                  'worker_total_tokens': (32000, 2_000_000), 'worker_request_tokens': (8000, 128000)}
+ 
+ 
+ def select_toolsets(available, requirements):
+@@ -269,7 +269,15 @@
+                                 'requested': plan['budget']['worker_run_seconds'],
+                                 'effective': ceiling, 'source': 'task.max_runtime_seconds'})
+             effective['worker_run_seconds'] = ceiling
+-    return {'effective_budget': effective, 'budget_constraints': constraints}
++    return {'effective_budget': effective, 'budget_constraints': constraints,
++            'budget_guidance': [
++                'Total tokens accumulate input and output across calls; cached input tokens also count. '
++                'Token usage is not a dollar-cost estimate.',
++                'Turn, elapsed-time, per-request and total-token limits are independent; remaining turns '
++                'do not guarantee remaining token allowance.',
++                'Choose an explicit budget for the prepared work. Operator ceilings still apply; '
++                'reaching a limit does not increase it or authorize another attempt.',
++            ]}
+ 
+ 
+ def _readiness(conn, task, plan, member):
+--- a/tests/hermes_cli/test_owner_work_preparation.py
++++ b/tests/hermes_cli/test_owner_work_preparation.py
+@@ -219,6 +219,30 @@
+     assert receipt['readiness']['effective_budget'] == receipt['effective_budget']
+ 
+ 
++def test_larger_prepared_budget_has_accounting_guidance_and_keeps_operator_ceiling(board, monkeypatch):
++    from hermes_cli import kanban_completion as completion
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'worker_total_tokens': 600000}}})
++    monkeypatch.setattr(completion, 'policy', lambda: settings)
++    value = plan()
++    original_budget = dict(value['budget'])
++    value['budget']['worker_total_tokens'] = 2_000_000
++    receipt = run(board, value, dry_run=True)
++    assert receipt['plan']['budget']['worker_total_tokens'] == 2_000_000
++    assert receipt['effective_budget']['worker_total_tokens'] == 600000
++    assert receipt['effective_budget']['worker_request_tokens'] == original_budget['worker_request_tokens']
++    assert receipt['effective_budget']['worker_max_turns'] == original_budget['worker_max_turns']
++    assert receipt['effective_budget']['max_attempts_per_input'] == 1
++    guidance = ' '.join(receipt['readiness']['budget_guidance'])
++    assert 'cached input tokens also count' in guidance
++    assert 'limits are independent' in guidance
++    assert 'does not increase it or authorize another attempt' in guidance
++    assert receipt['budget_guidance'] == receipt['readiness']['budget_guidance']
++    value['budget']['worker_total_tokens'] = 2_000_001
++    with pytest.raises(ValueError, match='worker_total_tokens'):
++        run(board, value, dry_run=True)
++
++
+ def test_connection_board_ignores_current_ui_board(board, monkeypatch):
+     conn, tid, workspace = board
+     target = workspace.parent / 'kanban' / 'boards' / 'actual-board' / 'kanban.db'
+--- a/tests/hermes_cli/test_prepared_work_budget.py
++++ b/tests/hermes_cli/test_prepared_work_budget.py
+@@ -72,7 +72,7 @@
+     {**PLAN_BUDGET, 'worker_run_seconds': 59},
+     {**PLAN_BUDGET, 'worker_run_seconds': 1801},
+     {**PLAN_BUDGET, 'worker_total_tokens': 31999},
+-    {**PLAN_BUDGET, 'worker_total_tokens': 256001},
++    {**PLAN_BUDGET, 'worker_total_tokens': 2_000_001},
+     {**PLAN_BUDGET, 'worker_request_tokens': 7999},
+     {**PLAN_BUDGET, 'worker_request_tokens': 128001},
+     {**PLAN_BUDGET, 'worker_total_tokens': 32000, 'worker_request_tokens': 64000},
+@@ -96,6 +96,19 @@
+         'enabled': True, 'task_budgets': {'t_prepared': {'max_runs_per_day': 1}},
+     }}})
+     assert completion.task_limits(settings, value)['max_runs_per_day'] == 1
++
++
++@pytest.mark.parametrize('total', [256001, 600000, 2_000_000])
++def test_explicit_larger_budget_is_accepted_without_increasing_other_limits(total):
++    budget = {**PLAN_BUDGET, 'worker_total_tokens': total}
++    assert completion.task_limits({}, task(budget)) == {**budget, 'budget_scope': 'task:t_prepared'}
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'worker_total_tokens': 600000,
++        'task_budgets': {'t_prepared': {'worker_request_tokens': 96000}},
++    }}})
++    limits = completion.task_limits(settings, task(budget))
++    assert limits == {**budget, 'worker_total_tokens': min(total, 600000),
++                      'worker_request_tokens': 96000, 'budget_scope': 'task:t_prepared'}
+ 
+ 
+ @pytest.fixture
+@@ -136,7 +149,8 @@
+     completion.record_admission(conn, task_id, limits)
+     conn.execute("UPDATE tasks SET status='blocked',consecutive_failures=1,last_failure_error='prior failure' WHERE id=?", (task_id,))
+     conn.commit()
+-    store_prepared_plan(conn, task_id, budget={**PLAN_BUDGET, 'worker_max_turns': 24})
++    store_prepared_plan(conn, task_id, budget={**PLAN_BUDGET, 'worker_max_turns': 24,
++                                             'worker_total_tokens': 2_000_000})
+     refreshed = importlib.reload(completion)
+     assert refreshed.input_fingerprint(conn, task_id) == first
+     # After the rolling day expires, the same input still cannot retry.
+--- a/tests/tools/test_prepared_board_inspection.py
++++ b/tests/tools/test_prepared_board_inspection.py
+@@ -9,7 +9,7 @@
+ def board(tmp_path, monkeypatch):
+     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+     monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+-    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_SESSION_SOURCE'):
++    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_SESSION_SOURCE'):
+         monkeypatch.delenv(key, raising=False)
+     monkeypatch.setattr(kt, '_profile_has_kanban_toolset', lambda: True)
+     kb.init_db()
+@@ -35,7 +35,7 @@
+     assert result['preparation']['current'] is None
+ 
+ 
+-@pytest.mark.parametrize('extra', [{'history_limit': 0}, {'history_limit': 21}, {'comments_before_id': -1}])
++@pytest.mark.parametrize('extra', [{'history_limit': 0}, {'history_limit': 21}, {'comments_before_id': -1}, {'events_before_id': 0}, {'include_event_payloads': 'true'}])
+ def test_invalid_history_bounds_rejected(board, extra):
+     tid = kb.create_task(board, title='History fixture', assignee='maker', triage=True)
+     assert 'error' in json.loads(kt._handle_show({'task_id': tid, **extra}))
+@@ -56,3 +56,75 @@
+     assert 'Old discovery 0\n' not in context
+     assert '17 earlier comments' in context
+     assert 'not new authority' in context
++
++
++def test_prepared_worker_shows_brief_once_and_can_retrieve_exact_audit_history(board, monkeypatch):
++    from hermes_cli import owner_work_preparation as prep
++    # Real task, preparation event and run rows. No provider or subprocess runs.
++    # Presentation is tested after the existing connection authority boundary.
++    monkeypatch.setattr(kt, '_connect', lambda board=None: (kb, kb.connect()))
++    original = 'Keep the authorized request and do not send external messages. ' * 30
++    tid = kb.create_task(board, title='Implement the remaining harness', body=original,
++                         assignee='maker', workspace_kind='dir', workspace_path='/fixture/work', triage=True)
++    for index in range(12):
++        kb.add_comment(board, tid, author='owner', body=f'Historical evidence {index}: ' + 'retained source details ' * 40)
++    brief = 'CURRENT_PREPARED_BRIEF: ' + 'Implement the concrete missing behavior using the retained input. ' * 85
++    plan = {'brief': brief, 'acceptance': ['Save and inspect the real artifact.'],
++            'requirements': {'toolsets': ['file', 'terminal']}, 'assignee': 'maker', 'skills': [],
++            'budget': {'max_runs_per_day': 2, 'max_attempts_per_input': 1, 'worker_max_turns': 24,
++                       'worker_run_seconds': 600, 'worker_total_tokens': 256000, 'worker_request_tokens': 64000}}
++    with kb.write_txn(board):
++        kb._append_event(board, tid, prep.EVENT, {
++            'version': 1, 'plan': plan, 'plan_digest': prep._hash(plan),
++            'binding_digest': prep._binding(board, tid), 'actor': 'default',
++            'reason': 'Continue the existing authorized work.', 'preserved_status': 'triage',
++            'readiness': {'local_checks_passed': True, 'claim_time_admission_required': True}})
++        run_id = board.execute("INSERT INTO task_runs(task_id,profile,status,started_at) VALUES(?,?,'running',1)",
++                               (tid, 'maker')).lastrowid
++        board.execute("UPDATE tasks SET status='running',current_run_id=? WHERE id=?", (run_id, tid))
++        kb._append_event(board, tid, 'claimed', {'run_id': run_id})
++        kb._append_event(board, tid, 'scope_hold', {'instruction': 'Preserve private files; explicit owner release required.'})
++    exact_events = {e.id: e.payload for e in kb.list_events(board, tid)}
++    monkeypatch.setenv('HERMES_PROFILE', 'maker')
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id))
++    response = kt._handle_show({'task_id': tid, 'board': 'fixture-board'})
++    result = json.loads(response)
++    assert 'error' not in result, result
++    assert result['preparation']['current']['brief'] == brief
++    assert response.count('CURRENT_PREPARED_BRIEF:') == 1
++    assert result['task']['body'] == original
++    assert result['task']['current_run_id'] == run_id
++    assert result['history_window']['prepared_worker']
++    assert len(result['comments']) == 3
++    assert result['history_window']['next_comments_before_id']
++    assert result['history_window']['next_events_before_id']
++    compact = next(e for e in result['events'] if e['kind'] == prep.EVENT)
++    assert compact['id'] in result['history_window']['omitted_event_payload_ids']
++    assert compact['payload_omitted'] == ['plan', 'readiness']
++    assert compact['full_payload_query']['board'] == 'fixture-board'
++    assert compact['payload']['plan_digest'] == prep._hash(plan)
++    hold = next(e for e in result['events'] if e['kind'] == 'scope_hold')
++    assert hold['payload'] == exact_events[hold['id']]
++    expanded = json.loads(kt._handle_show(compact['full_payload_query']))
++    assert len(expanded['events']) == 1
++    assert expanded['events'][0]['payload'] == exact_events[compact['id']]
++    # All previous event payloads remain page-accessible, not just the latest plan.
++    seen = set()
++    query = {'task_id': tid, 'history_limit': 3, 'include_event_payloads': True}
++    while True:
++        page = json.loads(kt._handle_show(query))
++        for event in page['events']:
++            assert event['id'] not in seen
++            seen.add(event['id'])
++            assert event['payload'] == exact_events[event['id']]
++        cursor = page['history_window']['next_events_before_id']
++        if cursor is None:
++            break
++        query['events_before_id'] = cursor
++    assert seen == set(exact_events)
++    # Stale inherited run identity cannot select the worker-only default.
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(run_id + 1))
++    ordinary = json.loads(kt._handle_show({'task_id': tid}))
++    assert not ordinary['history_window']['prepared_worker']
++    assert len(ordinary['comments']) == 8
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -754,8 +754,8 @@
+             # not replay an ever-growing audit trail plus a second formatted
+             # copy of the same contract on every orientation call. A fence or
+             # request ceiling alone is insufficient; bind this to the durable
+-            # preparation event and dependency edge. Every other task remains
+-            # byte-for-byte unchanged.
++            # preparation event and dependency edge. Other prepared workers
++            # use their own current plan and active run binding below.
+             from hermes_cli.kanban_completion import request_token_limit
+             bounded_worker = False
+             readiness_binding = None
+@@ -783,20 +783,59 @@
+                             "AND edge_role='dependency'",
+                             (worker_id, original_id),
+                         ).fetchone() is not None
+-            # Current state appears once. Older discussion remains available in
+-            # bounded same-card pages, avoiding duplicate historical prompts.
+-            history_limit = args.get("history_limit", 8)
++            # Current state appears once. Only the active task's bound worker
++            # receives the smaller default; explicit pages remain available.
++            from hermes_cli.owner_work_preparation import inspect as inspect_preparation
++            preparation = inspect_preparation(conn, tid)
++            worker_run = _worker_run_id(tid)
++            prepared_worker = bool(
++                preparation.get("current")
++                and worker_id == tid and _is_dispatcher_owned_worker()
++                and task.status == "running" and worker_run is not None
++                and worker_run == task.current_run_id
++                and task.assignee == os.environ.get("HERMES_PROFILE")
++                and any(r.id == worker_run and r.profile == task.assignee
++                        and r.status == "running" and r.ended_at is None for r in runs)
++            )
++            history_limit = args.get("history_limit", 3 if prepared_worker else 8)
+             before_id = args.get("comments_before_id")
++            events_before_id = args.get("events_before_id")
++            include_event_payloads = args.get("include_event_payloads", False)
+             if type(history_limit) is not int or not 1 <= history_limit <= 20:
+                 raise ValueError("history_limit must be an integer from 1 to 20")
+             if before_id is not None and (type(before_id) is not int or before_id < 1):
+                 raise ValueError("comments_before_id must be a positive comment id")
++            if events_before_id is not None and (type(events_before_id) is not int or events_before_id < 1):
++                raise ValueError("events_before_id must be a positive event id")
++            if type(include_event_payloads) is not bool:
++                raise ValueError("include_event_payloads must be a boolean")
+             eligible_comments = [c for c in comments if before_id is None or c.id < before_id]
+             shown_comments = eligible_comments[-min(history_limit, 3):] if bounded_worker else eligible_comments[-history_limit:]
+-            shown_events = events[-8:]
++            eligible_events = [e for e in events if events_before_id is None or e.id < events_before_id]
++            shown_events = eligible_events[-history_limit:]
+             shown_runs = runs[-2:]
+-            from hermes_cli.owner_work_preparation import inspect as inspect_preparation
+-            preparation = inspect_preparation(conn, tid)
++
++            def _event_dict(event):
++                result = {"id": event.id, "kind": event.kind, "payload": event.payload,
++                          "created_at": event.created_at, "run_id": event.run_id}
++                # The current plan is already present above. Keep its audit
++                # identity, actor, reason and disposition, without replaying
++                # complete prior briefs and readiness inventories by default.
++                # Unknown/malformed events and all holds/findings stay intact.
++                if event.kind == "owner_work_prepared" and not include_event_payloads:
++                    payload = event.payload
++                    if isinstance(payload, dict) and payload.get("version") == 1 and isinstance(payload.get("plan"), dict):
++                        omitted = [key for key in ("plan", "readiness") if key in payload]
++                        result.update({
++                            "payload": {key: value for key, value in payload.items() if key not in omitted},
++                            "payload_omitted": omitted,
++                            "full_payload_query": {"task_id": tid, **({"board": board} if board else {}),
++                                                   "events_before_id": event.id + 1,
++                                                   "history_limit": 1, "include_event_payloads": True},
++                        })
++                return result
++
++            event_records = [_event_dict(event) for event in shown_events]
+ 
+             def _task_dict(t):
+                 return {
+@@ -852,11 +891,7 @@
+                      "created_at": c.created_at}
+                     for c in shown_comments
+                 ],
+-                "events": [
+-                    {"id": e.id, "kind": e.kind, "payload": e.payload,
+-                     "created_at": e.created_at, "run_id": e.run_id}
+-                    for e in shown_events
+-                ],
++                "events": event_records,
+                 "runs": [_run_dict(r) for r in shown_runs],
+                 "worker_context": None,
+                 "history_window": {
+@@ -867,7 +902,10 @@
+                                       len(shown_events) < len(events),
+                                       len(shown_runs) < len(runs))),
+                     "next_comments_before_id": shown_comments[0].id if shown_comments and len(eligible_comments) > len(shown_comments) else None,
+-                    "full_history": "Use this same show tool with comments_before_id and history_limit for older comments; run metadata and full events remain in hermes kanban log. Original task and owner review state remain authoritative. Read relevant referenced approvals and findings before recovery; missing from this window does not mean absent.",
++                    "next_events_before_id": shown_events[0].id if shown_events and len(eligible_events) > len(shown_events) else None,
++                    "omitted_event_payload_ids": [event["id"] for event in event_records if event.get("payload_omitted")],
++                    "prepared_worker": prepared_worker,
++                    "full_history": "Use this same show tool with comments_before_id or events_before_id and history_limit for older same-task history. Set include_event_payloads=true to retrieve complete preparation audit payloads; each compact event supplies its exact query. Full run metadata remains in hermes kanban log. Original task, holds and owner review state remain authoritative. Read relevant referenced approvals and findings before recovery; missing from this window does not mean absent.",
+                     "readiness_binding": readiness_binding,
+                 },
+             })
+@@ -2282,7 +2320,7 @@
+         "handoffs, your prior attempts on this task if any, comments, "
+         "and recent events. Use this to (re)orient yourself before "
+         "starting work, especially on retries. The response includes a "
+-        "current preparation and bounded history; use comments_before_id to read older relevant discussion. For the admitted independent reviewer, "
++        "current preparation and bounded history; use comments_before_id or events_before_id to read older relevant discussion and include_event_payloads for complete preparation audit payloads. For the admitted independent reviewer, "
+         "child_execution contains compact native child model/count evidence. "
+         "Unavailable does not mean zero children or success; ended is not a "
+         "success verdict. Use recorded fields instead of session_search solely "
+@@ -2296,8 +2334,10 @@
+                 "description": _DESC_TASK_ID_DEFAULT,
+             },
+             "board": _board_schema_prop(),
+-            "history_limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Number of recent comments, default8."},
++            "history_limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Comments/events per page: default 3 for the current prepared worker, otherwise 8."},
+             "comments_before_id": {"type": "integer", "minimum": 1, "description": "Read older comments on this same task using next_comments_before_id."},
++            "events_before_id": {"type": "integer", "minimum": 1, "description": "Read older events on this same task using next_events_before_id."},
++            "include_event_payloads": {"type": "boolean", "description": "Return full preparation audit payloads on the selected event page; default false avoids repeated briefs. Holds and review findings are never compacted."},
+         },
+         "required": [],
+     },
+@@ -3066,7 +3106,7 @@
+                 "max_attempts_per_input": {"type": "integer", "enum": [1]},
+                 "worker_max_turns": {"type": "integer", "minimum": 12, "maximum": 64},
+                 "worker_run_seconds": {"type": "integer", "minimum": 60, "maximum": 1800},
+-                "worker_total_tokens": {"type": "integer", "minimum": 32000, "maximum": 256000},
++                "worker_total_tokens": {"type": "integer", "minimum": 32000, "maximum": 2000000},
+                 "worker_request_tokens": {"type": "integer", "minimum": 8000, "maximum": 128000}}, "required": ["max_runs_per_day", "max_attempts_per_input", "worker_max_turns", "worker_run_seconds", "worker_total_tokens", "worker_request_tokens"], "additionalProperties": False}},
+             "required": ["brief", "acceptance", "requirements", "budget"], "additionalProperties": False},
+         "dry_run": {"type": "boolean", "description": "For prepare, triage/review recovery and repair_review_reference, preview first then apply once with false."},
