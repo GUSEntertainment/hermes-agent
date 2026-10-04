@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "offline": true,
+  "lanes": [
+    {
+      "lane": "gateway",
+      "ok": true,
+      "checks": [
+        "native_manage_registration",
+        "owner_tool_discovery",
+        "new_member_recovery_catalog",
+        "normal_member_delegation_registration",
+        "profile_edits_preserve_routing",
+        "current_identity_and_declared_authority_retained",
+        "native_prepare_preview_apply",
+        "prepared_request_and_hold_preserved",
+        "prepared_worker_context_and_budget",
+        "simple_work_preserves_scope_and_plan"
+      ]
+    },
+    {
+      "lane": "controller",
+      "ok": true,
+      "checks": [
+        "native_archive_preserves_evidence",
+        "native_restore_preserves_pause",
+        "dependency_release",
+        "unfinished_prerequisite_retained",
+        "native_evidence_bound_continuation",
+        "native_initial_triage_start",
+        "profile_edits_preserve_routing",
+        "current_identity_and_declared_authority_retained",
+        "native_prepare_preview_apply",
+        "prepared_request_and_hold_preserved",
+        "prepared_worker_context_and_budget",
+        "simple_work_preserves_scope_and_plan"
+      ]
+    }
+  ]
+}

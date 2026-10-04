@@ -1,0 +1,147 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T22:10:46.067521+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-simple-work",
+      "files": [
+        {
+          "path": "gateway/kanban_dispatch_wake.py",
+          "before_sha256": "e462e0023451147a39a0994ee1f2a5e6bef436c1432cfd1c421ee990fa7cee85",
+          "after_sha256": "687555358014ce8f93d4ceb6d7c2b5e4ff2ab5ef0f53d8808909699dc5f96b38"
+        },
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": "07ac6e91865505050ebc88a4f489c59fb64a8ae313c458a03c48976e35903c4b",
+          "after_sha256": "11ea789c206a1181d5b9e2779e6a0d5f3cfdfb6345d0bb87a7ab8d146c72b843"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "f6ac936ce782bd35e715465aadccea248b9aad8aa9ca3f9d2c20c4ea43f3a0a7",
+          "after_sha256": "8c3629f1a5426e8838ae7fae7963d6e231da5c292cf31c2830ad37fe89ea7f13"
+        },
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "805792342e87d057b41e198c70098cee9f5ff19fea0f4842bd3be501f9deb1fb",
+          "after_sha256": "94d5de19f846c222a0cbff43f00f586a28bc0ecad3e96c9f131899b44357a197"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "eedf82cf7373c1e1fb4d42c5c757cb457a97ae0fa9f355c112e543e4325408c2",
+          "after_sha256": "2b87d9447a1dedf96b6a1de1a032d195b6edeacf1a19b6a21a8ae72a25cf4f68"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "320057e82a7748869c6b3ab45e6ef03b40668609cf688919aa69b72808a6a0fd",
+          "after_sha256": "f486ed272a88276899c298a973ed96f0d8988e94f4203c98e4426489212bdc41"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": null,
+          "after_sha256": "19773f1f6cd9591528ec3b1d2ee50ea9721882429f385a307266e2c67f95bd6f"
+        },
+        {
+          "path": "hermes_cli/owner_workflow.py",
+          "before_sha256": "8d2fe84c5fab55f1e726ef440b4e793799c6a0b22ea15cd0459c5730efdb1a9e",
+          "after_sha256": "bb518268b5df589b2b022da1fb9828384fff8cf2e1d6afe6bf673408b393fce4"
+        },
+        {
+          "path": "tests/gateway/test_owner_work_wake.py",
+          "before_sha256": null,
+          "after_sha256": "df2f8b0de7b26f441ad50005243f3f32b41a8dcb11a17683f1803b0b4c2d3eb1"
+        },
+        {
+          "path": "tests/gateway/test_simple_owner_work_surface.py",
+          "before_sha256": null,
+          "after_sha256": "ba43f331f8d32d3433e5c705b7382574778a5fb0365e063718fb8a18ae21acef"
+        },
+        {
+          "path": "tests/hermes_cli/test_completion_first_review_budget.py",
+          "before_sha256": null,
+          "after_sha256": "5a27cef1703f985748c8ae91d4a684116df81ac95f4ab6a5980ee5dc6252b537"
+        },
+        {
+          "path": "tests/hermes_cli/test_held_review_admission_requirements.py",
+          "before_sha256": null,
+          "after_sha256": "8aadb8b565ef934278bc5a167bb978919d01078dd38413b93a9250534d7095ab"
+        },
+        {
+          "path": "tests/hermes_cli/test_ordinary_review_recovery.py",
+          "before_sha256": null,
+          "after_sha256": "35ef28dcf8e2565c002fbcb3cbf82cddbdd05fcee7d92e0ffe0807e930cfeee6"
+        },
+        {
+          "path": "tests/hermes_cli/test_simple_owner_work.py",
+          "before_sha256": null,
+          "after_sha256": "7977e52d0dfc6f797e5b6a57429163fa3242bbb211f09e765c8f6b486de4a469"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "92005ef8ae2a71c0b28a984f82f411c7455f85685a6e8e81329f4ef436507c1d",
+          "after_sha256": "4a03c0236d0e172c611ee67df33aca13521e367707e945151925de1d15643192"
+        }
+      ],
+      "patch_sha256": "b72e3e6131d2c6166282c6e5b15682c8eeb27dcef123275265f56ce06f3dd2f0",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-controller-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-simple-work-controller",
+      "files": [
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "6360d71e24e465c109f3eb670dfeb308b2a3e4843473d8222f28317d235e6d37",
+          "after_sha256": "92701dbacd794ccbec97d191997e44417ffd344c57baf481bfa5519bdc757dc0"
+        },
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "805792342e87d057b41e198c70098cee9f5ff19fea0f4842bd3be501f9deb1fb",
+          "after_sha256": "94d5de19f846c222a0cbff43f00f586a28bc0ecad3e96c9f131899b44357a197"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "159af7ffafbd86376ebe04753b8b3681e952d251c349eaab7e429c47e4b21a44",
+          "after_sha256": "f27cc566ec46d72ff97bb54c4acafdf191eb87f0216f4ba6b35e506e7543e31c"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "320057e82a7748869c6b3ab45e6ef03b40668609cf688919aa69b72808a6a0fd",
+          "after_sha256": "f486ed272a88276899c298a973ed96f0d8988e94f4203c98e4426489212bdc41"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": null,
+          "after_sha256": "19773f1f6cd9591528ec3b1d2ee50ea9721882429f385a307266e2c67f95bd6f"
+        },
+        {
+          "path": "hermes_cli/owner_workflow.py",
+          "before_sha256": "8d2fe84c5fab55f1e726ef440b4e793799c6a0b22ea15cd0459c5730efdb1a9e",
+          "after_sha256": "bb518268b5df589b2b022da1fb9828384fff8cf2e1d6afe6bf673408b393fce4"
+        },
+        {
+          "path": "tests/hermes_cli/test_completion_first_review_budget.py",
+          "before_sha256": null,
+          "after_sha256": "5a27cef1703f985748c8ae91d4a684116df81ac95f4ab6a5980ee5dc6252b537"
+        },
+        {
+          "path": "tests/hermes_cli/test_held_review_admission_requirements.py",
+          "before_sha256": null,
+          "after_sha256": "8aadb8b565ef934278bc5a167bb978919d01078dd38413b93a9250534d7095ab"
+        },
+        {
+          "path": "tests/hermes_cli/test_ordinary_review_recovery.py",
+          "before_sha256": null,
+          "after_sha256": "35ef28dcf8e2565c002fbcb3cbf82cddbdd05fcee7d92e0ffe0807e930cfeee6"
+        },
+        {
+          "path": "tests/hermes_cli/test_simple_owner_work.py",
+          "before_sha256": null,
+          "after_sha256": "7977e52d0dfc6f797e5b6a57429163fa3242bbb211f09e765c8f6b486de4a469"
+        }
+      ],
+      "patch_sha256": "45d01856a542eac2b7e74a43a72115e6f2919cc9cc4e16227dbe88880ed08a62",
+      "patch": "controller.patch"
+    }
+  }
+}

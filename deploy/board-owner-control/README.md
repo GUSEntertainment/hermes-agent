@@ -189,3 +189,30 @@ Explicit total budgets may be up to 2,000,000 tokens, still clamped by tighter
 operator settings; existing plans are never increased. Readiness explains that
 cached inputs count toward cumulative usage and that turn/request/time limits
 are independent. No live task is resumed by this update.
+
+## Simple work pickup (October 4)
+
+`kanban_manage(action="work", task_id=..., reason="current instruction")` and
+`own_work_manage` use the same authenticated controller. The controller resolves
+snapshots internally; callers do not need hashes, an authorization-comment ID,
+or a complete preparation plan for ordinary work. Existing requests, workers,
+profile tools and budgets are retained. An optional plan is available when the
+work actually needs a revised brief or worker configuration.
+
+The durable instruction appears first in worker context. A stopped task gets one
+attempt for that substantive instruction; repeating it or changing only a budget
+does not replenish execution. Real dependencies stay gating and completed
+prerequisites wake dispatch. A fresh work instruction can end a scheduling pause
+without clearing external-action or final-acceptance holds. Later pauses and
+changed member enrollment remain authoritative.
+
+Ordinary held reviews reuse the bound reviewer, artifact and saved findings.
+Readiness can inspect the exact idle reviewer projection before restoring review;
+it no longer circularly demands that the task already be in review. A prepared
+maker's one-attempt allowance reserves one initial independent review, including
+plain native reviews, while explicit operator ceilings remain combined. No repeat
+review reserve or increased token/time cap is granted.
+
+Package: `releases/20261004-simple-work`. The paired source trees and offline
+preflight retain existing member isolation, preparation and profile-routing fixes.
+This is an owner-directed pickup path, not a recurring model-driven triage scan.

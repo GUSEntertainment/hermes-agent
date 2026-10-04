@@ -115,6 +115,9 @@ def gateway_probe():
     require(entry.check_fn is not None and entry.check_fn(), "Owner cannot discover kanban_manage")
     definitions = registry.get_definitions({"kanban_manage"}, quiet=True)
     require(len(definitions) == 1, "Owner schema resolution did not expose kanban_manage")
+    parameters = definitions[0]['function']['parameters']
+    require('work' in parameters['properties']['action']['enum'], 'Simple work action missing')
+    require('expected_state' not in parameters['required'], 'Work again requires model-supplied bookkeeping')
     from hermes_cli import board_owner_manage as owner
     grant = dict(principal="future-member", profile="future-member", board="future-home", fingerprint="a" * 64)
     original = owner.require_owner
@@ -200,7 +203,13 @@ def preparation_probe():
         require(current(conn, tid)['brief'] == plan['brief'], 'Prepared task brief not durable')
         require(task_limits({}, task)['worker_max_turns'] == 24, 'Prepared execution budget ignored')
         require('Current prepared next step' in kb.build_worker_context(conn, tid), 'Worker did not receive preparation')
-    return ['native_prepare_preview_apply', 'prepared_request_and_hold_preserved', 'prepared_worker_context_and_budget']
+        simple = execute(dict(action='work', task_id=tid, reason='Finish the existing local deliverable.'))
+        require(simple['ok'] and simple['status'] == 'ready', 'Plain work instruction did not queue the existing card')
+        require(current(conn, tid)['brief'] == plan['brief'], 'Simple work lost existing preparation')
+        context = kb.build_worker_context(conn, tid)
+        require(context.index('Current work instruction') < context.index('## Body'), 'Current instruction is buried in old history')
+        require(kb.get_task(conn, tid).body == 'Original request; no external sends.', 'Simple work changed original restrictions')
+    return ['native_prepare_preview_apply', 'prepared_request_and_hold_preserved', 'prepared_worker_context_and_budget', 'simple_work_preserves_scope_and_plan']
 
 
 
