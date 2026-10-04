@@ -1,0 +1,87 @@
+--- a/gateway/member_board_tools.py
++++ b/gateway/member_board_tools.py
+@@ -61,7 +61,12 @@
+             "plan changes them. Preserve real dependencies, review findings and "
+             "external-action restrictions. Your authenticated account fixes the "
+             "workspace. Verify the actual worker and result; queued is not completed. "
+-            "Do not repeat unchanged failures. Precise reversible cleanup and "
++            "Do not repeatedly restart an unchanged failed worker run. "
++            "A recovery attempt limits worker starts, not individual tool calls. "
++            "Within the same run and budget, correct routine tool errors or try "
++            "equivalent already-authorized tools and sources. Do not invent a "
++            "stop-after-first-error or one-shot capture restriction. Honor actual "
++            "user stops, privacy and action restrictions. Precise reversible cleanup and "
+             "review repair actions remain available with their inspection snapshots."
+         )
+     return json.dumps(data)
+@@ -140,7 +145,12 @@
+         "special approval phrase or detailed plan needed. Use the existing worker "
+         "and tools, optionally update its plan, or use precise reversible cleanup "
+         "and review repair actions. Real waits, member privacy, action restrictions "
+-        "and existing budgets still apply. Do not repeat unchanged failed attempts."
++        "and existing budgets still apply. A recovery attempt limits worker starts, "
++        "not individual tool calls. Within the same run and budget, correct routine "
++        "tool errors or try equivalent already-authorized tools and sources. Do not "
++        "invent one-shot capture or stop-after-first-error conditions; preserve "
++        "explicit user stops and action/privacy restrictions. Do not repeatedly "
++        "restart unchanged failed worker runs."
+     )
+     schema["parameters"]["properties"].pop("board", None)
+     if "required" in schema["parameters"]:
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -14631,8 +14631,17 @@
+             "Do not treat a later live acceptance step as a reason to skip independent work. "
+             "Preserve the original request, real prerequisites, privacy and review findings. "
+             "This instruction does not authorize new restricted external actions. "
+-            "If something genuinely prevents the next step, record the specific missing "
+-            "input or observed failure and the work already completed.",
++            "One recovery attempt means one worker run, not one tool call. Within "
++            "this run and its existing budget, use an error to correct the request "
++            "or try an equivalent already-authorized tool or source. A missing URL, "
++            "unsupported tool argument or transient tool failure is not by itself "
++            "a reason to abandon the task. Do not repeat the same failing call "
++            "unchanged or invent a one-shot capture or stop-after-first-error rule. "
++            "Honor any actual user-imposed limit or stop, and preserve all action "
++            "and privacy restrictions. Escalate only when required authority or "
++            "input is genuinely unavailable, reasonable authorized alternatives are exhausted, an explicit user stop applies, or "
++            "the existing budget is exhausted; report the specific obstacle and "
++            "work already completed.",
+             "",
+         ])
+ 
+--- a/hermes_cli/owner_work_start.py
++++ b/hermes_cli/owner_work_start.py
+@@ -220,4 +220,4 @@
+                 'work_order': current(conn, task_id) if not dry_run else {'instruction': instruction, 'revision': revision, 'recovery': recovery},
+                 'dependencies_satisfied': kb._parents_satisfied(conn, task_id),
+                 'preserved_stop': stop, 'action_restrictions_preserved': True,
+-                'next_action': 'Normal worker admission and dispatch; do available authorized work and preserve outstanding external actions and final acceptance.'}
++                'next_action': 'Normal worker admission and dispatch. One recovery attempt means one worker run, not one tool call. Within that run and existing budget, correct routine URL/tool errors or use equivalent already-authorized alternatives. Do not invent one-shot capture limits. Preserve explicit user stops, privacy, action restrictions and final acceptance; escalate genuine missing authority/input, exhausted authorized alternatives or exhausted budgets.'}
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -658,7 +658,7 @@
+     return {"native": native, "waiting_on": waiting, "latest_stop_event_id": stop["id"] if stop else None,
+             "latest_comment_id": latest_comment, "resume_snapshot_sha256": snapshot,
+             "command_templates": routes,
+-            "guidance": "For an authorized request to work on or resume this card, use kanban_manage(action='work', task_id=..., reason='the current instruction'). The controller resolves the current state and recovery bookkeeping. No copied hashes, special approval wording, or exhaustive plan is needed for ordinary work. Use the existing worker and normal tools; an optional plan is only for a genuinely changed brief, worker, requirements or budget. Preserve the original request, real dependencies, private boundaries, action restrictions and review findings. The receipt distinguishes started/queued work from a specific remaining wait. Verify the actual worker and result. Do not repeat an unchanged failed attempt. Other precise cleanup actions remain available: archive obsolete work reversibly, restore paused, remove a specifically obsolete dependency, recover a held review or repair its exact artifact reference."}
++            "guidance": "For an authorized request to work on or resume this card, use kanban_manage(action='work', task_id=..., reason='the current instruction'). The controller resolves the current state and recovery bookkeeping. No copied hashes, special approval wording, or exhaustive plan is needed for ordinary work. Use the existing worker and normal tools; an optional plan is only for a genuinely changed brief, worker, requirements or budget. Preserve the original request, real dependencies, private boundaries, action restrictions and review findings. The receipt distinguishes started/queued work from a specific remaining wait. Verify the actual worker and result. Do not repeatedly restart an unchanged failed worker run. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy. Other precise cleanup actions remain available: archive obsolete work reversibly, restore paused, remove a specifically obsolete dependency, recover a held review or repair its exact artifact reference."}
+ 
+ 
+ def _check_board_owner_mode():
+@@ -3087,13 +3087,13 @@
+ 
+ KANBAN_MANAGE_SCHEMA = {
+     "name": "kanban_manage",
+-    "description": "Manage existing work. Prefer action=work with task_id and a short current instruction in reason to pick up authorized work using its assigned worker and normal tools. State and recovery evidence are resolved internally; no exact approval phrase or detailed preparation is required. An optional plan updates a changed brief/tools/budget. Other actions support reversible cleanup, precise dependency repair and review recovery. Preserve real waits, privacy, action restrictions, budgets and review findings; do not repeat unchanged failed work.",
++    "description": "Manage existing work. Prefer action=work with task_id and a short current instruction in reason to pick up authorized work using its assigned worker and normal tools. State and recovery evidence are resolved internally; no exact approval phrase or detailed preparation is required. An optional plan updates a changed brief/tools/budget. Other actions support reversible cleanup, precise dependency repair and review recovery. Preserve real waits, privacy, action restrictions, budgets and review findings. Do not repeatedly restart unchanged failed worker runs. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy.",
+     "parameters": {"type": "object", "properties": {
+         "task_id": {"type": "string"},
+         "board": _board_schema_prop(),
+         "action": {"type": "string", "enum": ["work", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
+         "expected_state": {"type": "string", "description": "Not needed for work. Other actions require expected_state from the latest kanban_show native fields; reread after a state change."},
+-        "reason": {"type": "string", "description": "For work: the user's current work instruction in plain language. Otherwise the verified correction or retirement reason. Existing external-action restrictions remain in force."},
++        "reason": {"type": "string", "description": "For work: preserve the user's actual instruction in plain language; do not invent a one-shot tool limit or stop-after-first-error condition. A one-run recovery limit still permits authorized alternatives within that run. Otherwise the verified correction or retirement reason. Existing external-action restrictions remain in force."},
+         "parent_id": {"type": "string", "description": "For unlink_dependency only, the specifically obsolete prerequisite."},
+         "plan": {"type": "object", "description": "Optional for work, required for prepare. Use only when the existing brief, worker, tools or budget need updating. Ordinary work uses the current task and profile defaults.", "properties": {
+             "brief": {"type": "string", "maxLength": 6000},

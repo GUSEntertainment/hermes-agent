@@ -1,0 +1,52 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T22:34:52.720154+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-simple-work-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-adaptive-work",
+      "files": [
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": "11ea789c206a1181d5b9e2779e6a0d5f3cfdfb6345d0bb87a7ab8d146c72b843",
+          "after_sha256": "adcaad0fdda08a8cc893fabc39de37115824e66d6a4369975d36b2602ff14ed8"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "9d39dcca9f8942b09a58f00bea87715d3ffb106992f2434368d3f05c4278f98f",
+          "after_sha256": "60af2b5e0343e7971fffb2fed0844ff26a8f5205fea0417b446b699ec85a645f"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "a347db8c100a36a5f2900cc42ecb48d05904dc30ebc55184d450c0f6de787f63",
+          "after_sha256": "07d22331e50aecb831507525259dc1dac0173be74415064157807ea20d7f8f6d"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "4a03c0236d0e172c611ee67df33aca13521e367707e945151925de1d15643192",
+          "after_sha256": "41cda7f4ad823549c8b3d1449c2bd8349ad433b1f52564f6f941540eb26bab08"
+        }
+      ],
+      "patch_sha256": "09a8ab946e3eef50868b1f45f713fd66a0df02a0fc66c90b398f22fede187ac4",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-simple-work-controller-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-adaptive-work-controller",
+      "files": [
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "7756c01be317fc12961a0bd408946a01fbd219d2f0338df2083b9ef8938e5dac",
+          "after_sha256": "40e9a1d6d001c636b4c62a44fff7ed5e29d2786dfb1a3db9b72b4b05044c4f51"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "a347db8c100a36a5f2900cc42ecb48d05904dc30ebc55184d450c0f6de787f63",
+          "after_sha256": "07d22331e50aecb831507525259dc1dac0173be74415064157807ea20d7f8f6d"
+        }
+      ],
+      "patch_sha256": "79254bbd9dcd7878d54e7b362489d77055152d49aa5e92926c8b8cdc903f3971",
+      "patch": "controller.patch"
+    }
+  }
+}

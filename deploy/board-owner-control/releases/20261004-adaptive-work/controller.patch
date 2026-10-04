@@ -1,0 +1,30 @@
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -15369,8 +15369,17 @@
+             "Do not treat a later live acceptance step as a reason to skip independent work. "
+             "Preserve the original request, real prerequisites, privacy and review findings. "
+             "This instruction does not authorize new restricted external actions. "
+-            "If something genuinely prevents the next step, record the specific missing "
+-            "input or observed failure and the work already completed.",
++            "One recovery attempt means one worker run, not one tool call. Within "
++            "this run and its existing budget, use an error to correct the request "
++            "or try an equivalent already-authorized tool or source. A missing URL, "
++            "unsupported tool argument or transient tool failure is not by itself "
++            "a reason to abandon the task. Do not repeat the same failing call "
++            "unchanged or invent a one-shot capture or stop-after-first-error rule. "
++            "Honor any actual user-imposed limit or stop, and preserve all action "
++            "and privacy restrictions. Escalate only when required authority or "
++            "input is genuinely unavailable, reasonable authorized alternatives are exhausted, an explicit user stop applies, or "
++            "the existing budget is exhausted; report the specific obstacle and "
++            "work already completed.",
+             "",
+         ])
+ 
+--- a/hermes_cli/owner_work_start.py
++++ b/hermes_cli/owner_work_start.py
+@@ -220,4 +220,4 @@
+                 'work_order': current(conn, task_id) if not dry_run else {'instruction': instruction, 'revision': revision, 'recovery': recovery},
+                 'dependencies_satisfied': kb._parents_satisfied(conn, task_id),
+                 'preserved_stop': stop, 'action_restrictions_preserved': True,
+-                'next_action': 'Normal worker admission and dispatch; do available authorized work and preserve outstanding external actions and final acceptance.'}
++                'next_action': 'Normal worker admission and dispatch. One recovery attempt means one worker run, not one tool call. Within that run and existing budget, correct routine URL/tool errors or use equivalent already-authorized alternatives. Do not invent one-shot capture limits. Preserve explicit user stops, privacy, action restrictions and final acceptance; escalate genuine missing authority/input, exhausted authorized alternatives or exhausted budgets.'}

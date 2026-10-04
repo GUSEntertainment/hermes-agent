@@ -237,3 +237,16 @@ A consumed first-review reserve is never regenerated.
 Validation: five real skill-sync/admission checks passed in each lane; twelve
 focused native review checks and thirty-four existing work/budget checks passed.
 Both isolated deployment preflight lanes pass. These tests do not call a model.
+
+
+## Adaptive work inside a bounded run
+
+Apply `releases/20261004-adaptive-work` after simple-work-v2 in both lanes.
+This wording-only correction clarifies that a recovery attempt bounds worker
+starts, not individual tool calls. Owner/member guidance and new worker context
+permit equivalent authorized alternatives after routine tool or URL errors,
+without inventing stop-after-first-error restrictions. Explicit user stops,
+action/privacy restrictions and existing budgets remain. Workers stop when
+reasonable authorized methods are exhausted instead of blindly repeating calls.
+It does not modify already-running conversation prompts, add tools, increase
+budgets, or create retry jobs. Syntax and isolated deployment preflight verified.
