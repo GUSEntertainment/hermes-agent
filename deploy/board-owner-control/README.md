@@ -216,3 +216,24 @@ review reserve or increased token/time cap is granted.
 Package: `releases/20261004-simple-work`. The paired source trees and offline
 preflight retain existing member isolation, preparation and profile-routing fixes.
 This is an owner-directed pickup path, not a recurring model-driven triage scan.
+
+
+## Simple work startup and native reviewer continuation
+
+Apply `releases/20261004-simple-work-v2` after `20261004-simple-work` in both lanes.
+The existing manifest-aware bundled-skill synchronization now runs in the exact
+worker profile and runtime before admission is signed. Worker startup becomes
+idempotent; actual subsequent source or permission changes still invalidate
+admission. This fixes the observed Grace startup failure without excluding skill
+source from verification.
+
+The simple `work` action also resumes an ordinary native held review without an
+owner-cell goal, using its ended maker, existing evidence and bound reviewer. It
+preserves findings and action restrictions, never restarts the maker, and accepts
+one attempt per new authenticated work instruction within existing daily limits.
+Historical receipts remain counted, including receipts from before this overlay.
+A consumed first-review reserve is never regenerated.
+
+Validation: five real skill-sync/admission checks passed in each lane; twelve
+focused native review checks and thirty-four existing work/budget checks passed.
+Both isolated deployment preflight lanes pass. These tests do not call a model.
