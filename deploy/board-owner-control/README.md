@@ -151,3 +151,33 @@ The active controller additionally requires `releases/20261004-controller-contex
 Both source lanes contain the same resolver change and11 focused offline regressions. Ten existing member-worker isolation tests and both deployment preflight lanes pass. The read-only live inventory admits all12 department heads without rewriting the matrix or starting workers. Existing triage/explicit holds are not automatically bulk-released.
 
 The main gateway uses the existing guarded release switch; point the guarded controller wrapper to the paired native-profile-controller first. `operational/switch_personal_runtime.py --manifest <package>/manifest.json --apply` changes only Personal's source path and working directory, retaining its config, credentials and authenticated identity, with exact backup and automatic startup rollback. It supports explicit rollback under input hashes. No additional phone restart is required for routes using the shared gateway.
+
+
+## Prepared work (October 4)
+
+`kanban_manage(action="prepare")` and authenticated `own_work_manage` now record
+an idle existing card's current brief, acceptance criteria, eligible worker,
+required tools/resources and explicit execution budget. Preparation preserves the
+original request, status, dependencies, review findings and failure history. It
+never starts a worker. Inspect its offline readiness and effective limits before
+using the existing recovery action. Member operations remain confined to the
+currently authenticated member's enrolled board; future members inherit the same
+registration.
+
+The normal dispatcher uses the prepared requirements and an authorized subset of
+the worker's tools, then performs its existing admission checks. Member/private
+worker policies remain authoritative. The current brief comes first in worker
+context with bounded recent history; original instructions and paginated history
+remain available. A changed plan invalidates outstanding admission. A changed
+substantive brief creates a new input version; raising a budget alone does not
+reset attempts or the rolling run allowance.
+
+The preparation tool accepts one attempt per input and explicit bounded budgets.
+Existing operator ceilings still apply and are reported. No recovery scheduler,
+automatic retry loop or overnight job is added. A valid completion still depends
+on the actual task's acceptance and review requirements.
+
+`operational/switch_personal_runtime.py` reads the reviewed runtime pair from the
+manifest and creates a separate receipt for each target. It changes only the
+Personal service's source path and working directory, checks candidate hashes,
+retains identity/configuration, and rolls back a failed startup.

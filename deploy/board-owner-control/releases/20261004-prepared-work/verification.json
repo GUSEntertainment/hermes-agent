@@ -1,0 +1,23 @@
+{
+  "focused_tests": {
+    "passed": 101,
+    "failed": 0
+  },
+  "controller_materialization_tests": {
+    "passed": 4,
+    "failed": 0
+  },
+  "offline_preflight": {
+    "gateway": true,
+    "controller": true,
+    "network_or_models": false
+  },
+  "existing_readiness_suite": {
+    "passed": 52,
+    "failed": 4,
+    "limitation": "Four synthetic-profile admission subprocess tests remain incompatible with production-bound enrollment. A representative failure also reproduced on untouched baseline. No authority bypass added."
+  },
+  "live_status": "Not activated when this source receipt was written",
+  "gateway": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work",
+  "controller": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-controller"
+}

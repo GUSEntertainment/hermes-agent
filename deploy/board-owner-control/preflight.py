@@ -171,6 +171,66 @@ def profile_routing_probe():
     return ["profile_edits_preserve_routing", "current_identity_and_declared_authority_retained"]
 
 
+def preparation_probe():
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.board_owner_manage import describe, execute
+    from hermes_cli.owner_work_preparation import current
+    from hermes_cli.kanban_completion import task_limits
+    home = Path(os.environ['HERMES_HOME'])
+    profile = home / 'profiles' / 'prepared-worker'
+    profile.mkdir(parents=True)
+    (profile / 'config.yaml').write_text('platform_toolsets:\n  cli: [file, kanban]\n')
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title='Prepared deliverable', body='Original request; no external sends.',
+                             assignee='prepared-worker', triage=True,
+                             workspace_kind='dir', workspace_path=str(home))
+        budget = dict(max_runs_per_day=2, max_attempts_per_input=1, worker_max_turns=24,
+                      worker_run_seconds=600, worker_total_tokens=128000, worker_request_tokens=64000)
+        plan = dict(brief='Use the saved input to write and verify the result.',
+                    acceptance=['Result exists and has been checked.'], requirements={'toolsets': ['file']}, budget=budget)
+        args = dict(action='prepare', task_id=tid, expected_state=describe(conn, tid)['expected_state'],
+                    reason='Current authorized next step', plan=plan)
+        preview = execute(dict(args, dry_run=True))
+        require(preview['ok'] and current(conn, tid) is None, 'Preparation preview mutated the task')
+        result = execute(args)
+        task = kb.get_task(conn, tid)
+        require(result['ok'] and task.status == 'triage' and task.body == 'Original request; no external sends.',
+                'Preparation changed held state or original authority')
+        require(current(conn, tid)['brief'] == plan['brief'], 'Prepared task brief not durable')
+        require(task_limits({}, task)['worker_max_turns'] == 24, 'Prepared execution budget ignored')
+        require('Current prepared next step' in kb.build_worker_context(conn, tid), 'Worker did not receive preparation')
+    return ['native_prepare_preview_apply', 'prepared_request_and_hold_preserved', 'prepared_worker_context_and_budget']
+
+
+
+def isolated_authority_sources():
+    """Exercise real authority checks against explicit synthetic installation data."""
+    import sqlite3
+    from gateway import member_worker_policy as member
+    from gateway import private_action_worker_policy as private
+    from gateway import owner_delegation
+    home = Path(os.environ['HERMES_HOME']).resolve(strict=True)
+    require(home == Path(os.environ['HOME']).resolve(strict=True), 'Preflight HOME mismatch')
+    slug = 'preflight-fixture'
+    database = home / 'kanban' / 'boards' / slug / 'kanban.db'
+    database.parent.mkdir(parents=True, exist_ok=True)
+    (database.parent / 'board.json').write_text(json.dumps({'slug': slug}))
+    os.environ['HERMES_KANBAN_BOARD'] = slug
+    os.environ['HERMES_KANBAN_DB'] = str(database)
+    member.ROOT = private.ROOT = owner_delegation.ROOT = home
+    original_select = member.select
+    member.select = lambda task, board, worker, **kw: original_select(task, board, worker, root=home)
+    for relative, payload in (
+        ('private/phone-assistant/caller-profiles.json', {'profiles': [{'profile_key': 'chris', 'board': slug}]}),
+        ('private/photon-intake/custody-enrollments.json', {'enrollments': []}),
+    ):
+        path = home / relative; path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload)); path.chmod(0o600)
+    with sqlite3.connect(home / 'private/phone-assistant/actions.sqlite') as actions:
+        actions.execute('CREATE TABLE phone_task_links(task_id TEXT,board TEXT,authority_realm TEXT)')
+
+
 def isolated_child(lane, root):
     # Hard fail network/process attempts. Hooks are installed before release imports.
     def audit(event, args):
@@ -179,8 +239,10 @@ def isolated_child(lane, root):
             raise RuntimeError(f"Preflight prohibits {event}")
     sys.addaudithook(audit)
     sys.path.insert(0, str(root))
+    isolated_authority_sources()
     checks = gateway_probe() if lane == "gateway" else controller_probe()
     checks.extend(profile_routing_probe())
+    checks.extend(preparation_probe())
     print(json.dumps({"lane": lane, "ok": True, "checks": checks}))
 
 
@@ -206,9 +268,9 @@ def main():
     results = []
     for lane, root in roots.items():
         with tempfile.TemporaryDirectory(prefix="hermes-board-preflight-") as tmp:
-            home = Path(tmp)
+            home = Path(tmp).resolve()
             (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
-            environment = {"PATH": "/usr/bin:/bin", "HOME": tmp, "HERMES_HOME": tmp,
+            environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "HERMES_HOME": str(home),
                            "HERMES_KANBAN_DB": str(home / "board.db"),
                            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
                            "LANG": "C.UTF-8", "TZ": "UTC"}

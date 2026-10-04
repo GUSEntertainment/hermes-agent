@@ -1,0 +1,1449 @@
+--- a/hermes_cli/board_owner_manage.py
++++ b/hermes_cli/board_owner_manage.py
+@@ -14,7 +14,7 @@
+ from pathlib import Path
+ 
+ _expected = ContextVar('owner_board_expected_state', default=None)
+-ACTIONS = ('archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
++ACTIONS = ('prepare', 'archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
+ 
+ 
+ # Set only after the controller verifies a signed gateway request.
+@@ -171,7 +171,7 @@
+     member = require_owner()
+     if member is not None and _member_context.get() is None:
+         raise PermissionError('Member mutations require the signed controller request')
+-    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence'}
++    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence', 'plan'}
+     if not isinstance(args, dict) or set(args) - allowed:
+         raise ValueError('Unsupported board operation fields')
+     from gateway.gus_admin_cli import admission
+@@ -189,7 +189,7 @@
+     dry = args.get('dry_run', False)
+     if type(dry) is not bool:
+         raise ValueError('dry_run must be boolean')
+-    if dry and action not in ('start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
++    if dry and action not in ('prepare', 'start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
+         raise ValueError('Dry run is supported for triage and review operations; other operations are reversible')
+     board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+     actor = member['principal'] if member is not None else 'default'
+@@ -199,7 +199,11 @@
+     try:
+         with admission(proof), kb.connect_closing(board=board) as conn:
+             validate_bound_target(conn, task_id, cli_action)
+-            if action == 'archive':
++            if action == 'prepare':
++                from hermes_cli.owner_work_preparation import prepare
++                prepared = prepare(conn, task_id, args.get('plan'), actor=actor, member=member, reason=reason, dry_run=dry)
++                return dict(ok=True, action=action, task_id=task_id, board=board, status=kb.get_task(conn, task_id).status, dry_run=dry, preparation=prepared, native=describe(conn, task_id), next_action='Inspect preparation readiness and existing holds; resume separately only after the blocking condition is resolved')
++            elif action == 'archive':
+                 changed = kb.archive_task(conn, task_id, reason=reason)
+             elif action == 'restore':
+                 changed = kb.restore_task(conn, task_id, reason=reason) is not None
+--- a/hermes_cli/kanban_completion.py
++++ b/hermes_cli/kanban_completion.py
+@@ -1,8 +1,9 @@
+ """Deterministic Kanban execution budgets; no model or network dependencies.
+ 
+-Limits are opt-in through kanban.completion in config.yaml. Admission is called
+-under the existing board dispatch lock. Receipts share its transactional event
+-ledger, so a restart cannot reset the rolling budget or repeated-input limit.
++Limits are opt-in through kanban.completion or a prepared task execution budget.
++Admission is called under the existing board dispatch lock. Receipts share its
++transactional event ledger, so a restart cannot reset the rolling budget or
++repeated-input limit.
+ """
+ from __future__ import annotations
+ 
+@@ -50,6 +51,9 @@
+             if key not in DEFAULTS or type(value) is not int or value < 1:
+                 raise ValueError("invalid per-task completion budget field")
+     result["task_budgets"] = task_budgets
++    # Maintenance defaults are not implicit ceilings on prepared user work.
++    # Only operator-configured global fields constrain its own explicit plan.
++    result["_explicit_limits"] = {key: result[key] for key in DEFAULTS if key in raw}
+     if raw.get("outcome_candidates_dir"):
+         from pathlib import Path
+         output = Path(raw["outcome_candidates_dir"]).expanduser()
+@@ -59,6 +63,40 @@
+     return result
+ 
+ 
++def _prepared_execution_budget(value: dict) -> dict | None:
++    raw = value.get("worker_budget_json")
++    if raw is None or raw == "":
++        return None
++    field = "worker_budget_json.execution_budget"
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"Invalid {field}: worker_budget_json must be a JSON object; repair the task plan before dispatch") from exc
++    if type(raw) is not dict:
++        raise ValueError(f"Invalid {field}: worker_budget_json must be an object; repair the task plan before dispatch")
++    if "execution_budget" not in raw:
++        return None
++    budget = raw["execution_budget"]
++    if type(budget) is not dict or set(budget) != set(DEFAULTS):
++        raise ValueError(f"Invalid {field}: require exactly {', '.join(DEFAULTS)}; repair the task plan before dispatch")
++    bounds = {
++        "max_runs_per_day": (1, 4),
++        "max_attempts_per_input": (1, 1),
++        "worker_max_turns": (12, 64),
++        "worker_run_seconds": (60, 1800),
++        "worker_total_tokens": (32000, 256000),
++        "worker_request_tokens": (8000, 128000),
++    }
++    for key, (lower, upper) in bounds.items():
++        number = budget[key]
++        if type(number) is not int or not lower <= number <= upper:
++            raise ValueError(f"Invalid {field}.{key}: require an integer from {lower} to {upper}; repair the task plan before dispatch")
++    if budget["worker_request_tokens"] > budget["worker_total_tokens"]:
++        raise ValueError(f"Invalid {field}: worker_request_tokens must not exceed worker_total_tokens; repair the task plan before dispatch")
++    return dict(budget)
++
++
+ def task_limits(settings: dict, task: Any) -> dict:
+     """Routine repair has fixed limits; substantive work uses explicit task budgets.
+ 
+@@ -66,10 +104,29 @@
+     budget was requested. This never imposes the maintenance cap on a build,
+     important email, financial analysis or other substantive user outcome.
+     """
+-    if not settings or task is None:
++    if task is None:
+         return {}
+     value = task if isinstance(task, dict) else vars(task)
+     task_id = value.get("id")
++    prepared = _prepared_execution_budget(value)
++    if prepared is not None:
++        if not isinstance(task_id, str) or not task_id:
++            raise ValueError("Prepared execution budget requires a task id before dispatch")
++        # Plain settings mappings used by existing callers contain explicit
++        # limits. policy() distinguishes configured fields from its defaults.
++        configured = settings.get("_explicit_limits", {key: settings[key] for key in DEFAULTS if key in settings})
++        overrides = settings.get("task_budgets", {}).get(task_id, {})
++        for ceilings in (configured, overrides):
++            if not isinstance(ceilings, dict):
++                raise ValueError("Invalid configured completion budget ceiling")
++            for key, ceiling in ceilings.items():
++                if key not in DEFAULTS or type(ceiling) is not int or ceiling < 1:
++                    raise ValueError(f"Invalid configured completion budget ceiling: {key}")
++                prepared[key] = min(prepared[key], ceiling)
++        prepared["worker_request_tokens"] = min(prepared["worker_request_tokens"], prepared["worker_total_tokens"])
++        return {**prepared, "budget_scope": "task:" + task_id}
++    if not settings:
++        return {}
+     explicit = settings.get("task_budgets", {}).get(task_id)
+     if explicit is not None:
+         return {**DEFAULTS, **explicit, "budget_scope": "task:" + task_id}
+@@ -94,6 +151,13 @@
+     launch_surface = _readiness_launch_surface(conn, task)
+     if launch_surface is not None:
+         data["readiness_launch_surface"] = launch_surface
++    from hermes_cli.owner_work_preparation import current as prepared_work
++    plan = prepared_work(conn, task_id)
++    if plan is not None:
++        # A changed execution brief is new substantive input. Increasing its
++        # budget or recording the same plan again is not another attempt.
++        data["prepared_work"] = {key: plan.get(key) for key in (
++            "brief", "acceptance", "requirements", "assignee", "skills")}
+     data["dependencies"] = [dict(row) for row in conn.execute(
+         "SELECT l.parent_id,l.edge_role,p.status,p.result "
+         "FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1501,6 +1501,8 @@
+     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
+     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
+     block_recurrences: int = 0
++    # Durable execution/preparation contract, also bound by admission CAS.
++    worker_budget_json: Optional[str] = None
+     # Ephemeral authority returned only by an explicitly opted-in review claim.
+     # Exclude the bearer token from dataclass repr/equality to avoid accidental
+     # log disclosure and keep durable Task comparisons lifecycle-only.
+@@ -1570,6 +1572,7 @@
+                 row["current_step_key"] if "current_step_key" in keys else None
+             ),
+             skills=skills_value,
++            worker_budget_json=row["worker_budget_json"] if "worker_budget_json" in keys else None,
+             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+             provider_override=(
+                 row["provider_override"]
+@@ -10635,12 +10638,22 @@
+             and current.claim_lock is None
+             and _task_admission_snapshot(current) == snapshot
+         ):
++            from hermes_cli.owner_work_preparation import (
++                capture_materialization, reseal_materialization,
++            )
++            preparation = capture_materialization(conn, task.id)
+             updated = conn.execute(
+                 "UPDATE tasks SET workspace_path=?, branch_name=? "
+                 "WHERE id=? AND status=? AND claim_lock IS NULL",
+                 (str(workspace), branch_name, task.id, lane),
+             )
+             if updated.rowcount == 1:
++                # Only this native CAS may carry an existing prepared plan
++                # across workspace resolution. Arbitrary path edits remain stale.
++                reseal_materialization(
++                    conn, task.id, preparation,
++                    resolved_path=str(workspace), resolved_branch=branch_name,
++                )
+                 persisted = get_task(conn, task.id)
+     if persisted is not None:
+         return persisted, workspace
+@@ -12543,6 +12556,9 @@
+     fallbacks.append({"provider": fp, "model": fm})
+ 
+ toolsets = sorted(set(_get_platform_tools(config, "cli")) | (set() if request.get("member_company_policy") else set(request.get("approved_extra_toolsets") or [])))
++if request.get("prepared_requirements") is not None and not request.get("member_company_policy"):
++    from hermes_cli.owner_work_preparation import select_toolsets
++    toolsets = select_toolsets(toolsets, request["prepared_requirements"])
+ enabled_mcp = set(enabled_mcp_server_names(config))
+ if any(name not in enabled_mcp and not validate_toolset(name) for name in toolsets):
+     raise ValueError("invalid explicit toolset")
+@@ -12615,6 +12631,7 @@
+         task.model_override,
+         task.provider_override,
+         task.reasoning_effort,
++        task.worker_budget_json,
+         task.tenant,
+         task.workspace_kind,
+         task.workspace_path,
+@@ -12746,6 +12763,12 @@
+             except (ValueError, TypeError):
+                 rejection = _rejected_worker_admission(task, profile, board, profile_home)
+                 raise WorkerAdmissionError(rejection, {"issues": [{"code": "invalid_requirements", "resource": "task"}]})
++        from hermes_cli.owner_work_preparation import current as current_preparation
++        with connect_closing(board=board) as preparation_conn:
++            prepared = current_preparation(preparation_conn, task.id)
++        if prepared is not None:
++            from hermes_cli.worker_readiness import requirements as parse_requirements
++            needed = parse_requirements('', '```worker-requirements\n' + json.dumps(prepared['requirements']) + '\n```')
+         from hermes_cli.owner_workflow import admission_requirements
+         needed, approved_extra = admission_requirements(task, profile, needed, board=board)
+         from gateway.member_worker_policy import select as select_member_policy
+@@ -12753,7 +12776,8 @@
+         request = {"skills": requested, "readiness": needed,
+                    "workspace": workspace_contract["path"],
+                    "approved_extra_toolsets": approved_extra,
+-                   "member_company_policy": member_policy}
++                   "member_company_policy": member_policy,
++                   "prepared_requirements": needed if prepared is not None else None}
+         with _timing_phase("profile_hash_before", task.id):
+             before_profile_digest = _profile_config_digest(profile_home)
+         with _timing_phase("discovery_subprocess", task.id):
+@@ -15208,6 +15232,11 @@
+     if not task:
+         raise ValueError(f"unknown task {task_id}")
+ 
++    from hermes_cli.owner_work_preparation import current as current_preparation
++    prepared = current_preparation(conn, task_id)
++    prior_limit = 1 if prepared else _CTX_MAX_PRIOR_ATTEMPTS
++    comment_limit = 3 if prepared else _CTX_MAX_COMMENTS
++
+     # Single clock reading shared by every relative-age stamp below, so all
+     # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
+     # by the seconds it takes to build the block).
+@@ -15256,6 +15285,20 @@
+             "Use bounded searches and paginated file reads instead of reloading whole archives or tool catalogs. "
+             "The full sources remain authoritative; a preview is not proof that every required section was checked. "
+             "Do not create another preparation card, reset counters, increase budgets or change permissions.",
++            "",
++        ])
++
++    if prepared:
++        lines.extend([
++            "## Current prepared next step",
++            prepared['brief'],
++            "Acceptance: " + json.dumps(prepared['acceptance'], ensure_ascii=False),
++            "Worker requirements: " + json.dumps(prepared['requirements'], ensure_ascii=False, sort_keys=True),
++            "Execution budget: " + json.dumps(prepared['budget'], sort_keys=True),
++            "This is the owner's current execution plan, not new authority. Preserve the original request, "
++            "privacy, delivery, explicit action holds and review findings below. Reuse the referenced progress. "
++            "Older discussion and run evidence remain available through bounded kanban_show history or kanban log; "
++            "read relevant referenced instructions rather than rediscovering the entire archive.",
+             "",
+         ])
+ 
+@@ -15308,9 +15351,9 @@
+     # more exist without bloating the prompt.
+     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+     # list_runs returns ascending by started_at; "most recent" = last N
+-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
+-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
+-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
++    if len(all_prior) > prior_limit:
++        omitted = len(all_prior) - prior_limit
++        shown = all_prior[-prior_limit:]
+         first_shown_idx = omitted + 1
+     else:
+         omitted = 0
+@@ -15335,7 +15378,7 @@
+                 lines.append(_cap(run.summary))
+             if run.error and run.error.strip():
+                 lines.append(f"_error_: {_cap(run.error)}")
+-            if run.metadata:
++            if run.metadata and not prepared:
+                 try:
+                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                     lines.append(f"_metadata_: `{_cap(meta_str)}`")
+@@ -15391,7 +15434,7 @@
+             else:
+                 body_lines.append("(no result recorded)")
+ 
+-            if run is not None and run.metadata:
++            if run is not None and run.metadata and not prepared:
+                 try:
+                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
+@@ -15406,7 +15449,7 @@
+     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
+     # most recent 5 completed runs, excluding this task so the retry
+     # section above isn't duplicated. Safe on assignee=None (skipped).
+-    if task.assignee:
++    if task.assignee and not prepared:
+         role_rows = conn.execute(
+             "SELECT t.id, t.title, r.summary, r.ended_at "
+             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+@@ -15432,9 +15475,9 @@
+     # comment-storm tasks don't blow out the worker's prompt. Older
+     # comments summarised in a one-line marker like prior attempts.
+     all_comments = list_comments(conn, task_id)
+-    if len(all_comments) > _CTX_MAX_COMMENTS:
+-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
+-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
++    if len(all_comments) > comment_limit:
++        omitted_c = len(all_comments) - comment_limit
++        shown_c = all_comments[-comment_limit:]
+     else:
+         omitted_c = 0
+         shown_c = all_comments
+--- /dev/null
++++ b/hermes_cli/owner_work_preparation.py
+@@ -0,0 +1,395 @@
++"""Audited next-step preparation; never grants authority or starts a worker."""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import re
++import time
++
++EVENT = 'owner_work_prepared'
++_BIND_FIELDS = ('id', 'title', 'body', 'assignee', 'skills', 'tenant', 'workspace_kind',
++                'workspace_path', 'branch_name', 'project_id', 'owner_profile', 'runtime_profile', 'reviewer_profile',
++                'security_realm', 'scope_fingerprint', 'router_mode', 'capability_contract',
++                'model_override', 'provider_override', 'reasoning_effort', 'approval_policy',
++                'worker_budget_json')
++_BUDGET_RANGES = {'max_runs_per_day': (1, 4), 'max_attempts_per_input': (1, 1),
++                  'worker_max_turns': (12, 64), 'worker_run_seconds': (60, 1800),
++                  'worker_total_tokens': (32000, 256000), 'worker_request_tokens': (8000, 128000)}
++
++
++def select_toolsets(available, requirements):
++    """Select a lean subset of the caller's already-authorized toolsets only."""
++    def names(value, field):
++        if (not isinstance(value, (list, tuple, set, frozenset))
++                or any(not isinstance(item, str) or not item.strip() for item in value)):
++            raise ValueError(field + ' must contain nonempty toolset names')
++        return set(value)
++
++    authorized = names(available, 'Available toolsets')
++    if not isinstance(requirements, dict):
++        raise ValueError('Prepared requirements must be an object')
++    requested = names(requirements.get('toolsets', []), 'Prepared toolsets')
++    mcp = requirements.get('mcp', {})
++    if not isinstance(mcp, dict):
++        raise ValueError('Prepared MCP requirements must map server names to operations')
++    requested.update(names(list(mcp), 'Prepared MCP servers'))
++    commands = requirements.get('commands', [])
++    if (not isinstance(commands, list)
++            or any(not isinstance(command, str) or not command.strip() for command in commands)):
++        raise ValueError('Prepared commands must be a list of nonempty strings')
++    for flag in ('terminal_network', 'localhost_server', 'browser_session'):
++        if type(requirements.get(flag, False)) is not bool:
++            raise ValueError('Prepared ' + flag + ' must be true or false')
++    if commands or requirements.get('terminal_network') or requirements.get('localhost_server'):
++        requested.add('terminal')
++    if requirements.get('browser_session'):
++        requested.add('browser')
++    missing = requested - authorized
++    if missing:
++        raise ValueError('Prepared work needs unavailable toolsets: ' + ', '.join(sorted(missing))
++                         + '. Use currently configured authorized toolsets or repair the worker profile before starting.')
++    return sorted(requested | ({'kanban', 'skills'} & authorized))
++
++
++def _hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
++                                    ensure_ascii=True).encode()).hexdigest()
++
++
++def _task(conn, task_id):
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if row is None:
++        raise ValueError('Unknown task in the selected board')
++    return dict(row)
++
++
++def _goal(conn, task_id):
++    row = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def _binding(conn, task_id):
++    task = _task(conn, task_id)
++    goal = _goal(conn, task_id)
++    if goal:
++        goal.pop('updated_at', None)
++    links = [dict(row) for row in conn.execute(
++        'SELECT parent_id,edge_role FROM task_links WHERE child_id=? ORDER BY parent_id,edge_role',
++        (task_id,))]
++    fields = {key: task.get(key) for key in _BIND_FIELDS}
++    if (task.get('workspace_kind') or 'scratch') == 'scratch':
++        from hermes_cli import kanban_db as kb
++        planned = kb._planned_workspace_contract(kb.get_task(conn, task_id), _connection_board(conn, None))
++        fields['workspace_path'] = str(Path(planned['path']).resolve(strict=False))
++    return _hash({'task': fields, 'goal': goal, 'parents': links})
++
++
++def current(conn, task_id):
++    """Return the latest plan only while its exact governing inputs still match."""
++    row = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (task_id, EVENT)).fetchone()
++    if row is None:
++        return None
++    try:
++        record = json.loads(row['payload'])
++        plan = record['plan']
++        if (record.get('version') != 1 or not isinstance(plan, dict)
++                or record.get('plan_digest') != _hash(plan)
++                or record.get('binding_digest') != _binding(conn, task_id)):
++            return None
++        return {**plan, 'preparation_event_id': row['id'], 'plan_digest': record['plan_digest'],
++                'readiness': record.get('readiness', {})}
++    except (KeyError, TypeError, ValueError):
++        return None
++
++
++
++def capture_materialization(conn, task_id):
++    """Capture a current plan inside native worktree persistence's existing CAS."""
++    if not conn.in_transaction:
++        raise ValueError('Native materialization capture requires the existing write transaction')
++    plan = current(conn, task_id)
++    if plan is None:
++        return None
++    row = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (task_id, EVENT)).fetchone()
++    return {'task': _task(conn, task_id), 'goal': _goal(conn, task_id),
++            'parents': [tuple(row) for row in conn.execute(
++                'SELECT parent_id,edge_role FROM task_links WHERE child_id=? ORDER BY parent_id,edge_role', (task_id,))],
++            'event_id': row['id'], 'record': json.loads(row['payload'])}
++
++
++def reseal_materialization(conn, task_id, snapshot, *, resolved_path, resolved_branch):
++    """Append the same brief binding only for the native CAS's exact materialization."""
++    if snapshot is None:
++        return False
++    if not conn.in_transaction:
++        raise ValueError('Native materialization reseal requires the existing write transaction')
++    fresh = _task(conn, task_id)
++    before = snapshot['task']
++    if (before['id'] != task_id or before.get('workspace_kind') != 'worktree'
++            or not isinstance(resolved_path, str) or not Path(resolved_path).is_absolute()
++            or not isinstance(resolved_branch, str) or not resolved_branch):
++        raise ValueError('Exact native worktree materialization is required')
++    expected = {**before, 'workspace_path': resolved_path, 'branch_name': resolved_branch}
++    row = conn.execute('SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (task_id, EVENT)).fetchone()
++    parents = [tuple(row) for row in conn.execute(
++        'SELECT parent_id,edge_role FROM task_links WHERE child_id=? ORDER BY parent_id,edge_role', (task_id,))]
++    if (fresh != expected or _goal(conn, task_id) != snapshot['goal'] or parents != snapshot['parents']
++            or row is None or row['id'] != snapshot['event_id']
++            or json.loads(row['payload']) != snapshot['record']):
++        raise ValueError('Task or plan changed outside exact native worktree materialization')
++    record = snapshot['record']
++    if record['plan_digest'] != _hash(record['plan']):
++        raise ValueError('Preparation digest changed during materialization')
++    binding = _binding(conn, task_id)
++    if binding == record['binding_digest']:
++        return False
++    from hermes_cli import kanban_db as kb
++    kb._append_event(conn, task_id, EVENT, {**record, 'binding_digest': binding,
++        'materialization': {'source': 'native_worktree_preclaim', 'prior_event_id': row['id'],
++                            'prior_binding_digest': record['binding_digest']}})
++    return True
++
++
++def _idle(conn, task):
++    if task['status'] not in {'triage', 'blocked', 'todo', 'ready'}:
++        raise ValueError('Preparation requires idle triage, blocked, todo or ready work')
++    if (any(task.get(key) is not None for key in ('current_run_id', 'worker_pid', 'claim_lock', 'claim_expires'))
++            or conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task['id'],)).fetchone()
++            or conn.execute('SELECT 1 FROM target_leases WHERE task_id=? AND expires_at>=?',
++                            (task['id'], int(time.time()))).fetchone()):
++        raise ValueError('Task has active work; preparation must preserve its current run')
++
++
++def _normalise(plan, task):
++    from hermes_cli.worker_readiness import requirements
++    if (not isinstance(plan, dict) or set(plan) - {'brief', 'acceptance', 'requirements', 'assignee', 'skills', 'budget'}
++            or not {'brief', 'acceptance', 'requirements', 'budget'} <= set(plan)):
++        raise ValueError('Provide brief, acceptance, requirements and budget only, plus optional assignee/skills')
++    brief, acceptance = plan['brief'], plan['acceptance']
++    if not isinstance(brief, str) or not brief.strip() or len(brief) > 6000:
++        raise ValueError('A nonempty next-step brief of at most 6000 characters is required')
++    if (not isinstance(acceptance, list) or not acceptance or len(acceptance) > 32
++            or any(not isinstance(item, str) or not item.strip() for item in acceptance)
++            or sum(map(len, acceptance)) > 2000):
++        raise ValueError('Acceptance must be concise nonempty strings totaling at most 2000 characters')
++    needed = requirements('', '```worker-requirements\n' + json.dumps(plan['requirements']) + '\n```')
++    needed.pop('source', None)
++    budget = plan['budget']
++    if not isinstance(budget, dict) or set(budget) != set(_BUDGET_RANGES):
++        raise ValueError('Execution budget must contain all six supported completion fields')
++    for key, (low, high) in _BUDGET_RANGES.items():
++        if type(budget[key]) is not int or not low <= budget[key] <= high:
++            raise ValueError('Execution budget field out of bounds: ' + key)
++    if budget['worker_request_tokens'] > budget['worker_total_tokens']:
++        raise ValueError('Request token budget must not exceed total token budget')
++    from hermes_cli.profiles import normalize_profile_name
++    worker = plan.get('assignee', task.get('assignee'))
++    if not isinstance(worker, str) or not worker:
++        raise ValueError('Choose an existing worker for this task')
++    worker = normalize_profile_name(worker)
++    skills = plan.get('skills')
++    if skills is None:
++        skills = json.loads(task.get('skills') or '[]')
++    if (not isinstance(skills, list) or len(skills) > 32
++            or any(not isinstance(item, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}', item)
++                   or '..' in item.split('/') for item in skills)):
++        raise ValueError('Skills must be a bounded list of existing skill names')
++    return {'brief': brief.strip(), 'acceptance': [s.strip() for s in acceptance],
++            'requirements': needed, 'assignee': worker, 'skills': sorted(set(skills)),
++            'budget': dict(budget)}
++
++
++def _eligible(conn, task, worker, member):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.profiles import profile_exists
++    if not profile_exists(worker) or kb._worker_profile_uses_root_home(worker):
++        raise ValueError('Choose an installed non-root worker profile')
++    goal = _goal(conn, task['id'])
++    if goal and goal.get('phase') == 'review':
++        raise ValueError('This card holds a bound review; use recover_review with its reviewer findings')
++    if worker == task.get('assignee'):
++        return
++    from gateway.private_action_worker_policy import classified_private
++    if goal or classified_private(conn, task['id']) or task.get('runtime_profile') or task.get('reviewer_profile'):
++        raise ValueError('Reassignment would change a bound maker/reviewer route; prepare the existing worker or repair that route explicitly')
++    if member is not None:
++        from gateway.owner_delegation import agents, agent
++        matches = [entry for entry in agents(member['principal'])
++                   if agent(entry['id'], member['principal'])['runtime'] == worker]
++        if len(matches) != 1:
++            raise PermissionError('Choose an active worker in this authenticated member\'s own roster')
++
++
++
++def _connection_board(conn, member):
++    """Select the open board, never an unrelated UI/default board."""
++    from hermes_cli import kanban_db as kb, board_owner_manage as control
++    rows = [row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main']
++    if len(rows) != 1 or not rows[0]:
++        raise PermissionError('Preparation requires a canonical file-backed board')
++    actual = Path(rows[0]).resolve(strict=True)
++    if member is not None:
++        control._validate_member_connection(conn, member)
++        return member['board']
++    for root in (control.ROOT.resolve(), kb.kanban_home().resolve()):
++        try:
++            parts = actual.relative_to(root).parts
++        except ValueError:
++            continue
++        if (len(parts) == 4 and parts[:2] == ('kanban', 'boards')
++                and parts[3] == 'kanban.db' and kb._normalize_board_slug(parts[2]) == parts[2]):
++            return parts[2]
++    if actual == kb.kanban_db_path(board='default').resolve(strict=True):
++        return 'default'
++    raise PermissionError('Open database is not a canonical native board')
++
++
++def _effective_budget(task, plan):
++    from hermes_cli.kanban_completion import policy, task_limits
++    sibling = json.loads(task.get('worker_budget_json') or '{}')
++    if not isinstance(sibling, dict):
++        raise ValueError('Existing worker budget must be an object')
++    sibling['execution_budget'] = plan['budget']
++    candidate = {**task, 'worker_budget_json': sibling}
++    effective = task_limits(policy(), candidate)
++    constraints = [{'field': key, 'requested': value, 'effective': effective[key],
++                    'source': 'existing_operator_budget'}
++                   for key, value in plan['budget'].items() if effective[key] < value]
++    ceiling = task.get('max_runtime_seconds')
++    if ceiling is not None:
++        if type(ceiling) is not int or ceiling < 1:
++            raise ValueError('Existing task runtime ceiling must be a positive integer')
++        effective['max_runtime_seconds'] = ceiling
++        if ceiling < effective['worker_run_seconds']:
++            constraints.append({'field': 'worker_run_seconds',
++                                'requested': plan['budget']['worker_run_seconds'],
++                                'effective': ceiling, 'source': 'task.max_runtime_seconds'})
++            effective['worker_run_seconds'] = ceiling
++    return {'effective_budget': effective, 'budget_constraints': constraints}
++
++
++def _readiness(conn, task, plan, member):
++    """Offline profile/resource checks; never connect to MCP or a model provider."""
++    import yaml
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.profiles import get_profile_dir
++    from hermes_cli.tools_config import _get_platform_tools
++    from hermes_cli.worker_readiness import probe
++    from gateway.member_worker_policy import select, effective
++    board = _connection_board(conn, member)
++    profile = get_profile_dir(plan['assignee'])
++    config = yaml.safe_load((profile / 'config.yaml').read_text()) or {}
++    if not isinstance(config, dict):
++        raise ValueError('Worker configuration must be a mapping')
++    policy = select(task['id'], board, plan['assignee'])
++    config = effective(config, policy)
++    tools = sorted(_get_platform_tools(config, 'cli'))
++    needed = plan['requirements']
++    # The normal claim-time validator performs real connection/auth/schema and
++    # provider checks. Inspection must not start MCP servers or bind sockets.
++    local = {**needed, 'mcp': {}, 'localhost_server': False}
++    workspace = task.get('workspace_path')
++    if not workspace:
++        workspace = kb._planned_workspace_contract(kb.get_task(conn, task['id']), board).get('path')
++    if not workspace:
++        raise ValueError('Task workspace must be resolved before preparation')
++    result = probe(config, local, workspace, tools)
++    result['requirements'] = needed
++    deferred = []
++    for server in needed['mcp']:
++        entry = (config.get('mcp_servers') or {}).get(server)
++        if not isinstance(entry, dict) or entry.get('enabled', True) is False or server not in tools:
++            result['issues'].append({'code': 'missing_mcp_server', 'resource': server})
++        else:
++            deferred.append({'code': 'mcp_connection_auth_schema_check', 'resource': server})
++    if needed['localhost_server']:
++        if ((config.get('security') or {}).get('workspace_confinement') or {}).get('enabled') is True:
++            result['issues'].append({'code': 'localhost_listen_denied', 'resource': 'terminal'})
++        else:
++            deferred.append({'code': 'localhost_bind_check', 'resource': 'terminal'})
++    for skill in plan['skills']:
++        path = profile / 'skills' / skill / 'SKILL.md'
++        if not path.is_file():
++            deferred.append({'code': 'skill_resolution_check', 'resource': skill})
++    return {**result, 'offline_only': True, 'claim_time_admission_required': True,
++            'deferred': deferred, 'requested_toolsets': needed['toolsets'],
++            'local_checks_passed': not result['issues']}
++
++
++def inspect(conn, task_id):
++    from hermes_cli import kanban_db as kb
++    task, goal = _task(conn, task_id), _goal(conn, task_id)
++    plan = current(conn, task_id)
++    exists = conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=? LIMIT 1', (task_id, EVENT)).fetchone()
++    if goal and goal.get('phase') == 'review':
++        action = 'recover_review'
++    elif task['status'] == 'triage':
++        from hermes_cli.board_owner_manage import describe
++        action = 'start_triage' if describe(conn, task_id)['initial_triage'] else 'resume_triage'
++    elif task['status'] == 'blocked':
++        action = 'unblock'
++    elif task['status'] in {'todo', 'ready'}:
++        action = 'normal_dispatch'
++    else:
++        action = 'inspect_active_or_completed_work'
++    dependencies_satisfied = kb._parents_satisfied(conn, task_id)
++    if not dependencies_satisfied and task['status'] in {'triage', 'blocked', 'todo', 'ready'}:
++        action = 'wait_for_dependencies'
++    suggested = [action]
++    if task['status'] in {'triage', 'blocked', 'todo', 'ready'} and not (goal and goal.get('phase') == 'review'):
++        suggested.insert(0, 'prepare')
++    return {'current': plan, 'stale': bool(exists and plan is None), 'next_action': action,
++            'suggested_actions': suggested, 'dependencies_satisfied': dependencies_satisfied,
++            'instruction': 'This is a next-step brief, not new authority. Preserve the original request, holds, review findings and normal worker admission.'}
++
++
++def prepare(conn, task_id, plan, *, actor, member, reason, dry_run=False):
++    from hermes_cli import kanban_db as kb, board_owner_manage as control
++    if type(dry_run) is not bool or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
++        raise ValueError('A concise preparation reason and boolean dry_run are required')
++    if control.require_owner() != member:
++        raise PermissionError('Current owner identity changed')
++    expected_actor = member['principal'] if member else 'default'
++    if actor != expected_actor:
++        raise PermissionError('Preparation actor must be the authenticated owner')
++    task = _task(conn, task_id)
++    _idle(conn, task)
++    normalized = _normalise(plan, task)
++    _eligible(conn, task, normalized['assignee'], member)
++    before = control.describe(conn, task_id)['expected_state']
++    readiness = _readiness(conn, task, normalized, member)
++    budget_report = _effective_budget(task, normalized)
++    readiness.update(budget_report)
++    prior = current(conn, task_id)
++    changed = prior is None or any(prior.get(key) != value for key, value in normalized.items())
++    with kb.write_txn(conn):
++        control.validate_bound_target(conn, task_id, 'prepare')
++        if control.require_owner() != member or control.describe(conn, task_id)['expected_state'] != before:
++            raise ValueError('Board state or owner identity changed; inspect before preparing again')
++        fresh = _task(conn, task_id)
++        _idle(conn, fresh)
++        _eligible(conn, fresh, normalized['assignee'], member)
++        if not dry_run and changed:
++            budget = json.loads(fresh.get('worker_budget_json') or '{}')
++            if not isinstance(budget, dict):
++                raise ValueError('Existing worker budget must be an object')
++            budget['execution_budget'] = normalized['budget']
++            budget['preparation_digest'] = _hash(normalized)
++            conn.execute('UPDATE tasks SET assignee=?,skills=?,worker_budget_json=? WHERE id=?',
++                         (normalized['assignee'], json.dumps(normalized['skills']),
++                          json.dumps(budget, sort_keys=True), task_id))
++            kb._append_event(conn, task_id, EVENT, {'version': 1, 'actor': actor,
++                'reason': reason.strip(), 'plan': normalized, 'plan_digest': _hash(normalized),
++                'binding_digest': _binding(conn, task_id), 'readiness': readiness,
++                'failure_history_preserved': True, 'status_preserved': fresh['status']})
++    return {'task_id': task_id, 'changed': bool(changed and not dry_run), 'would_change': changed,
++            'dry_run': dry_run, 'status': task['status'], 'plan': normalized, 'readiness': readiness,
++            **budget_report,
++            'failure_history_preserved': True, 'worker_started': False,
++            'status_preserved': task['status'],
++            'expected_state': control.describe(conn, task_id)['expected_state'],
++            'next_action': inspect(conn, task_id)['next_action']}
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_work_preparation.py
+@@ -0,0 +1,242 @@
++"""Bounded preparation on isolated native boards; no workers or providers."""
++import json
++from pathlib import Path
++import socket
++import subprocess
++
++import pytest
++
++from hermes_cli import board_owner_manage as control, kanban_db as kb
++from hermes_cli import owner_work_preparation as prep
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID',
++                'HERMES_SESSION_SOURCE', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_HOME'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(home / 'board.db'))
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    for name in ('worker', 'second'):
++        root = home / 'profiles' / name
++        root.mkdir(parents=True)
++        (root / 'config.yaml').write_text('platform_toolsets:\n  cli: [file, kanban]\n')
++    monkeypatch.setattr(control, 'require_owner', lambda: None)
++    from gateway import member_worker_policy
++    monkeypatch.setattr(member_worker_policy, 'select', lambda *a, **kw: None)
++    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: pytest.fail('Unexpected subprocess'))
++    monkeypatch.setattr(socket, 'create_connection', lambda *a, **kw: pytest.fail('Unexpected network'))
++    conn = kb.connect()
++    workspace = home / 'work'; workspace.mkdir()
++    tid = kb.create_task(conn, title='Finish the real deliverable', body='Original authorized request.\n```worker-requirements\n{"toolsets":["file"]}\n```',
++                         assignee='worker', workspace_kind='dir', workspace_path=str(workspace))
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage',consecutive_failures=2,last_failure_error='Original failure',worker_budget_json=? WHERE id=?",
++                     (json.dumps({'producers': 1, 'reviewers': 1}), tid))
++        kb._append_event(conn, tid, 'triaged', {'reason': 'Original failure'})
++    yield conn, tid, workspace
++    conn.close()
++
++
++def plan(**changes):
++    value = {'brief': 'Produce the requested deliverable using the saved inputs.',
++             'acceptance': ['Save the deliverable and verify its contents.'],
++             'requirements': {'toolsets': ['file'], 'mcp': {}},
++             'budget': {'max_runs_per_day': 1, 'max_attempts_per_input': 1,
++                        'worker_max_turns': 24, 'worker_run_seconds': 300,
++                        'worker_total_tokens': 64000, 'worker_request_tokens': 16000}}
++    value.update(changes)
++    return value
++
++
++def run(board, value=None, **kwargs):
++    conn, tid, _ = board
++    return prep.prepare(conn, tid, value or plan(), actor='default', member=None,
++                        reason='Use the corrected bounded next step.', **kwargs)
++
++
++def snapshot(conn, tid):
++    return {'task': dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()),
++            'events': [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (tid,))]}
++
++
++def test_preview_and_apply_preserve_request_holds_failures_and_budget_siblings(board):
++    conn, tid, _ = board
++    before = snapshot(conn, tid)
++    preview = run(board, dry_run=True)
++    assert not preview['changed'] and preview['would_change']
++    assert preview['readiness']['local_checks_passed']
++    assert snapshot(conn, tid) == before
++    receipt = run(board)
++    after = snapshot(conn, tid)
++    assert receipt['changed'] and receipt['status'] == 'triage'
++    for key in ('body', 'status', 'consecutive_failures', 'last_failure_error', 'block_kind'):
++        assert after['task'][key] == before['task'][key]
++    budget = json.loads(after['task']['worker_budget_json'])
++    assert budget['producers'] == budget['reviewers'] == 1
++    assert budget['execution_budget'] == plan()['budget']
++    assert len(after['events']) == len(before['events']) + 1
++    assert prep.current(conn, tid)['brief'] == plan()['brief']
++    state = snapshot(conn, tid)
++    assert not run(board)['changed']
++    assert snapshot(conn, tid) == state
++
++
++def test_lifecycle_does_not_stale_plan_but_changed_request_does(board):
++    conn, tid, _ = board
++    run(board)
++    for status in ('ready', 'running', 'blocked'):
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid)); conn.commit()
++        assert prep.current(conn, tid) is not None
++    conn.execute("UPDATE tasks SET body=body || '\nNew controlling instruction' WHERE id=?", (tid,)); conn.commit()
++    assert prep.current(conn, tid) is None
++    assert prep.inspect(conn, tid)['stale']
++
++
++def test_reassignment_preserves_failure_history(board):
++    conn, tid, _ = board
++    run(board, plan(assignee='second'))
++    task = kb.get_task(conn, tid)
++    assert task.assignee == 'second' and task.consecutive_failures == 2
++    assert task.last_failure_error == 'Original failure'
++
++
++def test_local_readiness_reports_exact_missing_resources_without_connecting(board):
++    receipt = run(board, plan(requirements={'toolsets': ['browser'],
++        'read_paths': ['missing-source.txt'], 'mcp': {'unavailable': ['read']}, 'localhost_server': True}))
++    report = receipt['readiness']
++    assert report['offline_only'] and report['claim_time_admission_required']
++    assert {'code': 'missing_toolset', 'resource': 'browser'} in report['issues']
++    assert {'code': 'missing_input', 'resource': 'missing-source.txt'} in report['issues']
++    assert {'code': 'missing_mcp_server', 'resource': 'unavailable'} in report['issues']
++    assert {'code': 'localhost_bind_check', 'resource': 'terminal'} in report['deferred']
++
++
++@pytest.mark.parametrize('field,value', [('worker_pid', 42), ('claim_lock', 'active')])
++def test_active_refused_atomically(board, field, value):
++    conn, tid, _ = board
++    conn.execute(f'UPDATE tasks SET {field}=? WHERE id=?', (value, tid)); conn.commit()
++    before = snapshot(conn, tid)
++    with pytest.raises(ValueError, match='active work'):
++        run(board)
++    assert snapshot(conn, tid) == before
++
++
++@pytest.mark.parametrize('kind', ['missing_profile', 'bound_route', 'budget_bool', 'budget_extra', 'budget_oversize'])
++def test_invalid_plan_is_atomic(board, kind):
++    conn, tid, _ = board
++    value = plan()
++    if kind == 'missing_profile':
++        value['assignee'] = 'missing'
++    elif kind == 'bound_route':
++        conn.execute("UPDATE tasks SET runtime_profile='worker' WHERE id=?", (tid,)); conn.commit()
++        value['assignee'] = 'second'
++    elif kind == 'budget_bool':
++        value['budget']['worker_max_turns'] = True
++    elif kind == 'budget_extra':
++        value['budget']['unlimited'] = True
++    else:
++        value['budget']['worker_max_turns'] = 1000000
++    before = snapshot(conn, tid)
++    with pytest.raises(ValueError):
++        run(board, value)
++    assert snapshot(conn, tid) == before
++
++
++def test_member_cannot_choose_another_roster(board, monkeypatch):
++    conn, tid, _ = board
++    member = {'principal': 'member', 'profile': 'member', 'board': 'member-home', 'fingerprint': 'fixture'}
++    monkeypatch.setattr(control, 'require_owner', lambda: member)
++    from gateway import owner_delegation
++    monkeypatch.setattr(owner_delegation, 'agents', lambda principal: [])
++    before = snapshot(conn, tid)
++    with pytest.raises(PermissionError, match='own roster'):
++        prep.prepare(conn, tid, plan(assignee='second'), actor='member', member=member, reason='Prepare')
++    assert snapshot(conn, tid) == before
++
++
++def test_state_race_during_readiness_refuses_atomic_apply(board, monkeypatch):
++    conn, tid, _ = board
++    original = prep._readiness
++    def changed(*args):
++        result = original(*args)
++        kb.add_comment(conn, tid, 'owner', 'New direction arrived during preview')
++        return result
++    monkeypatch.setattr(prep, '_readiness', changed)
++    with pytest.raises(ValueError, match='changed'):
++        run(board)
++    assert prep.current(conn, tid) is None
++    assert not conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=?', (tid, prep.EVENT)).fetchone()
++
++
++def test_changed_brief_updates_admission_identity_without_resetting_failures(board):
++    conn, tid, _ = board
++    run(board)
++    before = snapshot(conn, tid)['task']
++    first = json.loads(before['worker_budget_json'])
++    receipt = run(board, plan(brief='Use the corrected source and verify the final document.'))
++    after = snapshot(conn, tid)['task']
++    second = json.loads(after['worker_budget_json'])
++    assert receipt['changed']
++    assert first['execution_budget'] == second['execution_budget']
++    assert first['preparation_digest'] != second['preparation_digest']
++    assert second['preparation_digest'] == prep.current(conn, tid)['plan_digest']
++    for key in ('consecutive_failures', 'last_failure_error', 'body', 'status'):
++        assert before[key] == after[key]
++
++
++def test_daily_budget_can_count_prior_work_and_allow_one_corrected_attempt(board):
++    value = plan()
++    value['budget']['max_runs_per_day'] = 2
++    receipt = run(board, value, dry_run=True)
++    assert receipt['plan']['budget']['max_runs_per_day'] == 2
++    assert receipt['plan']['budget']['max_attempts_per_input'] == 1
++    value['budget']['max_runs_per_day'] = 5
++    with pytest.raises(ValueError, match='max_runs_per_day'):
++        run(board, value, dry_run=True)
++
++
++def test_effective_budget_reports_operator_and_task_runtime_limits(board, monkeypatch):
++    from hermes_cli import kanban_completion as completion
++    conn, tid, _ = board
++    settings = completion.policy({'kanban': {'completion': {'enabled': True, 'task_budgets': {
++        tid: {'worker_max_turns': 8, 'worker_run_seconds': 300}}}}})
++    monkeypatch.setattr(completion, 'policy', lambda: settings)
++    conn.execute('UPDATE tasks SET max_runtime_seconds=120 WHERE id=?', (tid,));conn.commit()
++    value = plan();value['budget']['worker_run_seconds'] = 600
++    receipt = run(board, value, dry_run=True)
++    assert receipt['effective_budget']['worker_max_turns'] == 8
++    assert receipt['effective_budget']['worker_run_seconds'] == 120
++    assert receipt['effective_budget']['max_runtime_seconds'] == 120
++    constraints = receipt['budget_constraints']
++    assert {'field': 'worker_max_turns', 'requested': 24, 'effective': 8,
++            'source': 'existing_operator_budget'} in constraints
++    assert {'field': 'worker_run_seconds', 'requested': 600, 'effective': 120,
++            'source': 'task.max_runtime_seconds'} in constraints
++    assert receipt['readiness']['effective_budget'] == receipt['effective_budget']
++
++
++def test_connection_board_ignores_current_ui_board(board, monkeypatch):
++    conn, tid, workspace = board
++    target = workspace.parent / 'kanban' / 'boards' / 'actual-board' / 'kanban.db'
++    target.parent.mkdir(parents=True)
++    other = kb.connect(db_path=target)
++    try:
++        monkeypatch.setattr(kb, 'get_current_board', lambda: 'unrelated-board')
++        assert prep._connection_board(other, None) == 'actual-board'
++    finally:
++        other.close()
++
++
++def test_scratch_materialization_preserves_plan_but_other_workspace_invalidates(board):
++    conn, tid, workspace = board
++    conn.execute("UPDATE tasks SET workspace_kind='scratch',workspace_path=NULL WHERE id=?", (tid,));conn.commit()
++    run(board)
++    planned = kb._planned_workspace_contract(kb.get_task(conn, tid), prep._connection_board(conn, None))['path']
++    kb.set_workspace_path(conn, tid, planned)
++    assert prep.current(conn, tid) is not None
++    kb.set_workspace_path(conn, tid, str(workspace / 'different'))
++    assert prep.current(conn, tid) is None
+--- /dev/null
++++ b/tests/hermes_cli/test_prepared_tool_selection.py
+@@ -0,0 +1,74 @@
++"""Prepared workers use a lean subset of their existing tool authority."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli.owner_work_preparation import select_toolsets
++
++
++def test_selects_declared_and_mcp_names_without_unrelated_configured_tools():
++    available = ['file', 'terminal', 'browser', 'kanban', 'skills', 'github', 'email']
++    requirements = {'toolsets': ['file', 'file'], 'mcp': {'github': ['search']}}
++    original = deepcopy(requirements)
++    assert select_toolsets(available, requirements) == ['file', 'github', 'kanban', 'skills']
++    assert requirements == original
++    assert available == ['file', 'terminal', 'browser', 'kanban', 'skills', 'github', 'email']
++
++
++@pytest.mark.parametrize('requirements, expected', [
++    ({'commands': ['python -m pytest']}, ['terminal']),
++    ({'terminal_network': True}, ['terminal']),
++    ({'localhost_server': True}, ['terminal']),
++    ({'browser_session': True}, ['browser']),
++    ({'commands': ['curl localhost'], 'browser_session': True}, ['browser', 'terminal']),
++])
++def test_infers_only_tools_required_by_declared_work(requirements, expected):
++    assert select_toolsets(['file', 'terminal', 'browser'], requirements) == expected
++
++
++@pytest.mark.parametrize('available, expected', [
++    ([], []), (['kanban'], ['kanban']), (['skills'], ['skills']),
++    (['terminal', 'skills', 'kanban'], ['kanban', 'skills']),
++])
++def test_control_and_loading_tools_are_optional_existing_authority(available, expected):
++    assert select_toolsets(available, {'terminal_network': False, 'localhost_server': False,
++                                     'browser_session': False}) == expected
++
++
++@pytest.mark.parametrize('requirements, missing', [
++    ({'toolsets': ['terminal']}, 'terminal'),
++    ({'mcp': {'private_store': ['read']}}, 'private_store'),
++    ({'commands': ['python report.py']}, 'terminal'),
++    ({'terminal_network': True}, 'terminal'),
++    ({'localhost_server': True}, 'terminal'),
++    ({'browser_session': True}, 'browser'),
++])
++def test_missing_authority_fails_before_worker_start(requirements, missing):
++    with pytest.raises(ValueError, match='unavailable toolsets: ' + missing) as exc:
++        select_toolsets(['file', 'kanban', 'skills'], requirements)
++    assert 'before starting' in str(exc.value)
++
++
++def test_missing_set_is_sorted_and_does_not_select_a_tool_alias():
++    with pytest.raises(ValueError, match='unavailable toolsets: browser, github'):
++        select_toolsets(['mcp_github', 'browser_use'],
++                        {'toolsets': ['github'], 'browser_session': True})
++
++
++@pytest.mark.parametrize('available, requirements', [
++    ('terminal', {}), ([None], {}), ([''], {}),
++    ([], None), ([], {'toolsets': 'terminal'}),
++    ([], {'mcp': ['github']}), ([], {'mcp': {'': []}}),
++    ([], {'commands': 'python'}), ([], {'commands': ['']}),
++    ([], {'terminal_network': 'false'}), ([], {'localhost_server': 1}),
++    ([], {'browser_session': None}),
++])
++def test_malformed_selector_input_fails_closed(available, requirements):
++    with pytest.raises(ValueError):
++        select_toolsets(available, requirements)
++
++
++def test_deterministic_order_and_no_implicit_file_permission():
++    assert select_toolsets({'skills', 'kanban', 'terminal'},
++                           {'commands': ['python'], 'read_paths': ['/work/input']}) == [
++                               'kanban', 'skills', 'terminal']
+--- /dev/null
++++ b/tests/hermes_cli/test_prepared_work_budget.py
+@@ -0,0 +1,249 @@
++"""Prepared substantive work gets explicit budgets without resetting attempts."""
++from copy import deepcopy
++import importlib
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_completion as completion
++
++
++PLAN_BUDGET = {
++    'max_runs_per_day': 1, 'max_attempts_per_input': 1,
++    'worker_max_turns': 64, 'worker_run_seconds': 1800,
++    'worker_total_tokens': 256000, 'worker_request_tokens': 128000,
++}
++
++
++def task(budget=None):
++    return {'id': 't_prepared', 'created_by': 'Chris', 'worker_budget_json': {
++        'max_children': 3, 'max_rework_rounds': 2,
++        'execution_budget': deepcopy(PLAN_BUDGET if budget is None else budget),
++    }}
++
++
++@pytest.mark.parametrize('encoded', [False, True])
++def test_prepared_budget_applies_without_maintenance_policy_and_preserves_siblings(encoded):
++    value = task()
++    if encoded:
++        value['worker_budget_json'] = json.dumps(value['worker_budget_json'])
++    before = deepcopy(value)
++    limits = completion.task_limits(completion.policy({}), SimpleNamespace(**value))
++    assert limits == {**PLAN_BUDGET, 'budget_scope': 'task:t_prepared'}
++    assert value == before
++    env = {}
++    assert completion.worker_limits(env, limits) == ['--max-turns', '64', '--run-budget', '1800']
++    assert env == {'HERMES_KANBAN_TOTAL_TOKEN_LIMIT': '256000',
++                   'HERMES_KANBAN_REQUEST_TOKEN_LIMIT': '128000'}
++
++
++def test_implicit_maintenance_defaults_do_not_cap_prepared_work():
++    settings = completion.policy({'kanban': {'completion': {'enabled': True}}})
++    assert completion.task_limits(settings, task()) == {**PLAN_BUDGET, 'budget_scope': 'task:t_prepared'}
++    ordinary = {'id': 't_normal', 'created_by': 'Chris', 'worker_budget_json': {'max_children': 3}}
++    assert completion.task_limits(settings, ordinary) == {}
++    assert completion.task_limits({}, ordinary) == {}
++    assert completion.policy({'kanban': {'completion': {'enabled': False, 'worker_max_turns': 12}}}) == {}
++    repair = {**ordinary, 'created_by': 'worker-readiness'}
++    assert completion.task_limits(settings, repair)['budget_scope'] == 'maintenance'
++
++
++def test_explicit_global_and_task_limits_only_tighten_prepared_plan():
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'worker_total_tokens': 64000, 'worker_max_turns': 16,
++        'worker_run_seconds': 3600,
++        'task_budgets': {'t_prepared': {'worker_max_turns': 12, 'worker_request_tokens': 96000}},
++    }}})
++    limits = completion.task_limits(settings, task())
++    assert limits['worker_max_turns'] == 12
++    assert limits['worker_run_seconds'] == 1800
++    assert limits['worker_total_tokens'] == limits['worker_request_tokens'] == 64000
++    assert limits['max_runs_per_day'] == limits['max_attempts_per_input'] == 1
++
++
++@pytest.mark.parametrize('bad', [
++    {}, {'extra': 1, **PLAN_BUDGET},
++    {**PLAN_BUDGET, 'max_runs_per_day': 0},
++    {**PLAN_BUDGET, 'max_runs_per_day': 5},
++    {**PLAN_BUDGET, 'max_attempts_per_input': True},
++    {**PLAN_BUDGET, 'worker_max_turns': 11},
++    {**PLAN_BUDGET, 'worker_max_turns': 65},
++    {**PLAN_BUDGET, 'worker_run_seconds': 59},
++    {**PLAN_BUDGET, 'worker_run_seconds': 1801},
++    {**PLAN_BUDGET, 'worker_total_tokens': 31999},
++    {**PLAN_BUDGET, 'worker_total_tokens': 256001},
++    {**PLAN_BUDGET, 'worker_request_tokens': 7999},
++    {**PLAN_BUDGET, 'worker_request_tokens': 128001},
++    {**PLAN_BUDGET, 'worker_total_tokens': 32000, 'worker_request_tokens': 64000},
++    {**PLAN_BUDGET, 'worker_max_turns': '24'},
++])
++def test_invalid_prepared_budget_fails_closed_without_enabled_maintenance(bad):
++    with pytest.raises(ValueError, match='execution_budget.*repair the task plan'):
++        completion.task_limits({}, task(bad))
++
++
++@pytest.mark.parametrize('raw', ['not-json', '[]', 'null', [], True, {'execution_budget': None}])
++def test_malformed_budget_metadata_fails_closed(raw):
++    with pytest.raises(ValueError, match='execution_budget.*repair the task plan'):
++        completion.task_limits({}, {**task(), 'worker_budget_json': raw})
++
++
++def test_daily_plan_allowance_accepts_four_but_preserves_tighter_root_cap():
++    value = task({**PLAN_BUDGET, 'max_runs_per_day': 4})
++    assert completion.task_limits({}, value)['max_runs_per_day'] == 4
++    settings = completion.policy({'kanban': {'completion': {
++        'enabled': True, 'task_budgets': {'t_prepared': {'max_runs_per_day': 1}},
++    }}})
++    assert completion.task_limits(settings, value)['max_runs_per_day'] == 1
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    kb.init_db()
++    conn = kb.connect()
++    task_id = kb.create_task(conn, title='Existing work', body='Implement the approved fix',
++                             created_by='Chris', assignee='worker')
++    yield conn, task_id
++    conn.close()
++
++
++def store_prepared_plan(conn, task_id, *, budget=None, **changes):
++    from hermes_cli import kanban_db as kb, owner_work_preparation as preparation
++    plan = {'brief': 'Implement the identified routing correction',
++            'acceptance': ['The same request reaches its own board'],
++            'requirements': {'toolsets': ['file']}, 'assignee': 'worker', 'skills': [],
++            'budget': deepcopy(PLAN_BUDGET if budget is None else budget), **changes}
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET worker_budget_json=? WHERE id=?',
++                     (json.dumps({'max_children': 3, 'execution_budget': plan['budget']}), task_id))
++        kb._append_event(conn, task_id, preparation.EVENT, {
++            'version': 1, 'plan': plan, 'plan_digest': preparation._hash(plan),
++            'binding_digest': preparation._binding(conn, task_id), 'readiness': {'offline_only': True},
++        })
++    assert preparation.current(conn, task_id) is not None
++
++
++def test_recorded_attempt_survives_budget_only_plan_revision_restart_and_bookkeeping(board):
++    conn, task_id = board
++    store_prepared_plan(conn, task_id)
++    value = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
++    limits = completion.task_limits({}, value)
++    first = completion.input_fingerprint(conn, task_id)
++    completion.record_admission(conn, task_id, limits)
++    conn.execute("UPDATE tasks SET status='blocked',consecutive_failures=1,last_failure_error='prior failure' WHERE id=?", (task_id,))
++    conn.commit()
++    store_prepared_plan(conn, task_id, budget={**PLAN_BUDGET, 'worker_max_turns': 24})
++    refreshed = importlib.reload(completion)
++    assert refreshed.input_fingerprint(conn, task_id) == first
++    # After the rolling day expires, the same input still cannot retry.
++    assert refreshed.admission_reason(conn, task_id, limits, now=10**12) == 'completion_repeated_input_budget'
++    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='completion_admission'", (task_id,)).fetchone()[0] == 1
++    assert conn.execute('SELECT consecutive_failures FROM tasks WHERE id=?', (task_id,)).fetchone()[0] == 1
++
++
++def test_corrected_plan_can_use_one_additional_run_without_resetting_prior_admission(board):
++    conn, task_id = board
++    store_prepared_plan(conn, task_id)
++    original = {**PLAN_BUDGET, 'budget_scope': 'task:' + task_id}
++    completion.record_admission(conn, task_id, original)
++    budget = {**PLAN_BUDGET, 'max_runs_per_day': 2}
++    store_prepared_plan(conn, task_id, budget=budget)
++    value = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
++    limits = completion.task_limits({}, value)
++    assert completion.admission_reason(conn, task_id, limits) == 'completion_repeated_input_budget'
++    store_prepared_plan(conn, task_id, budget=budget,
++                        brief='Implement the newly identified missing path before verifying the result')
++    assert completion.admission_reason(conn, task_id, limits) is None
++    completion.record_admission(conn, task_id, limits)
++    assert completion.admission_reason(conn, task_id, limits) == 'completion_daily_run_budget'
++    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='completion_admission'", (task_id,)).fetchone()[0] == 2
++
++
++@pytest.mark.parametrize('changed', [
++    {'brief': 'Fix the newly located implementation rather than repeating the old test'},
++    {'acceptance': ['Verify the repaired implementation with the observed failing case']},
++    {'requirements': {'toolsets': ['file', 'terminal']}},
++    {'assignee': 'another-worker'},
++    {'skills': ['focused-debugging']},
++])
++def test_substantive_prepared_input_changes_attempt_identity_without_erasing_history(board, changed):
++    conn, task_id = board
++    store_prepared_plan(conn, task_id)
++    limits = {**PLAN_BUDGET, 'budget_scope': 'task:' + task_id}
++    first = completion.input_fingerprint(conn, task_id)
++    completion.record_admission(conn, task_id, limits)
++    store_prepared_plan(conn, task_id, **changed)
++    assert completion.input_fingerprint(conn, task_id) != first
++    # New input does not replenish today's single-run allowance.
++    assert completion.admission_reason(conn, task_id, limits) == 'completion_daily_run_budget'
++    assert completion.admission_reason(conn, task_id, limits, now=10**12) is None
++    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='completion_admission'", (task_id,)).fetchone()[0] == 1
++
++
++def test_db_task_preserves_prepared_budget_and_claim_cas_without_resetting_attempts(board, tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++
++    conn, task_id = board
++    monkeypatch.setattr(kb, '_fire_kanban_lifecycle_hook', lambda *args, **kwargs: None)
++    profile_home = tmp_path / 'worker-profile'
++    profile_home.mkdir()
++    database = conn.execute('PRAGMA database_list').fetchone()['file']
++
++    def admission_for(actual_task):
++        contract = {'version': 'hermes.worker-admission/v1', 'profile_home': str(profile_home),
++                    'board_database': kb._database_identity_contract(database)}
++        return kb.WorkerAdmission(contract, 'fixture-admission',
++                                  kb._task_admission_snapshot(actual_task),
++                                  kb._profile_config_digest(str(profile_home)))
++
++    store_prepared_plan(conn, task_id)
++    first_task = kb.get_task(conn, task_id)
++    assert isinstance(first_task, kb.Task)
++    assert json.loads(first_task.worker_budget_json) == {
++        'max_children': 3, 'execution_budget': PLAN_BUDGET}
++    first_limits = completion.task_limits({}, first_task)
++    assert first_limits == {**PLAN_BUDGET, 'budget_scope': 'task:' + task_id}
++    first_fingerprint = completion.input_fingerprint(conn, task_id)
++    first_admission = admission_for(first_task)
++    completion.record_admission(conn, task_id, first_limits)
++
++    # A larger budget is not new substantive work and cannot reuse an admission
++    # whose exact Task snapshot was validated before that budget changed.
++    changed_budget = {**PLAN_BUDGET, 'max_runs_per_day': 2, 'worker_max_turns': 24}
++    store_prepared_plan(conn, task_id, budget=changed_budget)
++    conn.execute("UPDATE tasks SET status='ready', consecutive_failures=1 WHERE id=?", (task_id,))
++    conn.commit()
++    budget_task = kb.get_task(conn, task_id)
++    limits = completion.task_limits({}, budget_task)
++    assert limits == {**changed_budget, 'budget_scope': 'task:' + task_id}
++    assert completion.input_fingerprint(conn, task_id) == first_fingerprint
++    assert completion.admission_reason(conn, task_id, limits) == 'completion_repeated_input_budget'
++    assert not kb._admission_still_current(budget_task, first_admission)
++    assert kb.claim_task(conn, task_id, admission=first_admission, expected_assignee='worker') is None
++    assert kb.get_task(conn, task_id).status == 'ready'
++    assert conn.execute('SELECT count(*) FROM task_runs WHERE task_id=?', (task_id,)).fetchone()[0] == 0
++
++    # A corrected execution brief can use the second daily slot, after fresh
++    # admission; neither the original attempt nor its failure history disappears.
++    store_prepared_plan(conn, task_id, budget=changed_budget,
++                        brief='Implement the missing route before verifying it, using the existing failure evidence')
++    corrected_task = kb.get_task(conn, task_id)
++    corrected_limits = completion.task_limits({}, corrected_task)
++    corrected_fingerprint = completion.input_fingerprint(conn, task_id)
++    assert corrected_fingerprint != first_fingerprint
++    assert completion.admission_reason(conn, task_id, corrected_limits) is None
++    fresh_admission = admission_for(corrected_task)
++    assert kb._admission_still_current(corrected_task, fresh_admission)
++    claimed = kb.claim_task(conn, task_id, admission=fresh_admission, expected_assignee='worker')
++    assert isinstance(claimed, kb.Task)
++    assert completion.task_limits({}, claimed) == corrected_limits
++    assert claimed.consecutive_failures == 1
++    completion.record_admission(conn, task_id, corrected_limits)
++    assert completion.admission_reason(conn, task_id, corrected_limits) == 'completion_daily_run_budget'
++    history = [json.loads(row['payload']) for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='completion_admission' ORDER BY id", (task_id,))]
++    assert [event['input_fingerprint'] for event in history] == [first_fingerprint, corrected_fingerprint]
+--- /dev/null
++++ b/tests/hermes_cli/test_prepared_work_materialization.py
+@@ -0,0 +1,119 @@
++"""Native worktree persistence preserves only an unchanged prepared task."""
++import json
++from pathlib import Path
++import socket
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_db as kb, owner_work_preparation as prep
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / '.hermes'
++    home.mkdir()
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(home))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(home / 'kanban.db'))
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', 'default')
++    monkeypatch.delenv('HERMES_KANBAN_WORKSPACES_ROOT', raising=False)
++    monkeypatch.setattr(socket, 'create_connection', lambda *a, **kw: pytest.fail('Unexpected network'))
++    repo = tmp_path / 'project'
++    subprocess.run(['git', 'init', '-b', 'main', str(repo)], check=True, capture_output=True)
++    (repo / 'README.md').write_text('Original project\n')
++    subprocess.run(['git', '-C', str(repo), 'add', 'README.md'], check=True, capture_output=True)
++    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Test User',
++                    '-c', 'user.email=test@example.com', 'commit', '-m', 'Initial'],
++                   check=True, capture_output=True)
++    conn = kb.connect()
++    tid = kb.create_task(conn, title='Complete the authorized implementation',
++                         body='Original scope; retain its original delivery and review.',
++                         assignee='worker', workspace_kind='worktree', workspace_path=str(repo))
++    plan = {'brief': 'Use the existing source and finish its bounded implementation.',
++            'acceptance': ['The requested change passes its focused verification.'],
++            'requirements': {'toolsets': ['file', 'kanban']},
++            'assignee': 'worker', 'skills': [],
++            'budget': {'max_runs_per_day': 1, 'max_attempts_per_input': 1,
++                       'worker_max_turns': 24, 'worker_run_seconds': 300,
++                       'worker_total_tokens': 64000, 'worker_request_tokens': 16000}}
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET worker_budget_json=? WHERE id=?',
++                     (json.dumps({'execution_budget': plan['budget'], 'preparation_digest': prep._hash(plan)}), tid))
++        kb._append_event(conn, tid, prep.EVENT, {
++            'version': 1, 'plan': plan, 'plan_digest': prep._hash(plan),
++            'binding_digest': prep._binding(conn, tid), 'readiness': {'offline_only': True},
++        })
++    assert prep.current(conn, tid) is not None
++    try:
++        yield conn, tid, repo, plan
++    finally:
++        conn.close()
++
++
++def preparation_events(conn, tid):
++    return [dict(row) for row in conn.execute(
++        'SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id', (tid, prep.EVENT))]
++
++
++def test_native_materialization_preserves_plan_and_audits_without_rewriting_history(board):
++    conn, tid, repo, plan = board
++    old_task = kb.get_task(conn, tid)
++    old_events = preparation_events(conn, tid)
++    persisted, workspace = kb._persist_resolved_worktree_preclaim(conn, old_task, 'ready', board='default')
++    assert workspace == (repo / '.worktrees' / tid).resolve()
++    assert persisted.workspace_path == str(workspace)
++    assert persisted.branch_name == f'wt/{tid}'
++    assert persisted.body == old_task.body
++    assert persisted.worker_budget_json == old_task.worker_budget_json
++    prepared = prep.current(conn, tid)
++    assert {key: prepared[key] for key in plan} == plan
++    new_events = preparation_events(conn, tid)
++    assert new_events[:-1] == old_events
++    new_record = json.loads(new_events[-1]['payload'])
++    assert new_record['materialization']['prior_event_id'] == old_events[-1]['id']
++    assert new_record['plan_digest'] == prep._hash(plan)
++    assert new_record['materialization']['source'] == 'native_worktree_preclaim'
++    assert kb.claim_task(conn, tid) is not None
++    assert prep.current(conn, tid)['plan_digest'] == prep._hash(plan)
++    context = kb.build_worker_context(conn, tid)
++    assert plan['brief'] in context and old_task.body in context
++
++
++def test_arbitrary_workspace_edit_stays_stale_after_native_materialization(board):
++    conn, tid, repo, _ = board
++    old_events = preparation_events(conn, tid)
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET workspace_path=? WHERE id=?',
++                     (str(repo / '.worktrees' / 'different-authorized-location'), tid))
++    assert prep.current(conn, tid) is None
++    persisted, workspace = kb._persist_resolved_worktree_preclaim(
++        conn, kb.get_task(conn, tid), 'ready', board='default')
++    assert persisted is not None and workspace is not None
++    assert prep.current(conn, tid) is None
++    assert preparation_events(conn, tid) == old_events
++
++
++@pytest.mark.parametrize('race', ['status', 'body'])
++def test_lost_materialization_cas_does_not_reseal_or_publish_workspace(board, monkeypatch, race):
++    conn, tid, repo, _ = board
++    original = kb.get_task(conn, tid)
++    old_events = preparation_events(conn, tid)
++    resolve = kb._resolve_worktree_workspace
++    def resolve_with_race(*args, **kwargs):
++        result = resolve(*args, **kwargs)
++        with kb.write_txn(conn):
++            if race == 'status':
++                conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
++            else:
++                conn.execute("UPDATE tasks SET body=body || '\nNew controlling instruction' WHERE id=?", (tid,))
++        return result
++    monkeypatch.setattr(kb, '_resolve_worktree_workspace', resolve_with_race)
++    assert kb._persist_resolved_worktree_preclaim(conn, original, 'ready', board='default') == (None, None)
++    fresh = kb.get_task(conn, tid)
++    assert fresh.workspace_path == original.workspace_path
++    assert fresh.branch_name == original.branch_name
++    assert preparation_events(conn, tid) == old_events
++    assert not (repo / '.worktrees' / tid).exists()
++    assert (prep.current(conn, tid) is not None) == (race == 'status')
+--- a/tests/hermes_cli/test_worker_readiness.py
++++ b/tests/hermes_cli/test_worker_readiness.py
+@@ -28,6 +28,30 @@
+         skill=p/'skills'/'sdlc-review';skill.mkdir(parents=True)
+         (skill/'SKILL.md').write_text('---\nname: sdlc-review\ndescription: Review.\n---\nReview.')
+     monkeypatch.setenv('HERMES_HOME',str(home))
++    # Installation authority is isolated explicitly; HOME alone is insufficient.
++    import sqlite3
++    from gateway import member_worker_policy as member_policy
++    from gateway import private_action_worker_policy as private_policy
++    from gateway import owner_delegation
++    monkeypatch.setattr(member_policy, 'ROOT', home)
++    monkeypatch.setattr(private_policy, 'ROOT', home)
++    monkeypatch.setattr(owner_delegation, 'ROOT', home)
++    original_select = member_policy.select
++    monkeypatch.setattr(member_policy, 'select', lambda task, board, worker, **kw:
++                        original_select(task, board, worker, root=home))
++    slug = 'readiness-fixture'
++    database = home / 'kanban' / 'boards' / slug / 'kanban.db'
++    database.parent.mkdir(parents=True)
++    monkeypatch.setenv('HERMES_KANBAN_BOARD', slug)
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(database))
++    for relative, payload in (
++        ('private/phone-assistant/caller-profiles.json', {'profiles': [{'profile_key': 'chris', 'board': slug}]}),
++        ('private/photon-intake/custody-enrollments.json', {'enrollments': []}),
++    ):
++        path = home / relative; path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(json.dumps(payload)); path.chmod(0o600)
++    with sqlite3.connect(home / 'private/phone-assistant/actions.sqlite') as actions:
++        actions.execute('CREATE TABLE phone_task_links(task_id TEXT,board TEXT,authority_realm TEXT)')
+     monkeypatch.setattr(kb.Path,'home',lambda:tmp_path)
+     monkeypatch.setattr(kb,'_memory_pressure_level',lambda *a,**kw:'unknown')
+     kb.init_db();conn=kb.connect()

@@ -1,0 +1,127 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T21:11:08.149252+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-routing",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work",
+      "files": [
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": "2c7c4e0a5db51f5b319fad4b41d01cc27ab64097daf1ca0169f23d024a1ee8a2",
+          "after_sha256": "b3ce0026d826228d0298fe248294f8721768e1d8a4252beeba80054952ceb523"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "28d0b914548017f10d4d93c1269a3e44672c4708e282a74eed24acaee0113cf1",
+          "after_sha256": "f6ac936ce782bd35e715465aadccea248b9aad8aa9ca3f9d2c20c4ea43f3a0a7"
+        },
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "fea5e551b7975cbce6470c9a770410eb0bf0f0308349486344b691ccb0746937",
+          "after_sha256": "1e0c96bb259054f74b33b45aa4ecc207dac39a2d3a6f56fd2a0fbab7b8739199"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "cc0d67150c40a1b6f3db9a5f5f60f02cd766fc354ed5f2b43e7a2de6b0bed52e",
+          "after_sha256": "eedf82cf7373c1e1fb4d42c5c757cb457a97ae0fa9f355c112e543e4325408c2"
+        },
+        {
+          "path": "hermes_cli/owner_work_preparation.py",
+          "before_sha256": null,
+          "after_sha256": "6eb180d637afcc5687b219eef9f4af42e00913b85401d19c32ae4bef0e0bd21e"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": null,
+          "after_sha256": "86ef4f3f6473fceb1b558b77a4843065ba3646519965a7da8316042f5be46c79"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_tool_selection.py",
+          "before_sha256": null,
+          "after_sha256": "0707177ccf5e4893a4fdcc0b559c1fb3fe9942f95feb8072a0d39b17483a4606"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_budget.py",
+          "before_sha256": null,
+          "after_sha256": "de3dfc7c5558806b77359ecf5e84c49b1bf361a76376e855c12a1b43108483fc"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_materialization.py",
+          "before_sha256": null,
+          "after_sha256": "2cdf2ea7ffa75c563365f52a68daa84c4e6dba2c85d856ada9b52db2caa33009"
+        },
+        {
+          "path": "tests/hermes_cli/test_worker_readiness.py",
+          "before_sha256": "7acc828661cb83cd663f7e90c868d0ea24666dd9bc5187e39abc4b28e6d34378",
+          "after_sha256": "6d8ba6b9473f546743908bd2d0491db8e73feb5b7b5bbdb44aac2b9f34204e23"
+        },
+        {
+          "path": "tests/tools/test_prepared_board_inspection.py",
+          "before_sha256": null,
+          "after_sha256": "eb78b4144c2d4323b5b1cdb635d7d3e94bf98e95ebae21cd9b12322fa1664bdd"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "6c693a5cad95a16456ee4d7e3b293367dffc0044ff3a63deca84b06437d412fb",
+          "after_sha256": "0aa9dc88cf147f71f06ad279ff55386042317a9ad6eb54244d226e3778177f82"
+        }
+      ],
+      "patch_sha256": "de2a115501d2b993a44956c6d7866a8ad37fbdc732ae0d69a65806c1cc3bf9d3",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-native-profile-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-prepared-work-controller",
+      "files": [
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "d9c200b7150910d05ea419f448f364f7bae61d4b8d3e85ca0262748c6d9e125e",
+          "after_sha256": "6360d71e24e465c109f3eb670dfeb308b2a3e4843473d8222f28317d235e6d37"
+        },
+        {
+          "path": "hermes_cli/kanban_completion.py",
+          "before_sha256": "fea5e551b7975cbce6470c9a770410eb0bf0f0308349486344b691ccb0746937",
+          "after_sha256": "1e0c96bb259054f74b33b45aa4ecc207dac39a2d3a6f56fd2a0fbab7b8739199"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "5f1673d970c0be575e52c00b110ea73495b67396bf55ba2b12c334723cdc043f",
+          "after_sha256": "159af7ffafbd86376ebe04753b8b3681e952d251c349eaab7e429c47e4b21a44"
+        },
+        {
+          "path": "hermes_cli/owner_work_preparation.py",
+          "before_sha256": null,
+          "after_sha256": "6eb180d637afcc5687b219eef9f4af42e00913b85401d19c32ae4bef0e0bd21e"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": null,
+          "after_sha256": "86ef4f3f6473fceb1b558b77a4843065ba3646519965a7da8316042f5be46c79"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_tool_selection.py",
+          "before_sha256": null,
+          "after_sha256": "0707177ccf5e4893a4fdcc0b559c1fb3fe9942f95feb8072a0d39b17483a4606"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_budget.py",
+          "before_sha256": null,
+          "after_sha256": "de3dfc7c5558806b77359ecf5e84c49b1bf361a76376e855c12a1b43108483fc"
+        },
+        {
+          "path": "tests/hermes_cli/test_prepared_work_materialization.py",
+          "before_sha256": null,
+          "after_sha256": "2cdf2ea7ffa75c563365f52a68daa84c4e6dba2c85d856ada9b52db2caa33009"
+        },
+        {
+          "path": "tests/hermes_cli/test_worker_readiness.py",
+          "before_sha256": "7acc828661cb83cd663f7e90c868d0ea24666dd9bc5187e39abc4b28e6d34378",
+          "after_sha256": "6d8ba6b9473f546743908bd2d0491db8e73feb5b7b5bbdb44aac2b9f34204e23"
+        }
+      ],
+      "patch_sha256": "6820f7542790856a6b2ce0f14bae478376b09e1411efecf027cf16f5af3b59c6",
+      "patch": "controller.patch"
+    }
+  }
+}
