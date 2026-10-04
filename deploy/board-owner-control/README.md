@@ -121,3 +121,11 @@ creation, independent review, dependency release, conversation returns and Desk
 custody. They do not claim a live user conversation or successful execution of
 every existing blocked project. New profile names alone are not enrollment;
 profiles must have their authenticated canonical account/board binding.
+
+Josh's existing phone route required a separate protected configuration change
+from the older company listener to his authenticated named main-gateway route.
+`operational/route_josh_phone.py` performs only that exact reversible three-field
+change, with a private backup. The live phone processor rereads this route for
+each request, so no phone service restart is required. Chris Personal is a
+separate older owner-context runtime and is not covered by this GUS member
+rollout; changing that route requires its own authenticated owner migration.
