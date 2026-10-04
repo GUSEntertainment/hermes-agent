@@ -1,0 +1,131 @@
+--- a/hermes_cli/board_owner_manage.py
++++ b/hermes_cli/board_owner_manage.py
+@@ -276,4 +276,9 @@
+ 
+ 
+ if __name__ == '__main__':
++    # -m runs this file as __main__. Helpers must import this same module so
++    # signed member authority and the in-transaction snapshot ContextVars are
++    # shared across the controller entrypoint, admission and mutation helper.
++    sys.modules['hermes_cli.board_owner_manage'] = sys.modules[__name__]
++    setattr(sys.modules['hermes_cli'], 'board_owner_manage', sys.modules[__name__])
+     raise SystemExit(main())
+--- /dev/null
++++ b/tests/hermes_cli/test_board_owner_cli_identity.py
+@@ -0,0 +1,116 @@
++"""One real -m regression across signing, CLI, imported admission and mutation."""
++import hashlib
++import json
++import os
++from pathlib import Path
++import sqlite3
++import subprocess
++import sys
++
++from gateway import board_control_transport as transport, josh_board_authority as authority
++from gateway import session_context
++from hermes_cli import board_owner_manage as owner
++import importlib.util
++
++_fixture_spec = importlib.util.spec_from_file_location(
++    'artifact_reference_fixture', Path(__file__).with_name('test_owner_artifact_reference.py'))
++_fixture = importlib.util.module_from_spec(_fixture_spec)
++_fixture_spec.loader.exec_module(_fixture)
++held, payload, state = _fixture.held, _fixture.payload, _fixture.state
++
++
++def test_signed_cli_shares_context_with_helper_and_refuses_stale_state(held, tmp_path, monkeypatch):
++    source, tid, artifact = held
++    root = artifact.parent.parent
++    board = 'connor-home'
++    db = root / 'kanban' / 'boards' / board / 'kanban.db'
++    db.parent.mkdir(parents=True, mode=0o700)
++    conn = sqlite3.connect(db)
++    source.backup(conn)
++    conn.row_factory = sqlite3.Row
++    monkeypatch.setattr(owner, 'ROOT', root)
++    monkeypatch.setattr(transport, 'ROOT', root)
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++
++    def protected_json(relative, value):
++        path = root / relative
++        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++        path.write_text(json.dumps(value))
++        path.chmod(0o600)
++        return path.read_bytes()
++
++    phone = '+15555550123'  # synthetic contact, never sent or called
++    profiles = protected_json('private/phone-assistant/caller-profiles.json', {'profiles': [{
++        'profile_key': 'connor', 'phone_e164': phone, 'board': board,
++        'subject_key': 'registry:connor_owner:' + hashlib.sha256(phone.encode()).hexdigest(),
++        'allowed_realms': ['business'], 'enabled': True,
++    }]})
++    acl = protected_json('private/phone_acl/caller_registry.private.json', {'people': [{
++        'phone_e164': phone, 'role': 'admin_internal', 'enabled': True,
++    }]})
++    grant = dict(principal='connor', profile='connor', board=board,
++                 fingerprint=hashlib.sha256(profiles + acl).hexdigest())
++    transport.key_path().parent.mkdir(parents=True, mode=0o700)
++    transport.key_path().write_bytes(b'k' * 32)
++    transport.key_path().chmod(0o600)
++    assert len(transport.key_path().read_bytes()) == 32
++    transport.initialize_ledger(transport.ledger_path())
++
++    # Run the actual candidate entrypoint and helpers. Only the two installed
++    # ROOT constants are redirected in this temporary package overlay; no
++    # entrypoint/helper logic, identity checks or transport functions are mocked.
++    release = Path(owner.__file__).resolve().parents[1]
++    overlay = tmp_path / 'cli-fixture'
++    for package in ('hermes_cli', 'gateway'):
++        directory = overlay / package
++        directory.mkdir(parents=True)
++        (directory / '__init__.py').write_text(
++            (release / package / '__init__.py').read_text() + '\n' +
++            '__path__ = ' + repr([str(directory), str(release / package)]) + '\n')
++    for relative in ('hermes_cli/board_owner_manage.py', 'gateway/board_control_transport.py'):
++        text = (release / relative).read_text()
++        installed = "ROOT = Path('/Users/Chris/.hermes')"
++        assert text.count(installed) == 1
++        (overlay / relative).write_text(text.replace(installed, 'ROOT = Path(' + repr(str(root)) + ')'))
++    env = dict(HOME=str(tmp_path), HERMES_HOME=str(root), PATH='/usr/bin:/bin',
++               PYTHONPATH=str(overlay) + os.pathsep + str(release), PYTHONDONTWRITEBYTECODE='1')
++    scope = authority._execution.set(('connor', 'connor'))
++    session = session_context._SESSION_ID.set('cli-fixture-session')
++
++    def request(args):
++        envelope = transport.issue(dict(args, board=board), grant, 'cli-fixture-session')
++        result = subprocess.run([sys.executable, '-m', 'hermes_cli.board_owner_manage'],
++                                input=json.dumps(envelope), text=True, capture_output=True,
++                                cwd=tmp_path, env=env, timeout=15)
++        response = json.loads(result.stdout)
++        return result.returncode, response
++
++    try:
++        fixture = conn, tid, artifact
++        before = state(conn, tid)
++        rc, preview = request(payload(fixture, dry_run=True))
++        assert rc == 0 and preview['ok'] and preview['metadata_only'], preview
++        assert preview['status'] == 'triage' and not preview['changed']
++        assert state(conn, tid) == before
++
++        stale = payload(fixture)
++        conn.execute("INSERT INTO task_comments(task_id,author,body,created_at) VALUES(?,?,?,?)",
++                     (tid, 'connor', 'New evidence requires fresh inspection', 1))
++        conn.commit()
++        unchanged = state(conn, tid)
++        rc, denied = request(stale)
++        assert rc == 1 and not denied['ok'] and 'state changed' in denied['error'], denied
++        assert state(conn, tid) == unchanged
++
++        rc, applied = request(payload(fixture))
++        assert rc == 0 and applied['changed'] and applied['metadata_only'], applied
++        after = state(conn, tid)
++        assert after['task'] == unchanged['task']
++        assert after['verdicts'] == unchanged['verdicts'] and after['runs'] == unchanged['runs']
++        assert after['goal']['review_artifact_ref'] == str(artifact)
++        assert after['goal']['review_loop_count'] == unchanged['goal']['review_loop_count']
++        assert json.loads(after['events'][-1]['payload'])['actor'] == 'connor'
++    finally:
++        session_context._SESSION_ID.reset(session)
++        authority._execution.reset(scope)
++        conn.close()

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "release": "20261004-controller-context-identity",
+  "scope": "controller-only",
+  "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-controller",
+  "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-controller-context-identity",
+  "files": [
+    {
+      "path": "hermes_cli/board_owner_manage.py",
+      "before_sha256": "28d0b914548017f10d4d93c1269a3e44672c4708e282a74eed24acaee0113cf1",
+      "after_sha256": "d9c200b7150910d05ea419f448f364f7bae61d4b8d3e85ca0262748c6d9e125e"
+    },
+    {
+      "path": "tests/hermes_cli/test_board_owner_cli_identity.py",
+      "before_sha256": null,
+      "after_sha256": "c945f871a55e735eab68fcbe40da4bf5fa2d48638a1fc7d40956c675b2463e6a"
+    }
+  ],
+  "patch": "controller.patch",
+  "patch_sha256": "de62f9410306b709c47b2b9f67e9ef3ea8f72ccdae7230c249df82892b11611a",
+  "activation": "Guarded board-controller wrapper path only; gateway and Personal service unchanged",
+  "purpose": "Share authenticated member and expected-state ContextVars across python -m entrypoint and canonical helper imports"
+}

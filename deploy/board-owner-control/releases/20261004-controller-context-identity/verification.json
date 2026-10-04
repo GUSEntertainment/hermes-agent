@@ -1,0 +1,19 @@
+{
+  "status": "staged_not_activated",
+  "command": "bash scripts/run_tests.sh -j 1 --file-retries 0 tests/hermes_cli/test_board_owner_cli_identity.py -- --tb=short",
+  "result": {
+    "files": 1,
+    "passed": 1,
+    "failed": 0,
+    "seconds": 1.6
+  },
+  "verified": [
+    "Actual python -m subprocess receives signed member authority",
+    "Dry-run reaches imported repair helper and changes nothing",
+    "New comment invalidates expected state and refuses stale request atomically",
+    "Fresh apply retains held state, findings and counters; signed actor reaches audit"
+  ],
+  "live_mutations": false,
+  "paid_calls": 0,
+  "gateway_restart_required": false
+}
