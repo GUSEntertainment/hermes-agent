@@ -136,6 +136,41 @@ def gateway_probe():
     return ["native_manage_registration", "owner_tool_discovery", "new_member_recovery_catalog", "normal_member_delegation_registration"]
 
 
+def profile_routing_probe():
+    from hermes_constants import get_default_hermes_root
+    from plugins.capability_projection.resolver import load_capability_inventory, profile_config_fingerprint
+    root = Path(get_default_hermes_root())
+    home = Path(os.environ["HOME"])
+    require(root.is_relative_to(home), "Profile preflight escaped temporary HOME")
+    profile = root / "profiles" / "routing-preflight"
+    profile.mkdir(parents=True, exist_ok=False)
+    (profile / "config.yaml").write_text("toolsets: [file]\n")
+    soul = profile / "SOUL.md"
+    soul.write_text("A specialist.\n")
+    previous = profile_config_fingerprint("routing-preflight")
+    policy = root / "policy" / "capability-profiles.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(json.dumps({"schema_version": 1, "profiles": [{
+        "name": "routing-preflight", "profile_fingerprint": previous,
+        "allowed_capabilities": ["file_write_workspace"], "role": "specialist",
+        "data_realms": ["gus"], "workspace_roots": [str(home)],
+        "toolsets": ["file"], "skills": [], "mcp_families_read": [],
+        "mcp_families_mutation": []}]}))
+    policy.chmod(0o600)
+    before = policy.read_bytes()
+    soul.write_text("A concise specialist.\n")
+    inventory = load_capability_inventory(policy)
+    require(len(inventory.profiles) == 1 and not inventory.errors,
+            "Historical profile stamp still blocks authorized routing")
+    current = inventory.profiles[0]
+    require(current.profile_fingerprint == profile_config_fingerprint("routing-preflight")
+            and current.profile_fingerprint != previous, "Current profile identity was lost")
+    require(current.allowed_capabilities == frozenset({"file_write_workspace"})
+            and current.data_realms == ("gus",) and policy.read_bytes() == before,
+            "Profile routing changed declared authority")
+    return ["profile_edits_preserve_routing", "current_identity_and_declared_authority_retained"]
+
+
 def isolated_child(lane, root):
     # Hard fail network/process attempts. Hooks are installed before release imports.
     def audit(event, args):
@@ -145,6 +180,7 @@ def isolated_child(lane, root):
     sys.addaudithook(audit)
     sys.path.insert(0, str(root))
     checks = gateway_probe() if lane == "gateway" else controller_probe()
+    checks.extend(profile_routing_probe())
     print(json.dumps({"lane": lane, "ok": True, "checks": checks}))
 
 

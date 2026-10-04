@@ -1,0 +1,6 @@
+{
+  "old_release_rejected": true,
+  "new_release_both_lanes_pass": true,
+  "live_preflight_sha256": "a13469de537676e250a6afcbdfd6515ed85995e9ee8ab66649a8aa037044da71",
+  "backup": "/Users/Chris/.hermes/private/board-owner-control/native-profile-routing/preflight-before.py"
+}
