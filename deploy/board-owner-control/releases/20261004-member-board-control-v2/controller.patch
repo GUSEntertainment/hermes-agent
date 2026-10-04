@@ -1,0 +1,1388 @@
+--- /dev/null
++++ b/gateway/board_control_transport.py
+@@ -0,0 +1,216 @@
++"""One-use member board-controller requests; no identity from model arguments.
++
++The installer creates the key and ledger explicitly. Normal requests never
++create authority material. Same-user trusted operators remain outside the
++worker sandbox boundary; workers must not read this private directory.
++"""
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++import os
++from pathlib import Path
++import re
++import secrets
++import sqlite3
++import stat
++import time
++
++ROOT = Path('/Users/Chris/.hermes')
++PURPOSE = 'hermes-board-owner-control-v1'
++DOMAIN = (PURPOSE + '\0').encode()
++TTL_SECONDS = 30
++MAX_BYTES = 32768
++GRANT_FIELDS = {'principal', 'profile', 'board', 'fingerprint'}
++FIELDS = {'purpose', 'payload', 'grant', 'session_id', 'issued_at', 'expires_at',
++          'nonce', 'payload_sha256', 'signature'}
++
++
++def key_path():
++    return ROOT / 'private' / 'board-owner-control' / 'key'
++
++
++def ledger_path():
++    return ROOT / 'private' / 'board-owner-control' / 'nonces.sqlite3'
++
++
++def _canonical(value):
++    try:
++        raw = json.dumps(value, sort_keys=True, separators=(',', ':'),
++                         ensure_ascii=False, allow_nan=False).encode()
++    except (ValueError, TypeError, RecursionError) as exc:
++        raise PermissionError('Invalid controller request encoding') from exc
++    if len(raw) > MAX_BYTES:
++        raise PermissionError('Controller request exceeds size limit')
++    return raw
++
++
++def _grant(value):
++    if type(value) is not dict or set(value) != GRANT_FIELDS:
++        raise PermissionError('Exact member grant required')
++    for name in ('principal', 'profile', 'board'):
++        if type(value[name]) is not str or not re.fullmatch(r'[a-z][a-z0-9_-]{0,99}', value[name]):
++            raise PermissionError('Canonical member grant required')
++    if type(value['fingerprint']) is not str or not re.fullmatch('[a-f0-9]{64}', value['fingerprint']):
++        raise PermissionError('Current enrollment fingerprint required')
++    return dict(value)
++
++
++def _deny_worker():
++    from agent.delegation_context import is_delegated_child_context
++    from gateway.session_context import get_bound_session_env
++    if (is_delegated_child_context() or os.environ.get('HERMES_KANBAN_TASK')
++            or os.environ.get('HERMES_SESSION_SOURCE') in ('kanban', 'cron')
++            or get_bound_session_env('HERMES_SESSION_SOURCE') in ('kanban', 'cron')):
++        raise PermissionError('A direct member session is required')
++
++
++def _bound_session(session_id):
++    from gateway.session_context import get_bound_session_env
++    if type(session_id) is not str or not session_id or len(session_id) > 256:
++        raise PermissionError('Current bound session required')
++    bound = {get_bound_session_env(name) for name in
++             ('HERMES_SESSION_ID', 'HERMES_SESSION_KEY')}
++    bound.discard('')
++    bound.discard(None)
++    if bound:
++        if session_id not in bound:
++            raise PermissionError('Controller session mismatch')
++        return
++    # Photon fallback is the exact registered inbound message, never env data.
++    from plugins.platforms.photon.secure_intake.gateway_binding import current_identity
++    from plugins.platforms.photon.secure_intake.request_registry import encoded
++    from plugins.platforms.photon.secure_intake.trusted_intake import _CURRENT
++    identity = current_identity()
++    witness = _CURRENT.get()
++    if (identity.get('platform') != 'photon' or identity.get('chat_type') != 'dm'
++            or identity.get('message') != session_id or not witness
++            or witness[0] != encoded(identity)):
++        raise PermissionError('Current authenticated transport session required')
++
++
++def _key():
++    from gateway.app_business_authority import protected_bytes
++    raw = protected_bytes(key_path(), private=True, anchor=ROOT)
++    if len(raw) != 32:
++        raise PermissionError('Controller signing key is unavailable')
++    return raw
++
++
++def _sign(unsigned, key):
++    return hmac.new(key, DOMAIN + _canonical(unsigned), hashlib.sha256).hexdigest()
++
++
++def issue(payload, grant, session_id):
++    """Sign only the actual current member scope and exact requested operation."""
++    _deny_worker()
++    from hermes_cli.board_owner_manage import require_owner
++    grant = _grant(grant)
++    if require_owner() != grant:
++        raise PermissionError('Controller grant does not match current member')
++    _bound_session(session_id)
++    if type(payload) is not dict:
++        raise PermissionError('Controller payload must be an object')
++    # Detach mutable inputs before hashing/signing or crossing the process boundary.
++    payload = json.loads(_canonical(payload))
++    if payload.get('board') != grant['board']:
++        raise PermissionError('Controller request must name the enrolled board')
++    now = int(time.time())
++    unsigned = dict(purpose=PURPOSE, payload=payload, grant=grant, session_id=session_id,
++                    issued_at=now, expires_at=now + TTL_SECONDS,
++                    nonce=secrets.token_hex(16),
++                    payload_sha256=hashlib.sha256(_canonical(payload)).hexdigest())
++    envelope = dict(unsigned, signature=_sign(unsigned, _key()))
++    _canonical(envelope)
++    return envelope
++
++
++def _ledger_stat():
++    from gateway.gus_worker_authority import protected
++    value = protected(ledger_path(), ROOT)
++    if stat.S_IMODE(value.st_mode) != 0o600:
++        raise PermissionError('Controller replay ledger must be private')
++    return (value.st_dev, value.st_ino, value.st_uid, value.st_mode, value.st_nlink)
++
++
++def initialize_ledger(path):
++    """Installer-only initialization; refuses any pre-existing file or link."""
++    path = Path(path)
++    if path != ledger_path():
++        raise PermissionError('Unexpected controller replay ledger location')
++    # Checking the installed key also validates the protected parent path.
++    _key()
++    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
++    os.close(descriptor)
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE nonces (nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL, request_sha256 TEXT NOT NULL)')
++    _ledger_stat()
++
++
++def _consume(nonce, expires, request_sha256, now):
++    before = _ledger_stat()
++    # mode=rw prevents an absent ledger from being recreated by a normal request.
++    conn = sqlite3.connect(ledger_path().as_uri() + '?mode=rw', uri=True, timeout=5)
++    try:
++        if _ledger_stat() != before:
++            raise PermissionError('Controller replay ledger replaced')
++        conn.execute('BEGIN IMMEDIATE')
++        # Enrollment refresh or lock contention must not extend the signed TTL.
++        now = int(time.time())
++        if now >= expires:
++            raise PermissionError('Controller request expired before admission')
++        columns = conn.execute('PRAGMA table_info(nonces)').fetchall()
++        if [(r[1], r[2], r[5]) for r in columns] != [
++                ('nonce', 'TEXT', 1), ('expires', 'INTEGER', 0), ('request_sha256', 'TEXT', 0)]:
++            raise PermissionError('Controller replay ledger schema mismatch')
++        conn.execute('DELETE FROM nonces WHERE expires < ?', (now,))
++        conn.execute('INSERT INTO nonces VALUES (?, ?, ?)', (nonce, expires, request_sha256))
++        if _ledger_stat() != before:
++            raise PermissionError('Controller replay ledger replaced')
++        conn.commit()
++    except sqlite3.IntegrityError as exc:
++        conn.rollback()
++        raise PermissionError('Controller request was already consumed; inspect the card before retrying') from exc
++    except Exception:
++        conn.rollback()
++        raise
++    finally:
++        conn.close()
++
++
++def verify(envelope):
++    """Verify, freshly revalidate enrollment and consume one exact operation."""
++    _deny_worker()
++    if type(envelope) is not dict or set(envelope) != FIELDS:
++        raise PermissionError('Exact signed controller envelope required')
++    envelope = json.loads(_canonical(envelope))
++    if envelope['purpose'] != PURPOSE:
++        raise PermissionError('Wrong controller request purpose')
++    supplied = envelope.pop('signature')
++    if type(supplied) is not str or not re.fullmatch('[a-f0-9]{64}', supplied):
++        raise PermissionError('Invalid controller signature')
++    if not hmac.compare_digest(supplied, _sign(envelope, _key())):
++        raise PermissionError('Invalid controller signature')
++    if (type(envelope['issued_at']) is not int or type(envelope['expires_at']) is not int
++            or not 0 < envelope['expires_at'] - envelope['issued_at'] <= TTL_SECONDS):
++        raise PermissionError('Invalid controller request lifetime')
++    now = int(time.time())
++    if not envelope['issued_at'] <= now < envelope['expires_at']:
++        raise PermissionError('Controller request expired or not yet valid')
++    if type(envelope['nonce']) is not str or not re.fullmatch('[a-f0-9]{32}', envelope['nonce']):
++        raise PermissionError('Invalid controller request nonce')
++    session_id = envelope['session_id']
++    if type(session_id) is not str or not session_id or len(session_id) > 256:
++        raise PermissionError('Invalid controller request session')
++    payload, grant = envelope['payload'], _grant(envelope['grant'])
++    if type(payload) is not dict or payload.get('board') != grant['board']:
++        raise PermissionError('Controller request board mismatch')
++    payload_hash = hashlib.sha256(_canonical(payload)).hexdigest()
++    if envelope['payload_sha256'] != payload_hash:
++        raise PermissionError('Controller payload changed')
++    from hermes_cli.board_owner_manage import refresh_member_grant
++    if refresh_member_grant(grant) != grant:
++        raise PermissionError('Member enrollment changed')
++    _consume(envelope['nonce'], envelope['expires_at'], payload_hash, now)
++    return payload, grant
+--- a/gateway/gus_admin_cli.py
++++ b/gateway/gus_admin_cli.py
+@@ -12,6 +12,7 @@
+ from pathlib import Path
+ 
+ _active = ContextVar('native_admin_cli', default=None)
++_owner_continuation = ContextVar('owner_board_continuation', default=False)
+ READS = frozenset({'list', 'ls', 'show', 'runs', 'stats', 'log', 'context'})
+ MUTATIONS = frozenset({'archive', 'promote', 'unblock', 'restore', 'specify', 'resume-triage', 'unlink'})
+ 
+@@ -647,6 +648,24 @@
+     if is_delegated_child_process_context():
+         raise PermissionError('Delegated children must return results to their parent')
+     worker = current()
++    from hermes_cli.board_owner_manage import member_controller_scope
++    member = member_controller_scope()
++    if member is not None:
++        if worker is not None or getattr(args, 'board', None) != member['board']:
++            raise PermissionError('Member management outside authenticated board')
++        if args.kanban_action not in {'archive','restore','specify','resume-triage','unblock','unlink','recover_review'}:
++            raise PermissionError('Unsupported member board action')
++        # The exact signed operation/board/target is rechecked in the mutation transaction.
++        return None
++    if getattr(args, 'owner_continuation', False):
++        # An operator/chief-of-staff continuation is not peer authority.
++        # Never derive it from the supplied comment author or a --by value.
++        if (worker is not None or restricted()
++                or os.environ.get('HERMES_SESSION_SOURCE') == 'kanban'
++                or os.environ.get('HERMES_PROFILE', 'default') not in ('', 'default')):
++            raise PermissionError('Owner continuation is unavailable to task workers and member profiles')
++        if args.kanban_action != 'resume-triage':
++            raise PermissionError('Owner continuation applies only to same-card resume-triage')
+     if worker is None:
+         # Member sessions cannot use this administrative escape hatch.
+         if restricted() or os.environ.get('HERMES_SESSION_SOURCE') == 'kanban':
+@@ -708,10 +727,16 @@
+         with kb.connect_closing() as conn:
+             _assignment(conn, worker)
+     token = _active.set(worker)
++    owner_token = _owner_continuation.set(bool(getattr(args, 'owner_continuation', False)))
+     try:
+         yield
+     finally:
++        _owner_continuation.reset(owner_token)
+         _active.reset(token)
++
++
++def owner_continuation_active():
++    return _owner_continuation.get()
+ 
+ 
+ def _validate_unlink(conn, pair, worker):
+@@ -742,6 +767,8 @@
+ 
+ def validate_target(conn, task_id, operation, reason=None):
+     """Must run within the supported mutator's write transaction."""
++    from hermes_cli.board_owner_manage import validate_bound_target
++    validate_bound_target(conn, task_id, operation)
+     if operation == 'archive':
+         # Shared boundary (t_fa49d830): owner/core callers get the same
+         # reason requirement before the worker-only checks below.
+--- /dev/null
++++ b/hermes_cli/board_owner_manage.py
+@@ -0,0 +1,262 @@
++"""Native owner board operations, using the installed guarded controller.
++
++No authority is accepted from tool arguments. The gateway checks its actual
++caller before crossing the process boundary; the controller checks again.
++"""
++import hashlib
++import json
++import os
++import re
++import sys
++import time
++from argparse import Namespace
++from contextvars import ContextVar
++from pathlib import Path
++
++_expected = ContextVar('owner_board_expected_state', default=None)
++ACTIONS = ('archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review')
++
++
++# Set only after the controller verifies a signed gateway request.
++_member_context = ContextVar('verified_member_board_controller', default=None)
++ROOT = Path('/Users/Chris/.hermes')
++
++
++def refresh_member_grant(grant):
++    """Re-resolve protected enrollment, never model-supplied authority."""
++    if not isinstance(grant, dict) or set(grant) != {'principal', 'profile', 'board', 'fingerprint'}:
++        raise PermissionError('Invalid member board grant')
++    principal, profile = grant['principal'], grant['profile']
++    if any(not isinstance(v, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,99}', v) for v in (principal, profile)):
++        raise PermissionError('Canonical member identity required')
++    from gateway.app_business_authority import canonical_enrollment, current
++    if profile == principal:
++        value = canonical_enrollment(principal, ROOT)
++        if value.get('owner') != principal or value.get('profile') != principal:
++            raise PermissionError('Member enrollment mismatch')
++    else:
++        value = current(profile, principal, root=ROOT)
++    return dict(principal=principal, profile=profile, board=value['board'], fingerprint=value['fingerprint'])
++
++
++def require_owner():
++    """Main operator or currently authenticated member; workers never inherit it."""
++    from agent.delegation_context import is_delegated_child_context
++    from gateway.josh_board_authority import restricted, app_binding, _execution
++    from gateway.member_worker_policy import authenticated_private_policy
++    from hermes_constants import get_hermes_home
++    from gateway.session_context import get_bound_session_env
++    if (is_delegated_child_context() or os.environ.get('HERMES_KANBAN_TASK')
++            or os.environ.get('HERMES_SESSION_SOURCE') in ('kanban', 'cron')
++            or get_bound_session_env('HERMES_SESSION_SOURCE') in ('kanban', 'cron')
++            or authenticated_private_policy() is not None):
++        raise PermissionError('Board management requires the requesting member, not a worker or scheduled task')
++    transported = _member_context.get()
++    if transported is not None:
++        if refresh_member_grant(transported) != transported:
++            raise PermissionError('Member enrollment changed')
++        return dict(transported)
++    scope = _execution.get()
++    if scope is not None:
++        profile, principal = scope
++        if principal == 'chris' and profile in (None, '', 'default', 'chris'):
++            return None
++        if not principal or not profile:
++            raise PermissionError('Authenticated member identity required')
++        # _execution is bound by the authenticated server, not environment.
++        if profile != principal:
++            bound = app_binding()
++            if bound is None or bound['principal'] != principal or bound['profile'] != profile:
++                raise PermissionError('Authenticated app binding required')
++        return refresh_member_grant(dict(principal=principal, profile=profile, board='', fingerprint=''))
++    home = Path(get_hermes_home())
++    if (get_bound_session_env('HERMES_SESSION_PROFILE') not in ('', 'default')
++            or os.environ.get('HERMES_PROFILE', 'default') not in ('', 'default')
++            or home.parent.name == 'profiles' or restricted() or app_binding() is not None):
++        raise PermissionError('Authenticated member request required; a profile name alone grants no board control')
++    return None
++
++
++def member_controller_scope():
++    """For the guarded CLI only; ordinary named-profile CLI remains denied."""
++    return require_owner() if _member_context.get() is not None else None
++
++
++def member_board(grant, requested=None):
++    if requested is not None and requested != grant['board']:
++        raise PermissionError('Board outside authenticated member ownership')
++    from hermes_cli import kanban_db as kb
++    expected = ROOT / 'kanban' / 'boards' / grant['board'] / 'kanban.db'
++    if kb.kanban_db_path(board=grant['board']) != expected:
++        raise PermissionError('Member board database override denied')
++    from gateway.app_business_authority import protected
++    protected(expected, ROOT)
++    return grant['board']
++
++
++def _validate_member_connection(conn, grant):
++    expected = ROOT / 'kanban' / 'boards' / grant['board'] / 'kanban.db'
++    actual = [Path(r[2]) for r in conn.execute('PRAGMA database_list') if r[1] == 'main']
++    if actual != [expected]:
++        raise PermissionError('Member operation outside enrolled board')
++    from gateway.app_business_authority import protected
++    protected(expected, ROOT)
++
++
++def _hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++def describe(conn, task_id):
++    task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is None:
++        raise ValueError('Unknown task in the selected board')
++    goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++    stop = conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','triaged','escalated') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    event = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0]
++    comment = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_comments WHERE task_id=?', (task_id,)).fetchone()[0]
++    parents = [dict(x) for x in conn.execute('SELECT t.* FROM task_links l JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? ORDER BY t.id', (task_id,))]
++    data = dict(task=dict(task), goal=dict(goal) if goal else None, event=event, comment=comment, parents=parents)
++    fields = {k: task[k] for k in ('id', 'title', 'body', 'assignee', 'status', 'tenant')}
++    return dict(expected_state=_hash(data), expected_task_sha256=_hash(fields),
++                expected_goal_sha256=_hash(dict(goal)) if goal else None,
++                expected_stop_event_id=stop[0] if stop else None, expected_latest_comment_id=comment,
++                initial_triage=bool(task['status'] == 'triage' and stop is None and goal is None
++                    and not conn.execute('SELECT 1 FROM task_runs WHERE task_id=?', (task_id,)).fetchone()))
++
++
++def validate_bound_target(conn, target, operation):
++    """Called inside each existing mutation's write transaction."""
++    bound = _expected.get()
++    member = _member_context.get()
++    if member is not None:
++        current = require_owner()
++        _validate_member_connection(conn, current)
++        if bound is None:
++            raise PermissionError('Scoped member operation requires a bound target')
++    if bound is None:
++        return
++    task_id = target[1] if isinstance(target, tuple) else target
++    if task_id != bound['task_id'] or describe(conn, task_id)['expected_state'] != bound['expected_state']:
++        raise ValueError('Board state changed; inspect the card again before acting')
++    task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if (any(task[k] is not None for k in ('current_run_id', 'worker_pid', 'claim_lock', 'claim_expires'))
++            or conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone()
++            or conn.execute('SELECT 1 FROM target_leases WHERE task_id=? AND expires_at>=?', (task_id, int(time.time()))).fetchone()):
++        raise ValueError('Task has active work; preserve its current run and inspect it before cleanup')
++    if operation == 'specify':
++        if not describe(conn, task_id)['initial_triage'] or not task['assignee'] or not (task['body'] or '').strip():
++            raise ValueError('start_triage requires a fully specified new card with no prior stop, run or review; use the appropriate recovery route for stopped work')
++        evidence = bound.get('evidence') or {}
++        comment_id = evidence.get('authorization_comment_id')
++        if type(comment_id) is not int:
++            raise ValueError('A same-card authorization comment is required to start new triage work')
++        comment = conn.execute('SELECT body FROM task_comments WHERE id=? AND task_id=?', (comment_id, task_id)).fetchone()
++        from gateway.gus_admin_cli import authorization_text_ok
++        if comment is None or not authorization_text_ok(comment['body']):
++            raise ValueError('The cited comment must record the existing authorization to proceed')
++
++
++def execute(args):
++    member = require_owner()
++    if member is not None and _member_context.get() is None:
++        raise PermissionError('Member mutations require the signed controller request')
++    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence'}
++    if not isinstance(args, dict) or set(args) - allowed:
++        raise ValueError('Unsupported board operation fields')
++    from gateway.gus_admin_cli import admission
++    from gateway.josh_board_authority import admitted_board
++    from hermes_cli import kanban_db as kb
++    action = args.get('action')
++    if action not in ACTIONS:
++        raise ValueError('Unknown board management action')
++    task_id = args.get('task_id', '')
++    reason = args.get('reason', '')
++    if not re.fullmatch(r't_[A-Za-z0-9_]+', task_id) or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
++        raise ValueError('Exact task id and a concise disposition/resolution reason required')
++    if not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
++        raise ValueError('Use expected_state from the latest kanban_show board_administration.native fields')
++    dry = args.get('dry_run', False)
++    if type(dry) is not bool:
++        raise ValueError('dry_run must be boolean')
++    if dry and action not in ('start_triage', 'resume_triage', 'recover_review'):
++        raise ValueError('Dry run is supported for triage and review operations; other operations are reversible')
++    board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
++    actor = member['principal'] if member is not None else 'default'
++    cli_action = {'start_triage': 'specify', 'resume_triage': 'resume-triage', 'unlink_dependency': 'unlink'}.get(action, action)
++    proof = Namespace(kanban_action=cli_action, owner_continuation=action == 'resume_triage', board=board)
++    token = _expected.set(args)
++    try:
++        with admission(proof), kb.connect_closing(board=board) as conn:
++            validate_bound_target(conn, task_id, cli_action)
++            if action == 'archive':
++                changed = kb.archive_task(conn, task_id, reason=reason)
++            elif action == 'restore':
++                changed = kb.restore_task(conn, task_id, reason=reason) is not None
++            elif action == 'unblock':
++                changed = kb.unblock_task(conn, task_id, preserve_failure_history=True)
++                if not changed:
++                    state = kb.get_task(conn, task_id).status
++                    raise ValueError(f'No unblock transition occurred: task is {state}. Inspect kanban_show; use start_triage for a new specified card or resume_triage for a stopped card')
++            elif action == 'start_triage':
++                if dry:
++                    changed = False
++                else:
++                    changed = kb.specify_triage_task(conn, task_id, author=actor)
++                    if not changed:
++                        raise ValueError('Task is no longer in initial triage')
++                    kb.recompute_ready(conn)
++            elif action == 'unlink_dependency':
++                parent = args.get('parent_id', '')
++                if not re.fullmatch(r't_[A-Za-z0-9_]+', parent):
++                    raise ValueError('Exact obsolete prerequisite parent_id required')
++                changed = kb.unlink_tasks(conn, parent, task_id)
++            elif action == 'resume_triage':
++                evidence = args.get('evidence') or {}
++                kb.resume_triage_task(conn, task_id, author=actor, reason=reason, dry_run=dry,
++                    expected_stop_event_id=evidence.get('expected_stop_event_id'),
++                    authorization_comment_id=evidence.get('authorization_comment_id'),
++                    expected_latest_comment_id=evidence.get('expected_latest_comment_id'),
++                    expected_task_sha256=evidence.get('expected_task_sha256'))
++                changed = not dry
++            else:
++                from hermes_cli.owner_board_recovery import recover_review
++                result = recover_review(conn, task_id, actor=actor, reason=reason, dry_run=dry,
++                                        **(args.get('evidence') or {}))
++                changed = not dry
++            task = kb.get_task(conn, task_id)
++            result = dict(ok=True, action=action, task_id=task_id, board=board,
++                          changed=bool(changed), dry_run=dry, status=task.status,
++                          failure_history_preserved=True)
++            if action == 'recover_review':
++                result['next_action'] = 'Fresh decision by the bound reviewer; recovery is not review approval'
++            return result
++    finally:
++        _expected.reset(token)
++
++
++def main():
++    try:
++        payload = sys.stdin.read(32001)
++        if len(payload) > 32000:
++            raise ValueError('Board operation payload too large')
++        request = json.loads(payload)
++        if isinstance(request, dict) and 'signature' in request:
++            from gateway.board_control_transport import verify
++            args, grant = verify(request)
++            token = _member_context.set(grant)
++            try:
++                result = execute(args)
++            finally:
++                _member_context.reset(token)
++        else:
++            result = execute(request)
++    except Exception as exc:
++        print(json.dumps(dict(ok=False, error=str(exc))))
++        return 1
++    print(json.dumps(result))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -628,6 +628,7 @@
+     p_rt.add_argument("--task-sha", required=True, help="triage snapshot sha256 (kanban_db.triage_snapshot_sha)")
+     p_rt.add_argument("--reason", default=None, help="Evidence for the resume")
+     p_rt.add_argument("--dry-run", action="store_true", help="Validate and roll back")
++    p_rt.add_argument("--owner-continuation", action="store_true", help="Owner-authorized continuation within the existing task scope; preserves action restrictions and cannot be used by workers or member profiles")
+     p_rt.add_argument("--qa-only", action="store_true", help="Continue unchanged previously released read-only QA from a capability block; never release action holds")
+ 
+     # --- claim ---
+@@ -2290,6 +2291,8 @@
+                 qa_only=bool(getattr(args, 'qa_only', False)))
+         except (ValueError, PermissionError) as exc:
+             print(f"cannot resume {args.task_id}: {exc}", file=sys.stderr)
++            if str(exc).startswith('Needs Chris to decide: post-stop record involves') and not getattr(args, 'owner_continuation', False):
++                print('This is the peer-continuation policy. For an owner-authorized continuation of the unchanged task, the main owner session can add --owner-continuation with the same bound instruction and first use --dry-run. Workers and member profiles cannot use that route. It does not authorize new sends, spend, deployment, credential changes or wider access.', file=sys.stderr)
+             return 1
+     if args.dry_run:
+         print(f"Would resume {args.task_id} -> {status} (dry)")
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -9316,38 +9316,44 @@
+         from gateway.gus_admin_cli import authorization_text_ok, NEVER_PEER_RESUMABLE, _norm
+         if not authorization_text_ok(auth['body']):
+             raise ValueError('Bound comment does not record an authorization/resume decision')
+-        # Every comment since the stop is checked for never-peer-resumable subjects.
+-        # >= : same-second records fail closed (checked, not skipped).
+-        post_stop = [r['body'] or '' for r in conn.execute(
+-            'SELECT body FROM task_comments WHERE task_id=? AND created_at>=? ORDER BY id',
+-            (task_id, latest['created_at']))]
+-        # t_bef58dfb R18: two disjoint modes; no open-ended negation parsing.
+-        # (a) No mention needs the descriptive-report exemption: the baseline
+-        #     rule (_gate_preserved_only) applies unchanged.
+-        # (b) Some mention needs it: every protected mention in the whole
+-        #     post-stop record (never-peer subjects AND fresh deploy/restart/
+-        #     security/send words) must be a recognised checker description
+-        #     or sit in a sentence that matches, in full, the closed
+-        #     _SAFE_SCOPE_SENTENCE grammar ("No deployment or restart.",
+-        #     "Keep the publish hold.").  Anything else refuses, so negation
+-        #     or safeguard wording can never widen what resumes.
+-        record_exempted = any(
+-            _descriptive_mention(body, h.start(), h.end())
+-            and not _gate_preserved_only(body, h.group(0))
+-            for body in post_stop
+-            for m in NEVER_PEER_RESUMABLE.finditer(_norm(body))
+-            for h in _subject_hits(body, m.group(0)))
+-        for body in post_stop:
+-            nb = _norm(body)
+-            for m in NEVER_PEER_RESUMABLE.finditer(nb):
+-                ok = (_exempt_record_mentions_ok(body, m.group(0)) if record_exempted
+-                      else _gate_preserved_only(body, m.group(0)))
+-                if not ok:
+-                    raise PermissionError(f'Needs Chris to decide: post-stop record involves {m.group(0).lower()}')
+-            if record_exempted:
+-                for m in _FRESH_PROTECTED_REQUEST.finditer(nb):
+-                    if not _exempt_record_mentions_ok(body, m.group(0)):
++        # Peer restrictions must not turn the owner's own scoped continuation
++        # into a keyword-based approval loop. The CLI admits this owner context;
++        # workers cannot mint it with payload fields. Snapshot, authorization,
++        # active-work, review and dependency checks remain common to both paths.
++        from gateway.gus_admin_cli import owner_continuation_active
++        if not owner_continuation_active():
++            # Every comment since the stop is checked for never-peer-resumable subjects.
++            # >= : same-second records fail closed (checked, not skipped).
++            post_stop = [r['body'] or '' for r in conn.execute(
++                'SELECT body FROM task_comments WHERE task_id=? AND created_at>=? ORDER BY id',
++                (task_id, latest['created_at']))]
++            # t_bef58dfb R18: two disjoint modes; no open-ended negation parsing.
++            # (a) No mention needs the descriptive-report exemption: the baseline
++            #     rule (_gate_preserved_only) applies unchanged.
++            # (b) Some mention needs it: every protected mention in the whole
++            #     post-stop record (never-peer subjects AND fresh deploy/restart/
++            #     security/send words) must be a recognised checker description
++            #     or sit in a sentence that matches, in full, the closed
++            #     _SAFE_SCOPE_SENTENCE grammar ("No deployment or restart.",
++            #     "Keep the publish hold.").  Anything else refuses, so negation
++            #     or safeguard wording can never widen what resumes.
++            record_exempted = any(
++                _descriptive_mention(body, h.start(), h.end())
++                and not _gate_preserved_only(body, h.group(0))
++                for body in post_stop
++                for m in NEVER_PEER_RESUMABLE.finditer(_norm(body))
++                for h in _subject_hits(body, m.group(0)))
++            for body in post_stop:
++                nb = _norm(body)
++                for m in NEVER_PEER_RESUMABLE.finditer(nb):
++                    ok = (_exempt_record_mentions_ok(body, m.group(0)) if record_exempted
++                          else _gate_preserved_only(body, m.group(0)))
++                    if not ok:
+                         raise PermissionError(f'Needs Chris to decide: post-stop record involves {m.group(0).lower()}')
++                if record_exempted:
++                    for m in _FRESH_PROTECTED_REQUEST.finditer(nb):
++                        if not _exempt_record_mentions_ok(body, m.group(0)):
++                            raise PermissionError(f'Needs Chris to decide: post-stop record involves {m.group(0).lower()}')
+         mx = conn.execute('SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id=?',
+                           (task_id,)).fetchone()[0]
+         if mx != expected_latest_comment_id:
+@@ -9366,7 +9372,9 @@
+             'authorization_comment_id': authorization_comment_id,
+             'latest_comment_id': expected_latest_comment_id,
+             'task_sha256': expected_task_sha256,
+-            'failure_history_preserved': True, 'status': 'ready'})
++            'failure_history_preserved': True, 'status': 'ready',
++            'owner_continuation': owner_continuation_active(),
++            'action_restrictions_preserved': True})
+     return 'ready'
+ 
+ 
+@@ -10152,7 +10160,12 @@
+     preserve_workspace = False
+     with write_txn(conn):
+         from gateway.gus_admin_cli import validate_target
+-        preserve_workspace = validate_target(conn, task_id, "archive", reason=reason)
++        validate_target(conn, task_id, "archive", reason=reason)
++        # Retirement is reversible for owners as well as workers.  The
++        # authority check used to return False for an owner, accidentally
++        # treating owner archival as permission to delete scratch inputs.
++        # Retain the durable pin so later completion/GC also preserves them.
++        preserve_workspace = True
+         prior = conn.execute(
+             "SELECT status, block_kind, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+             (task_id,),
+--- /dev/null
++++ b/hermes_cli/owner_board_recovery.py
+@@ -0,0 +1,112 @@
++"""Exact-snapshot adapter for recovering an idle missing-senior review.
++
++Call only after trusted owner/board/private-task admission. This module repairs
++the existing reviewer projection; it never supplies a verdict or spends a run.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import owner_cell as oc
++
++
++def goal_snapshot_sha(row) -> str:
++    return hashlib.sha256(json.dumps(dict(row), sort_keys=True,
++                                    separators=(",", ":")).encode()).hexdigest()
++
++
++def recover_review(conn, task_id: str, *, expected_task_sha256: str,
++                   expected_goal_sha256: str, expected_stop_event_id: int,
++                   expected_latest_comment_id: int, evidence_comment_ids: list[int],
++                   actor: str, reason: str, dry_run: bool = True) -> dict:
++    """Restore one held owner-acceptance review after missing-senior repair.
++
++    ``expected_task_sha256`` is ``kb.triage_snapshot_sha(task_row)``;
++    ``expected_goal_sha256`` is ``goal_snapshot_sha(goal_row)``. The caller's
++    trusted owner boundary must enforce board identity and private task custody.
++    """
++    from agent.private_worker_mode import get_authenticated_worker_contract
++    from gateway.session_context import get_bound_session_env
++
++    kb._assert_not_delegated_child_mutation()
++    if (get_authenticated_worker_contract()
++            or os.environ.get("HERMES_KANBAN_TASK")
++            or os.environ.get("HERMES_KANBAN_RUN_ID")
++            or get_bound_session_env("HERMES_KANBAN_TASK")
++            or get_bound_session_env("HERMES_KANBAN_RUN_ID")
++            or (get_bound_session_env("HERMES_SESSION_SOURCE")
++                or os.environ.get("HERMES_SESSION_SOURCE")) in {"kanban", "cron"}):
++        raise PermissionError("held review recovery is unavailable to workers or cron")
++    if (type(dry_run) is not bool
++            or not all(isinstance(x, str) and re.fullmatch(r"[a-f0-9]{64}", x)
++                       for x in (expected_task_sha256, expected_goal_sha256))
++            or type(expected_stop_event_id) is not int or expected_stop_event_id < 1
++            or type(expected_latest_comment_id) is not int or expected_latest_comment_id < 1
++            or not isinstance(evidence_comment_ids, list) or not evidence_comment_ids
++            or len(evidence_comment_ids) > 20
++            or any(type(x) is not int or x < 1 for x in evidence_comment_ids)
++            or not isinstance(actor, str) or not actor.strip() or len(actor) > 100
++            or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000):
++        raise ValueError("exact review snapshots, evidence comments and bounded reason required")
++
++    with kb.write_txn(conn):
++        from hermes_cli.board_owner_manage import validate_bound_target
++        validate_bound_target(conn, task_id, "recover_review")
++        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        goal = conn.execute("SELECT * FROM owner_cell_goals WHERE task_id=?", (task_id,)).fetchone()
++        if (task is None or goal is None or task["status"] not in {"triage", "blocked"}
++                or kb.triage_snapshot_sha(task) != expected_task_sha256
++                or goal_snapshot_sha(goal) != expected_goal_sha256):
++            raise ValueError("held review snapshot changed; inspect the card again")
++        stop = conn.execute(
++            "SELECT id FROM task_events WHERE task_id=? AND kind IN "
++            "('block_loop_detected','blocked','triaged','escalated') ORDER BY id DESC LIMIT 1",
++            (task_id,)).fetchone()
++        latest = conn.execute("SELECT id FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                              (task_id,)).fetchone()
++        if (stop is None or stop["id"] != expected_stop_event_id
++                or latest is None or latest["id"] != expected_latest_comment_id):
++            raise ValueError("review stop or latest comment changed; inspect the card again")
++        for comment_id in evidence_comment_ids:
++            evidence = conn.execute("SELECT task_id,author FROM task_comments WHERE id=?",
++                                    (comment_id,)).fetchone()
++            if (evidence is None or evidence["task_id"] != task_id
++                    or evidence["author"] != goal["required_reviewer_profile"]):
++                raise ValueError("review evidence must be same-card comments by the bound reviewer")
++        if not kb._parents_satisfied(conn, task_id):
++            raise ValueError("review prerequisites remain unsatisfied")
++
++        contract = json.loads(goal["contract_json"])
++        conn.execute("SAVEPOINT preview_owner_review_recovery")
++        try:
++            receipt = oc.recover_owner_acceptance_senior_review(
++                conn, task_id,
++                expected_contract_sha256=hashlib.sha256(goal["contract_json"].encode()).hexdigest(),
++                expected_state_version=goal["current_state_version"],
++                expected_review_loop_count=goal["review_loop_count"],
++                expected_task_status=task["status"],
++                expected_owner_profile=goal["owner_profile"],
++                expected_maker_profile=contract["runtime_profile"],
++                expected_reviewer_profile=goal["required_reviewer_profile"],
++                expected_review_artifact_ref=goal["review_artifact_ref"],
++                expected_review_artifact_digest=goal["review_artifact_digest"],
++                evidence_comment_ids=evidence_comment_ids,
++                actor=actor.strip(), reason=reason.strip(),
++            )
++        finally:
++            if dry_run:
++                conn.execute("ROLLBACK TO SAVEPOINT preview_owner_review_recovery")
++            conn.execute("RELEASE SAVEPOINT preview_owner_review_recovery")
++        return {
++            "task_id": task_id, "action": "recover_review", "dry_run": dry_run,
++            "status": task["status"] if dry_run else "review",
++            "proposed_status": "review", "reviewer": goal["required_reviewer_profile"],
++            "review_loop_count": receipt["review_loop_count"],
++            "review_state_version": receipt["state_version"],
++            "verdict_recorded": False, "dispatch_performed": False,
++            "next_action": "The bound reviewer must claim the existing review and issue a fresh authenticated decision; prior findings and repair limits remain in force.",
++        }
+--- /dev/null
++++ b/tests/gateway/test_owner_board_continuation.py
+@@ -0,0 +1,69 @@
++import argparse
++from dataclasses import asdict
++
++import pytest
++
++from gateway import gus_admin_cli as admin
++from hermes_cli import kanban_db as kb
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    for key in ('HERMES_PROFILE','HERMES_KANBAN_TASK','HERMES_SESSION_SOURCE','HERMES_KANBAN_BOARD'):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    with kb.connect_closing() as c:
++        yield c
++
++
++def evidence(c, title='Local continuity repair'):
++    tid=kb.create_task(c,title=title,assignee='maker',triage=True)
++    with kb.write_txn(c):
++        kb._append_event(c,tid,'blocked',{'reason':'Local harness unavailable'})
++        c.execute("UPDATE task_events SET created_at=1 WHERE task_id=?",(tid,))
++    stop=c.execute('SELECT MAX(id) FROM task_events WHERE task_id=?',(tid,)).fetchone()[0]
++    kb.add_comment(c,tid,'owner','Resume the authorized internal check. The privacy regression suite remains required. No live sends or deployment.')
++    comment=c.execute('SELECT MAX(id) FROM task_comments WHERE task_id=?',(tid,)).fetchone()[0]
++    return tid,dict(expected_stop_event_id=stop,authorization_comment_id=comment,expected_latest_comment_id=comment,
++        expected_task_sha256=kb.triage_snapshot_sha(asdict(kb.get_task(c,tid))),author='owner',reason='Verified local harness is available')
++
++
++def args():
++    return argparse.Namespace(kanban_action='resume-triage',owner_continuation=True)
++
++
++def test_owner_can_continue_without_treating_privacy_scope_as_new_consent(board):
++    tid,ev=evidence(board)
++    with pytest.raises(PermissionError,match='privacy'):
++        kb.resume_triage_task(board,tid,dry_run=True,**ev)
++    with admin.admission(args()):
++        assert kb.resume_triage_task(board,tid,dry_run=True,**ev)=='ready'
++        assert kb.get_task(board,tid).status=='triage'
++        assert kb.resume_triage_task(board,tid,**ev)=='ready'
++    assert not admin.owner_continuation_active()
++    assert len(kb.list_comments(board,tid))==1
++
++
++@pytest.mark.parametrize('profile,source',[('claire','kanban'),('josh','api'),('default','kanban')])
++def test_worker_or_member_cannot_request_owner_continuation(board,monkeypatch,profile,source):
++    monkeypatch.setenv('HERMES_PROFILE',profile)
++    monkeypatch.setenv('HERMES_SESSION_SOURCE',source)
++    with pytest.raises(PermissionError):
++        with admin.admission(args()):
++            pytest.fail('worker/member entered owner continuation')
++    assert not admin.owner_continuation_active()
++
++
++def test_owner_still_cannot_skip_dependencies_or_new_comments(board):
++    tid,ev=evidence(board)
++    parent=kb.create_task(board,title='Required input',assignee='maker')
++    kb.link_tasks(board,parent,tid)
++    with admin.admission(args()):
++        with pytest.raises(ValueError,match='Dependencies'):
++            kb.resume_triage_task(board,tid,dry_run=True,**ev)
++        kb.add_comment(board,tid,'owner','Wait for new inputs')
++        with pytest.raises(ValueError,match='Newer comments'):
++            kb.resume_triage_task(board,tid,dry_run=True,**ev)
++    assert kb.get_task(board,tid).status=='triage'
+--- /dev/null
++++ b/tests/hermes_cli/test_board_owner_control.py
+@@ -0,0 +1,95 @@
++"""Bounded owner-control regression checks; all state lives under tmp_path."""
++import json
++from dataclasses import asdict
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD", "HERMES_PROFILE",
++                "HERMES_SESSION_SOURCE"):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    with kb.connect_closing() as conn:
++        yield conn
++
++
++def test_owner_archive_preserves_workspace_and_restores_lane(board, tmp_path):
++    workspace = tmp_path / "kanban" / "workspaces" / "test-owner-archive"
++    workspace.mkdir(parents=True)
++    original = workspace / "original.txt"
++    original.write_text("Unfinished work and review evidence")
++    tid = kb.create_task(board, title="Obsolete internal draft", assignee="reviewer", triage=True)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id=?",
++                      (str(workspace), tid))
++    kb.add_comment(board, tid, "owner", "Preserve the unfinished result")
++    assert kb.archive_task(board, tid, reason="withdrawn by owner; retain evidence")
++    assert original.read_text() == "Unfinished work and review evidence"
++    assert kb.get_task(board, tid).completed_at is None
++    assert kb.restore_task(board, tid, reason="owner needs it again") == "triage"
++    kb.recompute_ready(board)
++    assert kb.get_task(board, tid).status == "triage"
++    assert len(kb.list_comments(board, tid)) == 1
++
++
++def test_archive_cannot_release_unfinished_prerequisite(board):
++    parent = kb.create_task(board, title="Required input", assignee="maker")
++    child = kb.create_task(board, title="Needs input", assignee="maker", parents=[parent])
++    with pytest.raises(PermissionError, match="dependent"):
++        kb.archive_task(board, parent, reason="obsolete")
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == "todo"
++
++
++def test_done_prerequisite_promotes_child_on_next_tick(board):
++    parent = kb.create_task(board, title="Required input", assignee="maker")
++    child = kb.create_task(board, title="Needs input", assignee="maker", parents=[parent])
++    assert kb.get_task(board, child).status == "todo"
++    # Fixture represents a verified completion, without running an LLM worker.
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='done', completed_at=1 WHERE id=?", (parent,))
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == "ready"
++    assert kb.recompute_ready(board) == 0
++
++
++def test_resume_is_bound_to_current_card_and_preserves_failure_history(board):
++    tid = kb.create_task(board, title="Routine local correction", assignee="maker", triage=True)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET block_kind='capability', consecutive_failures=1 WHERE id=?", (tid,))
++        kb._append_event(board, tid, "blocked", {"reason": "Local tool was unavailable"})
++        board.execute("UPDATE task_events SET created_at=1 WHERE task_id=? AND kind='blocked'", (tid,))
++    stop = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()[0]
++    comment = kb.add_comment(board, tid, "owner", "Resume the authorized local correction; tool repair verified")
++    latest = board.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++    task = kb.get_task(board, tid)
++    evidence = dict(expected_stop_event_id=stop, authorization_comment_id=latest,
++                    expected_latest_comment_id=latest, expected_task_sha256=kb.triage_snapshot_sha(asdict(task)),
++                    author="owner", reason="Local tool repair verified")
++    assert kb.resume_triage_task(board, tid, dry_run=True, **evidence) == "ready"
++    assert kb.get_task(board, tid).status == "triage"
++    assert kb.resume_triage_task(board, tid, **evidence) == "ready"
++    assert kb.get_task(board, tid).consecutive_failures == 1
++    assert len(kb.list_comments(board, tid)) == 1
++
++
++def test_newer_comment_invalidates_prepared_resume(board):
++    tid = kb.create_task(board, title="Routine correction", assignee="maker", triage=True)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "blocked", {"reason": "Unavailable"})
++        board.execute("UPDATE task_events SET created_at=1 WHERE task_id=?", (tid,))
++    stop = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++    kb.add_comment(board, tid, "owner", "Resume authorized routine work")
++    auth = board.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++    kb.add_comment(board, tid, "owner", "Wait for revised inputs")
++    with pytest.raises(ValueError, match="Newer comments"):
++        kb.resume_triage_task(board, tid, expected_stop_event_id=stop, authorization_comment_id=auth,
++            expected_latest_comment_id=auth, expected_task_sha256=kb.triage_snapshot_sha(asdict(kb.get_task(board, tid))),
++            author="owner", reason="Tool fixed")
++    assert kb.get_task(board, tid).status == "triage"
+--- /dev/null
++++ b/tests/hermes_cli/test_member_board_management.py
+@@ -0,0 +1,142 @@
++import json
++from pathlib import Path
++
++import pytest
++
++from gateway import josh_board_authority as authority
++from hermes_cli import board_owner_manage as manage
++from hermes_cli import kanban_db as kb
++
++
++@pytest.fixture
++def member(tmp_path, monkeypatch):
++    monkeypatch.setattr(manage, 'ROOT', tmp_path)
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_HOME', 'HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_SESSION_SOURCE'):
++        monkeypatch.delenv(key, raising=False)
++    grant = dict(principal='newmember', profile='newmember', board='newmember-home', fingerprint='a' * 64)
++    monkeypatch.setattr(manage, 'refresh_member_grant', lambda value: dict(grant))
++    kb.init_db(board=grant['board'])
++    with kb.connect_closing(board=grant['board']) as conn:
++        yield grant, conn
++
++
++def request(conn, task, action, **extra):
++    return dict(action=action, task_id=task, board='newmember-home', reason='Obsolete local work replaced by verified successor',
++                expected_state=manage.describe(conn, task)['expected_state'], **extra)
++
++
++def test_authenticated_new_member_grant_not_environment(member, monkeypatch):
++    grant, conn = member
++    token = authority._execution.set(('newmember', 'newmember'))
++    try:
++        assert manage.require_owner() == grant
++        task = kb.create_task(conn, title='Old card', triage=True)
++        with pytest.raises(PermissionError, match='signed controller'):
++            manage.execute(request(conn, task, 'archive'))
++    finally:
++        authority._execution.reset(token)
++    monkeypatch.setenv('HERMES_PROFILE', 'newmember')
++    with pytest.raises(PermissionError, match='Authenticated member'):
++        manage.require_owner()
++
++
++def test_signed_scope_archive_restore_preserves_files_and_limits(member, tmp_path):
++    grant, conn = member
++    task = kb.create_task(conn, title='Old card', triage=True)
++    work = tmp_path / 'original'
++    work.mkdir()
++    artifact = work / 'result.txt'
++    artifact.write_text('evidence')
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET workspace_path=?,workspace_kind=?,consecutive_failures=2 WHERE id=?', (str(work), 'scratch', task))
++    token = manage._member_context.set(grant)
++    try:
++        assert manage.execute(request(conn, task, 'archive'))['status'] == 'archived'
++        assert artifact.read_text() == 'evidence'
++        assert manage.execute(request(conn, task, 'restore'))['status'] == 'triage'
++        current = kb.get_task(conn, task)
++        assert current.completed_at is None and current.consecutive_failures == 2
++    finally:
++        manage._member_context.reset(token)
++
++
++def test_member_cannot_cross_board_or_override_database(member, monkeypatch, tmp_path):
++    grant, conn = member
++    task = kb.create_task(conn, title='Own card', triage=True)
++    token = manage._member_context.set(grant)
++    try:
++        args = request(conn, task, 'archive')
++        args['board'] = 'chris-home'
++        with pytest.raises(PermissionError, match='outside authenticated'):
++            manage.execute(args)
++        monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'other.db'))
++        with pytest.raises(PermissionError, match='override'):
++            manage.execute(request(conn, task, 'archive'))
++        assert kb.get_task(conn, task).status == 'triage'
++    finally:
++        manage._member_context.reset(token)
++
++
++def test_revoked_member_and_worker_cannot_use_transported_scope(member, monkeypatch):
++    grant, conn = member
++    task = kb.create_task(conn, title='Own card', triage=True)
++    token = manage._member_context.set(grant)
++    try:
++        monkeypatch.setattr(manage, 'refresh_member_grant', lambda value: dict(grant, fingerprint='b' * 64))
++        with pytest.raises(PermissionError, match='enrollment changed'):
++            manage.execute(request(conn, task, 'archive'))
++        monkeypatch.setattr(manage, 'refresh_member_grant', lambda value: dict(grant))
++        monkeypatch.setenv('HERMES_KANBAN_TASK', task)
++        with pytest.raises(PermissionError, match='worker'):
++            manage.execute(request(conn, task, 'archive'))
++    finally:
++        manage._member_context.reset(token)
++
++
++def test_new_work_queues_and_dependency_release_is_common(member):
++    grant, conn = member
++    parent = kb.create_task(conn, title='Prepare input', body='Produce the input', assignee='maker')
++    child = kb.create_task(conn, title='Consume input', body='Read verified input', assignee='maker', parents=[parent])
++    assert kb.get_task(conn, parent).status == 'ready'
++    assert kb.get_task(conn, child).status == 'todo'
++    assert kb.claim_task(conn, parent) is not None
++    kb.complete_task(conn, parent, summary='Verified input')
++    assert kb.get_task(conn, child).status == 'ready'
++
++
++def test_member_recovers_stop_with_evidence_without_resetting_failure_history(member):
++    grant, conn = member
++    task = kb.create_task(conn, title='Repair reader', body='Read local result', assignee='maker', triage=True)
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET consecutive_failures=1 WHERE id=?', (task,))
++        kb._append_event(conn, task, 'blocked', {'reason': 'Local reader unavailable'})
++        conn.execute('UPDATE task_events SET created_at=1 WHERE task_id=?', (task,))
++    kb.add_comment(conn, task, 'newmember', 'Reader corrected; resume authorized local work. Preserve privacy.')
++    fields = manage.describe(conn, task)
++    evidence = {k: fields[k] for k in ('expected_task_sha256', 'expected_stop_event_id', 'expected_latest_comment_id')}
++    evidence['authorization_comment_id'] = fields['expected_latest_comment_id']
++    token = manage._member_context.set(grant)
++    try:
++        assert manage.execute(request(conn, task, 'resume_triage', evidence=evidence, dry_run=True))['status'] == 'triage'
++        assert manage.execute(request(conn, task, 'resume_triage', evidence=evidence))['status'] == 'ready'
++        assert kb.get_task(conn, task).consecutive_failures == 1
++    finally:
++        manage._member_context.reset(token)
++
++
++def test_member_connection_and_freshness_checked_inside_mutation(member, monkeypatch):
++    grant, conn = member
++    task = kb.create_task(conn, title='Own card', triage=True)
++    original = kb.archive_task
++    def stale_first(db, tid, **kwargs):
++        monkeypatch.setattr(manage, 'refresh_member_grant', lambda value: dict(grant, fingerprint='b' * 64))
++        return original(db, tid, **kwargs)
++    monkeypatch.setattr(kb, 'archive_task', stale_first)
++    token = manage._member_context.set(grant)
++    try:
++        with pytest.raises(PermissionError, match='enrollment changed'):
++            manage.execute(request(conn, task, 'archive'))
++        assert kb.get_task(conn, task).status == 'triage'
++    finally:
++        manage._member_context.reset(token)
+--- /dev/null
++++ b/tests/hermes_cli/test_native_board_management.py
+@@ -0,0 +1,145 @@
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import board_owner_manage as owner
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_SESSION_SOURCE'):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    with kb.connect_closing() as conn:
++        yield conn
++
++
++def payload(conn, tid, action, **extra):
++    return dict(task_id=tid, action=action, reason='Obsolete local receipt replaced by verified repair',
++                expected_state=owner.describe(conn, tid)['expected_state'], **extra)
++
++
++def test_owner_archive_restore_preserves_history_files_and_never_completes(board, tmp_path):
++    work = tmp_path / 'work'
++    work.mkdir()
++    artifact = work / 'receipt.txt'
++    artifact.write_text('original')
++    tid = kb.create_task(board, title='Obsolete local receipt', assignee='maker', triage=True)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET workspace_path=?, workspace_kind=?,consecutive_failures=1 WHERE id=?', (str(work), 'scratch', tid))
++    archived = owner.execute(payload(board, tid, 'archive'))
++    assert archived['status'] == 'archived'
++    assert archived['changed'] is True
++    assert artifact.read_text() == 'original'
++    assert kb.get_task(board, tid).completed_at is None
++    assert owner.execute(payload(board, tid, 'restore'))['status'] == 'triage'
++    assert kb.get_task(board, tid).consecutive_failures == 1
++
++
++def test_stale_state_and_active_run_refused(board):
++    tid = kb.create_task(board, title='Old receipt', assignee='maker', triage=True)
++    args = payload(board, tid, 'archive')
++    kb.add_comment(board, tid, 'owner', 'Keep this one for inspection')
++    with pytest.raises(ValueError, match='state changed'):
++        owner.execute(args)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET worker_pid=123 WHERE id=?', (tid,))
++    with pytest.raises(ValueError, match='active work'):
++        owner.execute(payload(board, tid, 'archive'))
++
++
++@pytest.mark.parametrize('key,value', [('HERMES_PROFILE','josh'), ('HERMES_PROFILE','claire'), ('HERMES_SESSION_SOURCE','kanban'), ('HERMES_SESSION_SOURCE','cron'), ('HERMES_KANBAN_TASK','t_any')])
++def test_members_workers_cron_do_not_receive_owner_authority(board, monkeypatch, key, value):
++    tid = kb.create_task(board, title='Receipt', assignee='maker', triage=True)
++    args = payload(board, tid, 'archive')
++    monkeypatch.setenv(key, value)
++    with pytest.raises(PermissionError):
++        owner.execute(args)
++    assert kb.get_task(board, tid).status == 'triage'
++
++
++def test_valid_triage_continuation_preserves_failure_and_releases_only_after_completion(board):
++    parent = kb.create_task(board, title='Verify local receipt', assignee='maker', triage=True)
++    child = kb.create_task(board, title='Consume receipt', assignee='maker', parents=[parent])
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET consecutive_failures=1 WHERE id=?', (parent,))
++        kb._append_event(board, parent, 'blocked', {'reason':'Reader unavailable'})
++        board.execute('UPDATE task_events SET created_at=1 WHERE task_id=?', (parent,))
++    kb.add_comment(board, parent, 'owner', 'Reader corrected; resume authorized local verification. Preserve privacy and no sends.')
++    fields = owner.describe(board, parent)
++    evidence = {k: fields[k] for k in ('expected_task_sha256', 'expected_stop_event_id', 'expected_latest_comment_id')}
++    evidence['authorization_comment_id'] = fields['expected_latest_comment_id']
++    args = payload(board, parent, 'resume_triage', evidence=evidence, dry_run=True)
++    assert owner.execute(args)['dry_run'] is True
++    assert kb.get_task(board, parent).status == 'triage'
++    args['dry_run'] = False
++    assert owner.execute(args)['status'] == 'ready'
++    assert kb.get_task(board, parent).consecutive_failures == 1
++    assert kb.get_task(board, child).status == 'todo'
++    assert kb.claim_task(board, parent) is not None
++    kb.complete_task(board, parent, summary='Verified local receipt')
++    assert kb.get_task(board, child).status == 'ready'
++    assert kb.claim_task(board, child) is not None
++
++
++def test_false_dependency_can_be_removed_without_marking_parent_done(board):
++    parent = kb.create_task(board, title='Obsolete unrelated input', assignee='maker', triage=True)
++    child = kb.create_task(board, title='Local repair', assignee='maker', parents=[parent])
++    assert owner.execute(payload(board, child, 'unlink_dependency', parent_id=parent))['status'] == 'ready'
++    assert kb.get_task(board, parent).status == 'triage'
++    assert kb.get_task(board, parent).completed_at is None
++
++
++def test_archive_real_dependency_refused(board):
++    parent = kb.create_task(board, title='Required input', assignee='maker', triage=True)
++    child = kb.create_task(board, title='Consumer', assignee='maker', parents=[parent])
++    with pytest.raises(PermissionError, match='dependent'):
++        owner.execute(payload(board, parent, 'archive'))
++    assert kb.get_task(board, child).status == 'todo'
++
++
++def test_change_between_preflight_and_mutation_is_checked_in_transaction(board, monkeypatch):
++    tid = kb.create_task(board, title='Old receipt', assignee='maker', triage=True)
++    args = payload(board, tid, 'archive')
++    archive = kb.archive_task
++    def changed_first(conn, task_id, **kwargs):
++        kb.add_comment(conn, task_id, 'owner', 'New instruction before mutation')
++        return archive(conn, task_id, **kwargs)
++    monkeypatch.setattr(kb, 'archive_task', changed_first)
++    with pytest.raises(ValueError, match='state changed'):
++        owner.execute(args)
++    assert kb.get_task(board, tid).status == 'triage'
++
++
++def test_initial_triage_has_explicit_start_and_real_dependency_gating(board):
++    parent = kb.create_task(board, title='Required input', body='Produce a local receipt', assignee='maker', triage=True)
++    child = kb.create_task(board, title='Specified new work', body='Read the required input', assignee='maker', triage=True, parents=[parent])
++    kb.add_comment(board, child, 'owner', 'Authorized to start this specified local work when its input is ready')
++    fields = owner.describe(board, child)
++    assert fields['initial_triage'] is True
++    args = payload(board, child, 'start_triage', evidence={'authorization_comment_id':fields['expected_latest_comment_id']}, dry_run=True)
++    assert owner.execute(args)['dry_run']
++    assert kb.get_task(board, child).status == 'triage'
++    args['dry_run'] = False
++    assert owner.execute(args)['status'] == 'todo'
++    assert kb.get_task(board, parent).status == 'triage'
++
++
++def test_new_triage_start_cannot_replace_stopped_work_recovery(board):
++    tid = kb.create_task(board, title='Stopped work', body='Local correction', assignee='maker', triage=True)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'blocked', {'reason':'Real dependency issue'})
++    kb.add_comment(board, tid, 'owner', 'Resume when resolved')
++    fields = owner.describe(board, tid)
++    with pytest.raises(ValueError, match='new card'):
++        owner.execute(payload(board, tid, 'start_triage', evidence={'authorization_comment_id':fields['expected_latest_comment_id']}))
++
++
++def test_unblock_noop_is_an_explicit_failure(board):
++    tid = kb.create_task(board, title='New triage', body='Specified local work', assignee='maker', triage=True)
++    with pytest.raises(ValueError, match='No unblock transition occurred'):
++        owner.execute(payload(board, tid, 'unblock'))
++    assert kb.get_task(board, tid).status == 'triage'
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_review_recovery.py
+@@ -0,0 +1,140 @@
++"""Bounded review recovery: disposable DB, no workers, services or model calls."""
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import owner_cell as oc
++
++from hermes_cli import owner_board_recovery as recovery
++
++
++@pytest.fixture
++def held_review(tmp_path, monkeypatch):
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME",
++                 "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_TASK",
++                 "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_SOURCE"):
++        monkeypatch.delenv(name, raising=False)
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(oc, "_installed_profile", lambda name: name)
++    conn = kb.connect(home / "kanban.db")
++    contract = {
++        "goal_id": "isolated-owner-review", "objective": "fixture artifact",
++        "owner_profile": "steven", "owner_role_alias": "legal",
++        "runtime_profile": "legal-drafter", "required_reviewer_profile": "steven",
++        "security_realm": "private", "router_mode": "reviewed", "risk_class": "material",
++        "capability_bundle": "legal", "worker_budget": {"producers": 1, "reviewers": 1, "extras": 0, "max_rework_rounds": 2},
++        "targets": [], "acceptance_test": {"expected": "pass"},
++        "rollback": {"procedure_ref": "fixture://rollback"},
++        "callback": {"source_surface": "test", "return_surface": "test", "report_policy": "milestones_only"},
++        "approval_gates": ["external_send"],
++        "owner_acceptance": {"mode": "accountable_owner"},
++        "delegation_roles": {"maker": "legal-drafter", "reviewer": "steven"},
++    }
++    tid = kb.create_task(conn, title="owner reviewer fixture", assignee="legal-drafter", owner_cell_contract=contract)
++    artifact = tmp_path / "artifact.txt"
++    artifact.write_text("Bound document with unresolved finding.")
++    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
++    assert kb.request_review(conn, tid, summary="ready for review", reviewer="steven",
++                             metadata={"owner_cell_artifact": {"ref": str(artifact), "digest": digest}})
++    # Seed the exact obsolete runtime projection: one prior correction, no
++    # active claim, held review, missing optional senior and existing findings.
++    conn.execute("UPDATE owner_cell_goals SET review_loop_count=1 WHERE task_id=?", (tid,))
++    oc.record_verdict(conn, tid, reviewer_profile="steven", state_version=1,
++                      artifact_ref=str(artifact), artifact_digest=digest,
++                      verdict="REQUEST_CHANGES", defects=["existing defect must remain"])
++    conn.execute("UPDATE tasks SET status='triage',block_kind='needs_input',block_recurrences=2,consecutive_failures=1 WHERE id=?", (tid,))
++    kb._append_event(conn, tid, "block_loop_detected", {"reason": "repair loop limit requires a senior owner", "source_status": "review"})
++    conn.commit()
++    cid = kb.add_comment(conn, tid, "steven", "Existing reviewer findings require correction.")
++    task = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    goal = oc.goal_projection(conn, tid)
++    stop = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='block_loop_detected'", (tid,)).fetchone()[0]
++    args = dict(expected_task_sha256=kb.triage_snapshot_sha(task),
++                expected_goal_sha256=recovery.goal_snapshot_sha(goal),
++                expected_stop_event_id=stop, expected_latest_comment_id=cid,
++                evidence_comment_ids=[cid], actor="default", reason="Existing owner restores held review after the missing-senior routing fix.")
++    yield conn, tid, args, artifact
++    conn.close()
++
++
++def state(conn, tid):
++    return (
++        dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()),
++        dict(oc.goal_projection(conn, tid)),
++        [dict(r) for r in conn.execute("SELECT * FROM review_verdicts WHERE task_id=?", (tid,))],
++        conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0],
++    )
++
++
++def test_dry_run_is_exactly_read_only(held_review):
++    conn, tid, args, _ = held_review
++    before = state(conn, tid)
++    result = recovery.recover_review(conn, tid, **args)
++    assert result["dry_run"] and result["proposed_status"] == "review"
++    assert state(conn, tid) == before
++
++
++def test_apply_preserves_findings_custody_limits_and_restores_only_review(held_review):
++    conn, tid, args, _ = held_review
++    before_task, before_goal, before_verdicts, _ = state(conn, tid)
++    result = recovery.recover_review(conn, tid, **args, dry_run=False)
++    after_task, after_goal, after_verdicts, _ = state(conn, tid)
++    assert result["status"] == "review" and result["dispatch_performed"] is False
++    assert after_task == {**before_task, "status": "review"}
++    assert after_verdicts == before_verdicts
++    for key in ("phase", "owner_profile", "runtime_profile", "security_realm", "review_loop_count",
++                "review_state_version", "current_state_version", "review_artifact_ref", "review_artifact_digest", "approval_gates_json", "worker_budget_json"):
++        assert after_goal[key] == before_goal[key]
++    assert after_goal["senior_owner_profile"] == "steven"
++    assert json.loads(after_goal["contract_json"])["runtime_profile"] == "legal-drafter"
++    assert kb.request_changes(conn, tid, reason="not an authenticated active reviewer")[0] is False
++    with pytest.raises(oc.OwnerCellGuardError, match="PASS"):
++        oc.assert_completion_allowed(conn, tid)
++
++
++@pytest.mark.parametrize("changed", ["comment", "goal", "artifact", "claim", "dependency", "foreign_evidence", "worker"])
++def test_recovery_rejects_stale_or_unowned_evidence(held_review, monkeypatch, changed):
++    conn, tid, args, artifact = held_review
++    if changed == "comment":
++        kb.add_comment(conn, tid, "default", "New instruction.")
++    elif changed == "goal":
++        conn.execute("UPDATE owner_cell_goals SET review_loop_count=2 WHERE task_id=?", (tid,)); conn.commit()
++    elif changed == "artifact":
++        artifact.write_text("changed")
++    elif changed == "claim":
++        conn.execute("UPDATE tasks SET claim_lock='active' WHERE id=?", (tid,)); conn.commit()
++    elif changed == "dependency":
++        parent = kb.create_task(conn, title="unfinished prerequisite", assignee="steven")
++        kb.link_tasks(conn, parent, tid)
++    elif changed == "foreign_evidence":
++        other = kb.create_task(conn, title="different private card", assignee="steven")
++        args["evidence_comment_ids"] = [kb.add_comment(conn, other, "steven", "Unrelated review evidence.")]
++    else:
++        monkeypatch.setenv("HERMES_KANBAN_TASK", "different-worker")
++    before = state(conn, tid)
++    with pytest.raises((ValueError, PermissionError, oc.OwnerCellGuardError)):
++        recovery.recover_review(conn, tid, **args, dry_run=False)
++    assert state(conn, tid) == before
++
++
++def test_existing_second_correction_keeps_maker_and_stops_at_budget(held_review):
++    conn, tid, args, _ = held_review
++    recovery.recover_review(conn, tid, **args, dry_run=False)
++    result = oc.request_changes_same_card(conn, tid)
++    assert result.runtime_profile == "legal-drafter"
++    assert result.owner_profile == "steven" and result.review_loop_count == 2
++    oc.update_state(conn, tid, expected_version=1, facts=["bounded correction"])
++    oc.begin_review(conn, tid, reviewer_profile="steven", artifact_ref="new", artifact_digest="new-digest")
++    oc.record_verdict(conn, tid, reviewer_profile="steven", state_version=2,
++                      artifact_ref="new", artifact_digest="new-digest", verdict="REQUEST_CHANGES", defects=["new defect"])
++    with pytest.raises(oc.OwnerCellGuardError, match="repair budget exhausted"):
++        oc.request_changes_same_card(conn, tid)
++    assert oc.goal_projection(conn, tid)["review_loop_count"] == 2

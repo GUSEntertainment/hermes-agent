@@ -121,9 +121,9 @@ def gateway_probe():
     owner.require_owner = lambda: dict(grant)
     try:
         from gateway.member_board_tools import TOOLS
-        require(TOOLS == {"own_work_show", "own_work_manage", "own_work_comment"}, "Member recovery catalog incomplete")
+        require(TOOLS == {"own_work_show", "own_work_manage", "own_work_comment", "own_work_list"}, "Member recovery catalog incomplete")
         schemas = registry.get_definitions(set(TOOLS), quiet=True)
-        require(len(schemas) == 3, "Enrolled member cannot discover recovery controls")
+        require(len(schemas) == 4, "Enrolled member cannot discover recovery controls")
         for name in TOOLS:
             require(callable(registry.get_entry(name).handler), "Member control handler missing")
     finally:

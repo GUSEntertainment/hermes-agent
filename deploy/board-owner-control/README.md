@@ -68,7 +68,7 @@ owner must wire a successful preflight as a prerequisite before activation;
 the existing startup-health rollback remains a separate check. Always preserve
 the previous verified gateway/controller pair and the exact generated package.
 
-Current member package: `releases/20261004-member-board-control` (supersedes the Chris-only v2 overlay). The installed
+Current member package: `releases/20261004-member-board-control-v2` (supersedes the Chris-only v2 overlay). The installed
 controller wrapper selects its controller; the switch script runs the maintained
 preflight before interrupting the gateway. The preflight also distinguishes new
 specified triage (`start_triage`) from stopped-card recovery (`resume_triage`).
@@ -87,7 +87,7 @@ passed deterministic tests; no further paid acceptance run was started.
 The member package derives the board, roster and return destination from protected
 current enrollment. No model argument, environment profile name, or caller-selected
 board grants access. Josh, Connor and new enrolled members use the same controls.
-`own_work_show`, `own_work_manage` and `own_work_comment` provide inspection,
+`own_work_list`, `own_work_show`, `own_work_manage` and `own_work_comment` provide inspection,
 reversible cleanup, triage/review recovery and exact obsolete-dependency removal.
 Existing attempt history, active work and real prerequisites remain enforced.
 Normal fully specified delegation creates ready work, or dependency-waiting work;
@@ -129,3 +129,7 @@ change, with a private backup. The live phone processor rereads this route for
 each request, so no phone service restart is required. Chris Personal is a
 separate older owner-context runtime and is not covered by this GUS member
 rollout; changing that route requires its own authenticated owner migration.
+
+The v2 gateway adds own-board listing to normal member catalogs. The app bridge
+continues to pin the byte-identical authority/delegation/return modules in the
+first member release; those pinned files were not changed by v2.

@@ -1,0 +1,172 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T19:17:25.002124+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-policy-t_c0d19424",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-control-v2",
+      "files": [
+        {
+          "path": "gateway/board_control_transport.py",
+          "before_sha256": null,
+          "after_sha256": "58c253775eb85266d2e0b15ccaa2fc3f67dc3400773ab9ac83867a317e70539e"
+        },
+        {
+          "path": "gateway/host_tool_authority.py",
+          "before_sha256": "9daf56a66c82cbc23d13e83c2b30851b55db448c9a8991e6011b634b9d8f4bf1",
+          "after_sha256": "0ffd1a2ec9d176b3e4bd10170ffa7253d19ee4d5909e8c0f2f6eba29898e4bc2"
+        },
+        {
+          "path": "gateway/josh_pilot_tools.py",
+          "before_sha256": "4590ee3d0ca82836149068a55dc5b0cfcc228178efaedc323e7c4590b61af403",
+          "after_sha256": "5b27ecd2d588ff141b129c8655c5f57d3d268a6b24654be05128f26775a7c51a"
+        },
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": null,
+          "after_sha256": "2c7c4e0a5db51f5b319fad4b41d01cc27ab64097daf1ca0169f23d024a1ee8a2"
+        },
+        {
+          "path": "gateway/owner_agent_creation.py",
+          "before_sha256": "510ed02a1033d770b2fd90fe54dc3015d5a89c492ba8e7836d81bdf4433925ab",
+          "after_sha256": "ceddecd5dfadee7da48f9340f13a058b52730335885f77839c029793cb30d3d2"
+        },
+        {
+          "path": "gateway/owner_app_returns.py",
+          "before_sha256": "dc329502d0f4d57e5a8a456889b6c2996f619655b5de14e358ad234a296ee544",
+          "after_sha256": "6680bc0147d57548da4c7883d20a06183031a83d1b7e70a3aa107c19f3814b39"
+        },
+        {
+          "path": "gateway/owner_delegation.py",
+          "before_sha256": "b23709d3340dff54d38b2d0001878e8d845eceeeb2ee0e858b9547c4887a534e",
+          "after_sha256": "04d8a3a3cfc2de6875f0dbe58afe3a707dd67762eb65908a9d35e454bcafdcc2"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": null,
+          "after_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "ec3bd409c8e1c479123e50d51e099bee79ffe2c6490542c85ed86c3fb0ce6ee8",
+          "after_sha256": "cc0d67150c40a1b6f3db9a5f5f60f02cd766fc354ed5f2b43e7a2de6b0bed52e"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": null,
+          "after_sha256": "320057e82a7748869c6b3ab45e6ef03b40668609cf688919aa69b72808a6a0fd"
+        },
+        {
+          "path": "tests/gateway/test_board_control_transport.py",
+          "before_sha256": null,
+          "after_sha256": "d25470c4df508e8500cf5f4e24963eec343625709917466a4a51cbeaba6d7e52"
+        },
+        {
+          "path": "tests/gateway/test_josh_registry_isolation.py",
+          "before_sha256": "9a7087fc3bdff2c4548df2db6382330c56b4e53fdd459f33af88573fb6194925",
+          "after_sha256": "e96141835c5dc564574e300289561adf92834a405ff3dacdcb2a0a8a48504d8c"
+        },
+        {
+          "path": "tests/gateway/test_member_board_tools.py",
+          "before_sha256": null,
+          "after_sha256": "6d35b23d32b673493b46241a73bf2a8736263eb781a15bd364b628ae3b7e15d5"
+        },
+        {
+          "path": "tests/gateway/test_member_owner_delegation.py",
+          "before_sha256": null,
+          "after_sha256": "a5c45d6e01b6b730364c91bea448851bab8a179c14af335e7859e59e84a97429"
+        },
+        {
+          "path": "tests/tools/test_board_owner_routes.py",
+          "before_sha256": null,
+          "after_sha256": "1811de3f23949f882fff185c1b27dfac2ae50037e0f6da16b4ee8b78613ff737"
+        },
+        {
+          "path": "tests/tools/test_member_board_read_scope.py",
+          "before_sha256": null,
+          "after_sha256": "ce2bf2ee922ba1897726b65edbad6dd31ef664e30b680d8cd96bda3c81678ac9"
+        },
+        {
+          "path": "tests/tools/test_native_board_owner_tool.py",
+          "before_sha256": null,
+          "after_sha256": "34f7bd4dc5cf3af84edc6f2761ca30ad478db50afa2c7a98c5b851cac3576744"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "ab33c67912824273947bd2eeb0343ebef51c4f9358a8c99a8a778c84ecee87a3",
+          "after_sha256": "24955e476faa4f981bb59aaff79e92444262eeec32ce0380fc59417455ddb6ad"
+        },
+        {
+          "path": "toolsets.py",
+          "before_sha256": "4663c5d93d67c3df5a127df1348971e9811d82dfae9583f99a782b93b9870e0c",
+          "after_sha256": "b60274994fcad9f3030810faccce4ced8eeb31f934e02326c1dfaed142dc51f1"
+        }
+      ],
+      "patch_sha256": "474db61d6a1dd7531464f09b1ace1af1f40278fe61833d807553557e153b38ea",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-board-autonomy-compatible",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-controller",
+      "files": [
+        {
+          "path": "gateway/board_control_transport.py",
+          "before_sha256": null,
+          "after_sha256": "58c253775eb85266d2e0b15ccaa2fc3f67dc3400773ab9ac83867a317e70539e"
+        },
+        {
+          "path": "gateway/gus_admin_cli.py",
+          "before_sha256": "03df631a0c7265c03513846e2dae3dc89c052e638acda2b2442e9dee44822cf0",
+          "after_sha256": "d54a28653062133e8fc971efff4f1d5781648ed3dca175d51aefc8e7d2971551"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": null,
+          "after_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074"
+        },
+        {
+          "path": "hermes_cli/kanban.py",
+          "before_sha256": "efb6392fe4e2d739dadadb0f41e38b98f47cb2aa1abcb2a0b1be50278632ca16",
+          "after_sha256": "4f8844f3b7732ec3271c774b67957a18661e93f120f52cfbd0ba1e08d71055cc"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "05283977193df14cf71b0b0c418b35cf4c3e2a6e5e6b4568993384da967a249f",
+          "after_sha256": "5f1673d970c0be575e52c00b110ea73495b67396bf55ba2b12c334723cdc043f"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": null,
+          "after_sha256": "320057e82a7748869c6b3ab45e6ef03b40668609cf688919aa69b72808a6a0fd"
+        },
+        {
+          "path": "tests/gateway/test_owner_board_continuation.py",
+          "before_sha256": null,
+          "after_sha256": "949a9db71c6dcd94f6582c7d31191b6c623dbad82ae691c654aaa30e27f952fe"
+        },
+        {
+          "path": "tests/hermes_cli/test_board_owner_control.py",
+          "before_sha256": null,
+          "after_sha256": "a216f7f03e1e6e364a016974c6cdddc572b49416269b867e26720bc79d4560ad"
+        },
+        {
+          "path": "tests/hermes_cli/test_member_board_management.py",
+          "before_sha256": null,
+          "after_sha256": "ef11a1731e1bc0d56b80e0f294eec28cc7485a67e3f5de8b9f357020af3c87f7"
+        },
+        {
+          "path": "tests/hermes_cli/test_native_board_management.py",
+          "before_sha256": null,
+          "after_sha256": "b61dcef31137c874258dcf36aa34ed21ddd4bd85d0ee3a3e9c56a0bd0edc041b"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_review_recovery.py",
+          "before_sha256": null,
+          "after_sha256": "333ca333b74a3ba53dc9a3b7647351dfdec215f4bfe6eecf27f08c62113060b0"
+        }
+      ],
+      "patch_sha256": "7ab74787b4648262216b4e04617a12042ef49ac9a765dd48cb3bc5e03890a914",
+      "patch": "controller.patch"
+    }
+  }
+}
