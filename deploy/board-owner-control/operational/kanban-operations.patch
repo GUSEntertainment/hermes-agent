@@ -1,0 +1,26 @@
+--- a/skills/devops/kanban-operations/SKILL.md
++++ b/skills/devops/kanban-operations/SKILL.md
+@@ -6,7 +6,22 @@
+ 
+ # Kanban Operations
+ 
+-## Owner board control: use the current command path
++## Owner board control: native actions first
++
++The main Margot owner session now has `kanban_manage`. After `kanban_show`, use
++`board_administration.native.expected_state` for one exact action: `archive`,
++`restore`, `unblock`, `resume_triage`, `unlink_dependency`, or `recover_review`.
++For resume/review, copy the native evidence fields and the actual existing
++same-card authorization/reviewer comment IDs; preview with `dry_run=true`, then
++apply once with false. Stale state means reread, not override. Preserve actual
++external-action restrictions, failed reviews and private account custody.
++`recover_review` restores the reviewer phase and never supplies a passing verdict.
++If a bound artifact uses a redacted locator, resolve it through the authorized
++private artifact route; do not substitute different bytes. Record exact refusals.
++Do these small management actions yourself when requested; do not create another
++cleanup task tree. Workers and member sessions retain their own scoped tools.
++
++### Command fallback
+ 
+ For a direct request to clean up or move the board forward, Margot owns the
+ administrative action. Do not delegate a small lane change into another cleanup

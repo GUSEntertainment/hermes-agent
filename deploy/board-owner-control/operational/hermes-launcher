@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# GUS-168: select the reviewed runtime explicitly, independent of cwd and old symlinks.
+# All board commands use the same reviewed controller as board maintenance.
+# Preserve global profile arguments; never infer the requesting identity here.
+_hermes_args=("$@")
+while (($#)); do
+  case "$1" in
+    -p|--profile) (($# >= 2)) || break; shift 2 ;;
+    --profile=*) shift ;;
+    kanban)
+      exec /Users/Chris/.hermes/scripts/hermes-kanban-guarded --hermes-cli "${_hermes_args[@]}"
+      ;;
+    *) break ;;
+  esac
+done
+set -- "${_hermes_args[@]}"
+unset _hermes_args
+unset PYTHONHOME
+export PYTHONPATH="/Users/Chris/.hermes/releases/hermes-agent-20260906-kanban-lifecycle-v7"
+export VIRTUAL_ENV="/Users/Chris/.hermes/releases/hermes-agent-20260906-kanban-lifecycle-v7/.venv"
+exec "/Users/Chris/.hermes/releases/hermes-agent-20260906-kanban-lifecycle-v7/.venv/bin/python" -P -m hermes_cli.main "$@"

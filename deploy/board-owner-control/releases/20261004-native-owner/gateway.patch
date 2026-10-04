@@ -1,0 +1,663 @@
+--- /dev/null
++++ b/hermes_cli/board_owner_manage.py
+@@ -0,0 +1,149 @@
++"""Native owner board operations, using the installed guarded controller.
++
++No authority is accepted from tool arguments. The gateway checks its actual
++caller before crossing the process boundary; the controller checks again.
++"""
++import hashlib
++import json
++import os
++import re
++import sys
++import time
++from argparse import Namespace
++from contextvars import ContextVar
++from pathlib import Path
++
++_expected = ContextVar('owner_board_expected_state', default=None)
++ACTIONS = ('archive', 'restore', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review')
++
++
++def require_owner():
++    from agent.delegation_context import is_delegated_child_context
++    from gateway.josh_board_authority import restricted, app_binding, _execution
++    from gateway.member_worker_policy import authenticated_private_policy
++    from hermes_constants import get_hermes_home
++    from gateway.session_context import get_bound_session_env
++    scope = _execution.get()
++    home = Path(get_hermes_home())
++    if (is_delegated_child_context() or os.environ.get('HERMES_KANBAN_TASK')
++            or os.environ.get('HERMES_SESSION_SOURCE') in ('kanban', 'cron')
++            or get_bound_session_env('HERMES_SESSION_SOURCE') in ('kanban', 'cron')
++            or get_bound_session_env('HERMES_SESSION_PROFILE') not in ('', 'default')
++            or os.environ.get('HERMES_PROFILE', 'default') not in ('', 'default')
++            or home.parent.name == 'profiles' or restricted() or app_binding() is not None
++            or authenticated_private_policy() is not None
++            or (scope is not None and any(x not in (None, '', 'default', 'chris') for x in scope))):
++        raise PermissionError('Board management requires the main owner session; workers and member sessions retain their existing task scope')
++
++
++def _hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++def describe(conn, task_id):
++    task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is None:
++        raise ValueError('Unknown task in the selected board')
++    goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++    stop = conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','triaged','escalated') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    event = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0]
++    comment = conn.execute('SELECT COALESCE(MAX(id),0) FROM task_comments WHERE task_id=?', (task_id,)).fetchone()[0]
++    parents = [dict(x) for x in conn.execute('SELECT t.* FROM task_links l JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? ORDER BY t.id', (task_id,))]
++    data = dict(task=dict(task), goal=dict(goal) if goal else None, event=event, comment=comment, parents=parents)
++    fields = {k: task[k] for k in ('id', 'title', 'body', 'assignee', 'status', 'tenant')}
++    return dict(expected_state=_hash(data), expected_task_sha256=_hash(fields),
++                expected_goal_sha256=_hash(dict(goal)) if goal else None,
++                expected_stop_event_id=stop[0] if stop else None, expected_latest_comment_id=comment)
++
++
++def validate_bound_target(conn, target, operation):
++    """Called inside each existing mutation's write transaction."""
++    bound = _expected.get()
++    if bound is None:
++        return
++    task_id = target[1] if isinstance(target, tuple) else target
++    if task_id != bound['task_id'] or describe(conn, task_id)['expected_state'] != bound['expected_state']:
++        raise ValueError('Board state changed; inspect the card again before acting')
++    task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if (any(task[k] is not None for k in ('current_run_id', 'worker_pid', 'claim_lock', 'claim_expires'))
++            or conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone()
++            or conn.execute('SELECT 1 FROM target_leases WHERE task_id=? AND expires_at>=?', (task_id, int(time.time()))).fetchone()):
++        raise ValueError('Task has active work; preserve its current run and inspect it before cleanup')
++
++
++def execute(args):
++    require_owner()
++    from gateway.gus_admin_cli import admission
++    from gateway.josh_board_authority import admitted_board
++    from hermes_cli import kanban_db as kb
++    action = args.get('action')
++    if action not in ACTIONS:
++        raise ValueError('Unknown board management action')
++    task_id = args.get('task_id', '')
++    reason = args.get('reason', '')
++    if not re.fullmatch(r't_[A-Za-z0-9_]+', task_id) or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
++        raise ValueError('Exact task id and a concise disposition/resolution reason required')
++    if not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
++        raise ValueError('Use expected_state from the latest kanban_show board_administration.native fields')
++    dry = args.get('dry_run', False)
++    if type(dry) is not bool:
++        raise ValueError('dry_run must be boolean')
++    if dry and action not in ('resume_triage', 'recover_review'):
++        raise ValueError('Dry run is supported for resume_triage and recover_review; other operations are reversible')
++    board = admitted_board(args.get('board'))
++    cli_action = {'resume_triage': 'resume-triage', 'unlink_dependency': 'unlink'}.get(action, action)
++    proof = Namespace(kanban_action=cli_action, owner_continuation=action == 'resume_triage', board=board)
++    token = _expected.set(args)
++    try:
++        with admission(proof), kb.connect_closing(board=board) as conn:
++            validate_bound_target(conn, task_id, cli_action)
++            if action == 'archive':
++                changed = kb.archive_task(conn, task_id, reason=reason)
++            elif action == 'restore':
++                changed = kb.restore_task(conn, task_id, reason=reason) is not None
++            elif action == 'unblock':
++                changed = kb.unblock_task(conn, task_id, preserve_failure_history=True)
++            elif action == 'unlink_dependency':
++                parent = args.get('parent_id', '')
++                if not re.fullmatch(r't_[A-Za-z0-9_]+', parent):
++                    raise ValueError('Exact obsolete prerequisite parent_id required')
++                changed = kb.unlink_tasks(conn, parent, task_id)
++            elif action == 'resume_triage':
++                evidence = args.get('evidence') or {}
++                kb.resume_triage_task(conn, task_id, author='default', reason=reason, dry_run=dry,
++                    expected_stop_event_id=evidence.get('expected_stop_event_id'),
++                    authorization_comment_id=evidence.get('authorization_comment_id'),
++                    expected_latest_comment_id=evidence.get('expected_latest_comment_id'),
++                    expected_task_sha256=evidence.get('expected_task_sha256'))
++                changed = not dry
++            else:
++                from hermes_cli.owner_board_recovery import recover_review
++                result = recover_review(conn, task_id, actor='default', reason=reason, dry_run=dry,
++                                        **(args.get('evidence') or {}))
++                changed = not dry
++            task = kb.get_task(conn, task_id)
++            result = dict(ok=True, action=action, task_id=task_id, board=board,
++                          changed=bool(changed), dry_run=dry, status=task.status,
++                          failure_history_preserved=True)
++            if action == 'recover_review':
++                result['next_action'] = 'Fresh decision by the bound reviewer; recovery is not review approval'
++            return result
++    finally:
++        _expected.reset(token)
++
++
++def main():
++    try:
++        payload = sys.stdin.read(32001)
++        if len(payload) > 32000:
++            raise ValueError('Board operation payload too large')
++        result = execute(json.loads(payload))
++    except Exception as exc:
++        print(json.dumps(dict(ok=False, error=str(exc))))
++        return 1
++    print(json.dumps(result))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -5197,18 +5197,28 @@
+ 
+ def _dependency_satisfied_from_values(
+     status: Optional[str], block_kind: Optional[str] = None,
++    completed_at: Optional[int] = None,
+ ) -> bool:
+-    return status in DEPENDENCY_TERMINAL_STATUSES
++    """Completion, not retirement, satisfies a prerequisite (t_fa49d830).
++
++    ``archived`` only counts when the card was actually completed before it was
++    retired (``completed_at`` survives archival; reopen clears it). Retiring
++    unfinished work must never release the work that depends on it, including
++    after restore or when a new link targets the retired card.
++    """
++    if status == "done":
++        return True
++    return status == "archived" and bool(completed_at)
+ 
+ 
+ def _task_row_satisfies_dependency(conn: sqlite3.Connection, task_id: str) -> bool:
+     row = conn.execute(
+-        "SELECT status, block_kind FROM tasks WHERE id = ?",
++        "SELECT status, block_kind, completed_at FROM tasks WHERE id = ?",
+         (task_id,),
+     ).fetchone()
+     if row is None:
+         return False
+-    return _dependency_satisfied_from_values(row["status"], row["block_kind"])
++    return _dependency_satisfied_from_values(row["status"], row["block_kind"], row["completed_at"])
+ 
+ 
+ def _is_verified_owner_cell_delegation(conn, parent_id, child_assignee, edge_role, *, child_id=None):
+@@ -5266,6 +5276,7 @@
+         """
+         SELECT l.parent_id, l.child_id, l.edge_role,
+                p.id AS resolved_parent_id, p.title, p.status, p.block_kind,
++               p.completed_at AS completed_at,
+                p.assignee, p.owner_profile, p.runtime_profile,
+                child.assignee AS child_assignee
+           FROM task_links l
+@@ -5282,7 +5293,7 @@
+ def _dependency_parent_row_satisfied(row: sqlite3.Row) -> bool:
+     if row["resolved_parent_id"] is None:
+         return False
+-    return _dependency_satisfied_from_values(row["status"], row["block_kind"])
++    return _dependency_satisfied_from_values(row["status"], row["block_kind"], row["completed_at"])
+ 
+ 
+ def _parent_ids_satisfied_for_dependency(
+@@ -5292,14 +5303,14 @@
+     if not ids:
+         return True
+     rows = conn.execute(
+-        "SELECT id, status, block_kind FROM tasks WHERE id IN "
++        "SELECT id, status, block_kind, completed_at FROM tasks WHERE id IN "
+         "(" + ",".join("?" * len(ids)) + ")",
+         ids,
+     ).fetchall()
+     if len(rows) != len(ids):
+         return False
+     return all(
+-        _dependency_satisfied_from_values(row["status"], row["block_kind"])
++        _dependency_satisfied_from_values(row["status"], row["block_kind"], row["completed_at"])
+         for row in rows
+     )
+ 
+--- /dev/null
++++ b/hermes_cli/owner_board_recovery.py
+@@ -0,0 +1,112 @@
++"""Exact-snapshot adapter for recovering an idle missing-senior review.
++
++Call only after trusted owner/board/private-task admission. This module repairs
++the existing reviewer projection; it never supplies a verdict or spends a run.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import owner_cell as oc
++
++
++def goal_snapshot_sha(row) -> str:
++    return hashlib.sha256(json.dumps(dict(row), sort_keys=True,
++                                    separators=(",", ":")).encode()).hexdigest()
++
++
++def recover_review(conn, task_id: str, *, expected_task_sha256: str,
++                   expected_goal_sha256: str, expected_stop_event_id: int,
++                   expected_latest_comment_id: int, evidence_comment_ids: list[int],
++                   actor: str, reason: str, dry_run: bool = True) -> dict:
++    """Restore one held owner-acceptance review after missing-senior repair.
++
++    ``expected_task_sha256`` is ``kb.triage_snapshot_sha(task_row)``;
++    ``expected_goal_sha256`` is ``goal_snapshot_sha(goal_row)``. The caller's
++    trusted owner boundary must enforce board identity and private task custody.
++    """
++    from agent.private_worker_mode import get_authenticated_worker_contract
++    from gateway.session_context import get_bound_session_env
++
++    kb._assert_not_delegated_child_mutation()
++    if (get_authenticated_worker_contract()
++            or os.environ.get("HERMES_KANBAN_TASK")
++            or os.environ.get("HERMES_KANBAN_RUN_ID")
++            or get_bound_session_env("HERMES_KANBAN_TASK")
++            or get_bound_session_env("HERMES_KANBAN_RUN_ID")
++            or (get_bound_session_env("HERMES_SESSION_SOURCE")
++                or os.environ.get("HERMES_SESSION_SOURCE")) in {"kanban", "cron"}):
++        raise PermissionError("held review recovery is unavailable to workers or cron")
++    if (type(dry_run) is not bool
++            or not all(isinstance(x, str) and re.fullmatch(r"[a-f0-9]{64}", x)
++                       for x in (expected_task_sha256, expected_goal_sha256))
++            or type(expected_stop_event_id) is not int or expected_stop_event_id < 1
++            or type(expected_latest_comment_id) is not int or expected_latest_comment_id < 1
++            or not isinstance(evidence_comment_ids, list) or not evidence_comment_ids
++            or len(evidence_comment_ids) > 20
++            or any(type(x) is not int or x < 1 for x in evidence_comment_ids)
++            or not isinstance(actor, str) or not actor.strip() or len(actor) > 100
++            or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000):
++        raise ValueError("exact review snapshots, evidence comments and bounded reason required")
++
++    with kb.write_txn(conn):
++        from hermes_cli.board_owner_manage import validate_bound_target
++        validate_bound_target(conn, task_id, "recover_review")
++        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        goal = conn.execute("SELECT * FROM owner_cell_goals WHERE task_id=?", (task_id,)).fetchone()
++        if (task is None or goal is None or task["status"] not in {"triage", "blocked"}
++                or kb.triage_snapshot_sha(task) != expected_task_sha256
++                or goal_snapshot_sha(goal) != expected_goal_sha256):
++            raise ValueError("held review snapshot changed; inspect the card again")
++        stop = conn.execute(
++            "SELECT id FROM task_events WHERE task_id=? AND kind IN "
++            "('block_loop_detected','blocked','triaged','escalated') ORDER BY id DESC LIMIT 1",
++            (task_id,)).fetchone()
++        latest = conn.execute("SELECT id FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                              (task_id,)).fetchone()
++        if (stop is None or stop["id"] != expected_stop_event_id
++                or latest is None or latest["id"] != expected_latest_comment_id):
++            raise ValueError("review stop or latest comment changed; inspect the card again")
++        for comment_id in evidence_comment_ids:
++            evidence = conn.execute("SELECT task_id,author FROM task_comments WHERE id=?",
++                                    (comment_id,)).fetchone()
++            if (evidence is None or evidence["task_id"] != task_id
++                    or evidence["author"] != goal["required_reviewer_profile"]):
++                raise ValueError("review evidence must be same-card comments by the bound reviewer")
++        if not kb._parents_satisfied(conn, task_id):
++            raise ValueError("review prerequisites remain unsatisfied")
++
++        contract = json.loads(goal["contract_json"])
++        conn.execute("SAVEPOINT preview_owner_review_recovery")
++        try:
++            receipt = oc.recover_owner_acceptance_senior_review(
++                conn, task_id,
++                expected_contract_sha256=hashlib.sha256(goal["contract_json"].encode()).hexdigest(),
++                expected_state_version=goal["current_state_version"],
++                expected_review_loop_count=goal["review_loop_count"],
++                expected_task_status=task["status"],
++                expected_owner_profile=goal["owner_profile"],
++                expected_maker_profile=contract["runtime_profile"],
++                expected_reviewer_profile=goal["required_reviewer_profile"],
++                expected_review_artifact_ref=goal["review_artifact_ref"],
++                expected_review_artifact_digest=goal["review_artifact_digest"],
++                evidence_comment_ids=evidence_comment_ids,
++                actor=actor.strip(), reason=reason.strip(),
++            )
++        finally:
++            if dry_run:
++                conn.execute("ROLLBACK TO SAVEPOINT preview_owner_review_recovery")
++            conn.execute("RELEASE SAVEPOINT preview_owner_review_recovery")
++        return {
++            "task_id": task_id, "action": "recover_review", "dry_run": dry_run,
++            "status": task["status"] if dry_run else "review",
++            "proposed_status": "review", "reviewer": goal["required_reviewer_profile"],
++            "review_loop_count": receipt["review_loop_count"],
++            "review_state_version": receipt["state_version"],
++            "verdict_recorded": False, "dispatch_performed": False,
++            "next_action": "The bound reviewer must claim the existing review and issue a fresh authenticated decision; prior findings and repair limits remain in force.",
++        }
+--- /dev/null
++++ b/tests/tools/test_board_owner_routes.py
+@@ -0,0 +1,65 @@
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tools import kanban_tools as kt
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD", "HERMES_PROFILE", "HERMES_SESSION_SOURCE"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: True)
++    kb.init_db()
++    with kb.connect_closing() as conn:
++        yield conn
++
++
++def test_native_triage_error_exposes_supported_continuation(board):
++    tid = kb.create_task(board, title="Local repair", assignee="maker", triage=True)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "blocked", {"reason": "Tool unavailable"})
++    kb.add_comment(board, tid, "owner", "Resume the authorized local repair after tool verification")
++    result = json.loads(kt._handle_unblock({"task_id": tid}))
++    assert result["code"] == "triage_resolution_required"
++    route = result["board_administration"]
++    assert "resume-triage" in route["command_templates"]["resume_dry_run"]
++    assert "--dry-run" in route["command_templates"]["resume_dry_run"]
++    assert route["latest_stop_event_id"] > 0
++    assert route["latest_comment_id"] > 0
++    assert len(route["resume_snapshot_sha256"]) == 64
++    assert kb.get_task(board, tid).status == "triage"
++
++
++def test_native_show_names_unsatisfied_dependency_and_owner(board):
++    parent = kb.create_task(board, title="Prepare required input", assignee="input-owner", triage=True)
++    child = kb.create_task(board, title="Consume input", assignee="maker", parents=[parent])
++    result = json.loads(kt._handle_show({"task_id": child}))
++    assert result["board_administration"]["waiting_on"] == [
++        {"task_id": parent, "title": "Prepare required input", "status": "triage", "owner": "input-owner"}]
++    assert all("id" in e for e in result["events"])
++    assert "archive" in result["board_administration"]["command_templates"]
++
++
++def test_worker_does_not_receive_orchestrator_routes(board, monkeypatch):
++    tid = kb.create_task(board, title="Worker task", assignee="maker")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    assert kt._owner_board_routes(kb, board, kb.get_task(board, tid)) is None
++    result = json.loads(kt._handle_unblock({"task_id": tid}))
++    assert "error" in result
++
++
++def test_retirement_is_not_dependency_completion_but_real_completion_releases(board):
++    parent = kb.create_task(board, title="Prerequisite", assignee="maker")
++    child = kb.create_task(board, title="Dependent", assignee="maker", parents=[parent])
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='archived',completed_at=NULL WHERE id=?", (parent,))
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == "todo"
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET completed_at=1 WHERE id=?", (parent,))
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == "ready"
+--- /dev/null
++++ b/tests/tools/test_native_board_owner_tool.py
+@@ -0,0 +1,53 @@
++import json
++
++import pytest
++
++from tools import kanban_tools as kt
++from hermes_cli import kanban_db as kb
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_SESSION_SOURCE'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(kt, '_profile_has_kanban_toolset', lambda: True)
++    kb.init_db()
++    with kb.connect_closing() as conn:
++        yield conn
++
++
++def test_native_inspection_provides_exact_control_evidence(board):
++    tid = kb.create_task(board, title='Local receipt', assignee='maker', triage=True)
++    result = json.loads(kt._handle_show({'task_id': tid}))
++    native = result['board_administration']['native']
++    assert native['tool'] == 'kanban_manage'
++    assert len(native['expected_state']) == 64
++    assert len(native['expected_task_sha256']) == 64
++    assert kt._check_board_owner_mode()
++
++
++@pytest.mark.parametrize('profile', ['josh','connor','claire'])
++def test_non_owner_never_reaches_subprocess(board, monkeypatch, profile):
++    monkeypatch.setenv('HERMES_PROFILE', profile)
++    monkeypatch.setattr(kt, '_invoke_board_controller', lambda args: pytest.fail('Unauthorized controller call'))
++    assert not kt._check_board_owner_mode()
++    assert 'error' in json.loads(kt._handle_manage({'task_id':'t_dummy','action':'archive'}))
++
++
++def test_authenticated_member_context_denied_even_with_default_process(board, monkeypatch):
++    from gateway import josh_board_authority as authority
++    token = authority._execution.set(('default','connor'))
++    try:
++        monkeypatch.setattr(kt, '_invoke_board_controller', lambda args: pytest.fail('Cross-account controller call'))
++        assert 'error' in json.loads(kt._handle_manage({'task_id':'t_dummy','action':'archive'}))
++    finally:
++        authority._execution.reset(token)
++
++
++def test_owner_calls_controller_with_real_board_admission(board, monkeypatch):
++    seen = []
++    monkeypatch.setattr(kt, '_invoke_board_controller', lambda args: seen.append(args) or {'ok':True,'status':'archived'})
++    result = json.loads(kt._handle_manage({'task_id':'t_dummy','action':'archive','board':None}))
++    assert result['ok'] and len(seen) == 1
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -587,6 +587,96 @@
+ # ---------------------------------------------------------------------------
+ # Handlers
+ # ---------------------------------------------------------------------------
++
++def _owner_board_routes(kb, conn, task, board=None):
++    """Expose supported control paths without changing session authority."""
++    if not _check_kanban_orchestrator_mode():
++        return None
++    import hashlib
++    import shlex
++
++    prefix = ["hermes", "kanban", "--board", board or kb.get_current_board()]
++    command = lambda *args: shlex.join(prefix + [str(x) for x in args])
++    fields = {k: getattr(task, k) for k in ("id", "title", "body", "assignee", "status", "tenant")}
++    snapshot = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++    stop = conn.execute(
++        "SELECT id,kind,payload FROM task_events WHERE task_id=? AND kind IN "
++        "('blocked','block_loop_detected','triaged','escalated') ORDER BY id DESC LIMIT 1",
++        (task.id,),
++    ).fetchone()
++    latest_comment = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_comments WHERE task_id=?", (task.id,)).fetchone()[0]
++    waiting = []
++    for pid in kb.parent_ids(conn, task.id):
++        parent = kb.get_task(conn, pid)
++        if not kb._task_row_satisfies_dependency(conn, pid):
++            waiting.append({"task_id": pid, "title": parent.title if parent else None,
++                            "status": parent.status if parent else "missing",
++                            "owner": parent.assignee if parent else None})
++    routes = {
++        "show": command("show", task.id, "--json"),
++        "archive": command("archive", task.id, "--reason", "DISPOSITION_AND_EVIDENCE"),
++        "restore": command("restore", task.id, "--reason", "REASON"),
++    }
++    if task.status == "triage" and stop:
++        routes["resume_dry_run"] = command("resume-triage", task.id, "--stop-event", stop["id"],
++            "--auth-comment", "AUTHORIZATION_COMMENT_ID", "--latest-comment", latest_comment,
++            "--task-sha", snapshot, "--reason", "RESOLUTION_EVIDENCE", "--dry-run")
++    native = None
++    try:
++        from hermes_cli.board_owner_manage import require_owner, describe
++        require_owner()
++        native = dict(tool="kanban_manage", **describe(conn, task.id))
++    except PermissionError:
++        pass
++    return {"native": native, "waiting_on": waiting, "latest_stop_event_id": stop["id"] if stop else None,
++            "latest_comment_id": latest_comment, "resume_snapshot_sha256": snapshot,
++            "command_templates": routes,
++            "guidance": "Use kanban_manage for owner cleanup and recovery when native fields are present. For triage use resume_triage with these exact snapshot fields and a same-card authorization comment after the stop: dry-run, then apply. For a held owner review use recover_review with bound reviewer evidence comments. Archive obsolete work reversibly; restore stays paused. Unlink only an identified obsolete scheduling dependency, never a real unfinished prerequisite. Read the current authorization and remaining holds; preserve action restrictions. Report the exact refused condition instead of repeating unblock or creating another cleanup chain. Command templates remain available as a fallback."}
++
++
++def _check_board_owner_mode():
++    if not _check_kanban_orchestrator_mode():
++        return False
++    try:
++        from hermes_cli.board_owner_manage import require_owner
++        require_owner()
++        return True
++    except PermissionError:
++        return False
++
++
++def _invoke_board_controller(args):
++    import subprocess
++    from pathlib import Path
++    from gateway.session_context import get_session_env
++    from hermes_constants import get_hermes_home
++    executable = Path(get_hermes_home()) / "scripts" / "hermes-kanban-guarded"
++    if not executable.is_file():
++        raise ValueError("Installed guarded board controller is unavailable")
++    env = os.environ.copy()
++    for name in ("HERMES_SESSION_SOURCE", "HERMES_SESSION_PROFILE"):
++        env[name] = get_session_env(name)
++    result = subprocess.run([str(executable), "--owner-tool-json"], input=json.dumps(args),
++                            text=True, capture_output=True, timeout=30, env=env)
++    try:
++        data = json.loads(result.stdout)
++    except ValueError:
++        raise ValueError("Board controller did not return a receipt; inspect the task before retrying")
++    return data
++
++
++def _handle_manage(args: dict, **kw) -> str:
++    try:
++        from hermes_cli.board_owner_manage import require_owner
++        from gateway.josh_board_authority import admitted_board
++        require_owner()
++        if not _profile_has_kanban_toolset():
++            raise PermissionError("The owner profile must enable its existing kanban toolset")
++        payload = dict(args, board=admitted_board(args.get("board")))
++        return json.dumps(_invoke_board_controller(payload))
++    except Exception as exc:
++        return tool_error(f"kanban_manage: {exc}")
++
+ 
+ def _handle_show(args: dict, **kw) -> str:
+     """Read a task's full state: task row, parents, children, comments,
+@@ -694,18 +784,19 @@
+             return json.dumps({
+                 **({"delivery_instructions": delivery} if private_policy is not None else {}),
+                 "child_execution": child_execution,
++                "board_administration": _owner_board_routes(kb, conn, task, board),
+                 "task": _task_dict(task),
+                 "owner_cell": kb.owner_cell_read_state(conn, tid),
+                 "owner_workflow": describe_workflow(conn, tid),
+                 "parents": parents,
+                 "children": children,
+                 "comments": [
+-                    {"author": c.author, "body": c.body,
++                    {"id": c.id, "author": c.author, "body": c.body,
+                      "created_at": c.created_at}
+                     for c in shown_comments
+                 ],
+                 "events": [
+-                    {"kind": e.kind, "payload": e.payload,
++                    {"id": e.id, "kind": e.kind, "payload": e.payload,
+                      "created_at": e.created_at, "run_id": e.run_id}
+                     for e in shown_events
+                 ],
+@@ -2044,8 +2135,14 @@
+             if not ok:
+                 task = kb.get_task(conn, str(tid))
+                 if task and task.status == 'triage':
++                    routes = _owner_board_routes(kb, conn, task, board)
++                    if routes and routes.get('native'):
++                        return tool_error(
++                            'This card needs same-card recovery. Use kanban_manage action resume_triage with the native snapshot and the existing same-card authorization comment after the stop. Preview with dry_run=true, then apply once. If the task is in review, use recover_review instead. Do not repeat ordinary unblock or create a duplicate cleanup task.',
++                            code='triage_resolution_required', status='triage', task_id=str(tid),
++                            board_administration=routes)
+                     from hermes_cli.plain_advisory import snapshot_digest
+-                    return tool_error('Task is in triage, not ordinary blocked state. Inspect the latest block and all remaining holds. '
++                    return tool_error('Task is in triage, not ordinary blocked state. Use the board_administration command templates for supported same-card continuation; do not repeat ordinary unblock or create another cleanup task. Inspect the latest block and all remaining holds. '
+                         'If the specific action was already approved, do not ask again: verify successful execution and current capability. '
+                         'For an idle plain capability/transient task, supply recovery with expected_snapshot_digest, '
+                         'evidence_ref, evidence_digest and reason. Evidence JSON must identify task_id and resolved_block_event_id, '
+@@ -2053,7 +2150,8 @@
+                         'capability_verified=true and unresolved_holds=[]. Denied/unexecuted actions, other unresolved holds and '
+                         'owner-cell reviews require their existing supported route; no blind status flip or reset.',
+                         code='triage_resolution_required', status='triage', task_id=str(tid),
+-                        snapshot_digest=snapshot_digest(conn, str(tid)))
++                        snapshot_digest=snapshot_digest(conn, str(tid)),
++                        board_administration=_owner_board_routes(kb, conn, task, board))
+                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+             task = kb.get_task(conn, str(tid))
+             return _ok(task_id=str(tid), status=task.status if task else None)
+@@ -2887,6 +2985,29 @@
+     },
+ }
+ 
++KANBAN_MANAGE_SCHEMA = {
++    "name": "kanban_manage",
++    "description": "Main-owner board control: reversibly archive obsolete work, restore it paused, resume triage after a verified correction, unblock resolved work, remove a specifically obsolete dependency, or restore a held owner review. Inspect kanban_show first and use its board_administration.native snapshot. This changes board state, not external-action permissions or review verdicts; never retry an unchanged failure.",
++    "parameters": {"type": "object", "properties": {
++        "task_id": {"type": "string"},
++        "board": _board_schema_prop(),
++        "action": {"type": "string", "enum": ["archive", "restore", "resume_triage", "unblock", "unlink_dependency", "recover_review"]},
++        "expected_state": {"type": "string", "description": "Copy expected_state from the latest kanban_show native fields; a change requires rereading the card."},
++        "reason": {"type": "string", "description": "Exact verified correction, or obsolete/duplicate/superseded/withdrawn retirement reason. Preserve existing restrictions."},
++        "parent_id": {"type": "string", "description": "For unlink_dependency only, the specifically obsolete prerequisite."},
++        "dry_run": {"type": "boolean", "description": "For resume_triage and recover_review, preview first then apply once with false."},
++        "evidence": {"type": "object", "properties": {
++            "expected_stop_event_id": {"type": "integer"},
++            "authorization_comment_id": {"type": "integer"},
++            "expected_latest_comment_id": {"type": "integer"},
++            "expected_task_sha256": {"type": "string"},
++            "expected_goal_sha256": {"type": "string"},
++            "evidence_comment_ids": {"type": "array", "items": {"type": "integer"}},
++        }, "additionalProperties": False,
++        "description": "For resume_triage: stop, same-card authorization comment after stop, latest comment and task SHA. For recover_review: stop, latest comment, task SHA, goal SHA and same-card bound-reviewer comment IDs; omit authorization_comment_id."},
++    }, "required": ["task_id", "action", "expected_state", "reason"], "additionalProperties": False},
++}
++
+ KANBAN_UNBLOCK_SCHEMA = {
+     "name": "kanban_unblock",
+     "description": (
+@@ -3112,3 +3233,6 @@
+     schema=KANBAN_REBIND_REVIEW_ARTIFACT_SCHEMA, handler=_handle_rebind_review_artifact,
+     check_fn=_check_kanban_mode, emoji="👀",
+ )
++
++registry.register(name="kanban_manage", toolset="kanban", schema=KANBAN_MANAGE_SCHEMA,
++                  handler=_handle_manage, check_fn=_check_board_owner_mode, emoji="📋")
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -81,7 +81,7 @@
+     "kanban_request_changes", "kanban_rebind_review_artifact",
+     "kanban_heartbeat",
+     "kanban_comment", "kanban_create", "kanban_link",
+-    "kanban_unblock",
++    "kanban_unblock", "kanban_manage",
+     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+     # Computer use (macOS, gated on cua-driver being installed via check_fn)
+     "computer_use",
+@@ -322,7 +322,7 @@
+             "kanban_request_review", "kanban_handoff", "kanban_request_changes", "kanban_rebind_review_artifact",
+             "kanban_heartbeat", "kanban_comment",
+             "kanban_create", "kanban_link",
+-            "kanban_unblock",
++            "kanban_unblock", "kanban_manage",
+             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+         ],
+         "includes": [],
