@@ -1,0 +1,102 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T19:36:51.432693+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-control-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-control",
+      "files": [
+        {
+          "path": "gateway/app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "e8b2c6894b157408510bf6ddc0d695d3a82e227e930b6cf761dc25c7b4ac0a50"
+        },
+        {
+          "path": "gateway/josh_board_authority.py",
+          "before_sha256": "8d53da950452809a537d62229ebd0fc8195ead09e79e83b47a04acd4d860ba14",
+          "after_sha256": "34c84167edeabc4ec008a07a479738a3a7fb236de6ccecf0b1c79f1686e5b945"
+        },
+        {
+          "path": "gateway/platforms/api_server.py",
+          "before_sha256": "15ae6c6d721a7302c4da11ba71e92e8e9a9d9b5e5fd60d280e4adcc40818def3",
+          "after_sha256": "46f4075ccc2bd53daa5abca46e9e6cd3631172a09570aab4db68b7efb29ccc6b"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074",
+          "after_sha256": "28d0b914548017f10d4d93c1269a3e44672c4708e282a74eed24acaee0113cf1"
+        },
+        {
+          "path": "hermes_cli/owner_artifact_reference.py",
+          "before_sha256": null,
+          "after_sha256": "1ff5a260588eb05d22ffe792a42f302be7102843f9ad9f3fb0e79710fa6331ab"
+        },
+        {
+          "path": "tests/gateway/test_app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "b6927d0188a7d55f78ed9bd7044a31c69564c50fcb3af832d1b335c36df4a057"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_artifact_reference.py",
+          "before_sha256": null,
+          "after_sha256": "beca19ee30e19d8d4de365974937e05a1fc02f5d5c45dcc3843f04eba33516e9"
+        },
+        {
+          "path": "tests/tools/test_owner_artifact_reference_catalog.py",
+          "before_sha256": null,
+          "after_sha256": "8d301cf2a77517a2c30d3549390d04acdea4218c5a200e8c7f5153df86edaf1b"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "24955e476faa4f981bb59aaff79e92444262eeec32ce0380fc59417455ddb6ad",
+          "after_sha256": "6c693a5cad95a16456ee4d7e3b293367dffc0044ff3a63deca84b06437d412fb"
+        },
+        {
+          "path": "toolsets.py",
+          "before_sha256": "b60274994fcad9f3030810faccce4ced8eeb31f934e02326c1dfaed142dc51f1",
+          "after_sha256": "d6b908118a17342277de9ed674b9e8c1f82e5ea28f54df12a95d46cfbd6e852f"
+        }
+      ],
+      "patch_sha256": "3457015b958da0761dea3b12474d3a23f84ef03b8685f34efbf42ee419ecd2be",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-controller",
+      "files": [
+        {
+          "path": "gateway/app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "e8b2c6894b157408510bf6ddc0d695d3a82e227e930b6cf761dc25c7b4ac0a50"
+        },
+        {
+          "path": "gateway/gus_admin_cli.py",
+          "before_sha256": "d54a28653062133e8fc971efff4f1d5781648ed3dca175d51aefc8e7d2971551",
+          "after_sha256": "3f8bc9b51b9e0f67f0346d150062b48f520426e5ab76406deaee103f02d54670"
+        },
+        {
+          "path": "gateway/josh_board_authority.py",
+          "before_sha256": "8d53da950452809a537d62229ebd0fc8195ead09e79e83b47a04acd4d860ba14",
+          "after_sha256": "34c84167edeabc4ec008a07a479738a3a7fb236de6ccecf0b1c79f1686e5b945"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074",
+          "after_sha256": "28d0b914548017f10d4d93c1269a3e44672c4708e282a74eed24acaee0113cf1"
+        },
+        {
+          "path": "hermes_cli/owner_artifact_reference.py",
+          "before_sha256": null,
+          "after_sha256": "1ff5a260588eb05d22ffe792a42f302be7102843f9ad9f3fb0e79710fa6331ab"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_artifact_reference.py",
+          "before_sha256": null,
+          "after_sha256": "beca19ee30e19d8d4de365974937e05a1fc02f5d5c45dcc3843f04eba33516e9"
+        }
+      ],
+      "patch_sha256": "608db7ca3f2d56766e40494606d308fd48896d2cd071789a4ccd99cdb3e9e819",
+      "patch": "controller.patch"
+    }
+  }
+}

@@ -1,0 +1,572 @@
+--- /dev/null
++++ b/gateway/app_private_board_authority.py
+@@ -0,0 +1,142 @@
++"""Private-app board controls bound to existing private work enrollment.
++
++This adds no work creation, memory, filesystem, delivery or company grant.
++Only a directly authenticated private listener can use the four own-board
++controls. The controller independently re-resolves the same protected files.
++"""
++import hashlib
++import json
++import math
++from pathlib import Path
++import re
++import time
++
++import yaml
++
++ROOT = Path('/Users/Chris/.hermes')
++CONTRACT = 'margot-owner-private-v1'
++TOOLSET = 'owner_board_control'
++
++
++def private_profile(profile):
++    return isinstance(profile, str) and re.fullmatch(r'app-owner-[a-z][a-z0-9_-]{0,63}-margot', profile) is not None
++
++
++def capabilities(profile, principal):
++    """Advertise only freshly admitted private tools, never configuration alone."""
++    from gateway.josh_board_authority import execution_scope, app_binding
++    try:
++        with execution_scope(profile, principal):
++            bound = app_binding()
++            if bound is None or bound.get('scope_contract') != CONTRACT:
++                return None
++            from gateway.member_board_tools import TOOLS, enabled
++            from model_tools import get_tool_definitions
++            schemas = get_tool_definitions([TOOLSET], quiet_mode=True, skip_tool_search_assembly=True)
++            if {s['function']['name'] for s in schemas} != TOOLS or not enabled():
++                return None
++            return {'tools': sorted(TOOLS)}
++    except (PermissionError, OSError, ValueError):
++        return None
++
++
++def current(profile, principal, *, root=None, enrollment=None):
++    from gateway.app_business_authority import protected_bytes, canonical_enrollment
++    root = ROOT if root is None else Path(root)
++    if (not isinstance(principal, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', principal)
++            or profile != f'app-owner-{principal}-margot'):
++        raise PermissionError('Authenticated private-app owner required')
++    reads = []
++
++    def read(path, *, private=True, yml=False):
++        raw = protected_bytes(path, private=private, anchor=root)
++        reads.append((path, private, raw))
++        return yaml.safe_load(raw) if yml else json.loads(raw)
++
++    home = root / 'profiles' / profile
++    config = read(home / 'config.yaml', private=False, yml=True)
++    marker = config.get('app_private_board_control', {})
++    if (type(marker) is not dict or set(marker) != {'enabled', 'principal', 'board', 'scope_contract'}
++            or marker.get('enabled') is not True or marker.get('principal') != principal
++            or marker.get('scope_contract') != CONTRACT):
++        raise PermissionError('Private board controls are not enabled for this profile')
++    board = marker['board']
++    if not isinstance(board, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', board):
++        raise PermissionError('Private enrolled board required')
++    expected_tools = {'owner_context', TOOLSET}
++    if (set(config.get('toolsets', [])) != expected_tools
++            or set(config.get('platform_toolsets', {}).get('api_server', [])) != expected_tools):
++        raise PermissionError('Private board catalog must preserve the context reader only')
++    api = config.get('platforms', {}).get('api_server', {})
++    extra = api.get('extra', {})
++    if (api.get('enabled') is not True or extra.get('cockpit_principal') != principal
++            or extra.get('host') != '127.0.0.1' or type(extra.get('port')) is not int
++            or not 1024 <= extra['port'] <= 65535 or config.get('gateway', {}).get('multiplex_profiles') is not False):
++        raise PermissionError('Dedicated authenticated private listener required')
++    base = root / 'private' / 'phone-assistant'
++    backends = read(base / 'app-private-backends.json')
++    rows = [b for b in backends.get('bindings', []) if b.get('owner') == principal]
++    if backends.get('version') != 1 or len(rows) != 1:
++        raise PermissionError('Unique private backend binding required')
++    binding = rows[0]
++    if (binding.get('enabled') is not True or binding.get('domain') != 'owner_private'
++            or binding.get('agent') != 'margot' or binding.get('profile') != profile
++            or binding.get('url') != f"http://127.0.0.1:{extra['port']}"
++            or type(binding.get('grantVersion')) is not int or binding['grantVersion'] < 1):
++        raise PermissionError('Current private backend binding required')
++    context_path = base / f'owner-context-{principal}.json'
++    context = read(context_path)
++    consumer = dict(owner=principal, domain='owner_private', agent='margot',
++                    profile=profile, audience='margot-app', grantVersion=binding['grantVersion'])
++    if (context.get('enabled') is not True or context.get('consumer') != consumer
++            or context.get('grant_ref') != binding.get('grantRef')):
++        raise PermissionError('Matching private memory consumer required')
++    servers = config.get('mcp_servers', {})
++    if set(servers) != {'owner_context'}:
++        raise PermissionError('Private memory reader must remain isolated')
++    reader = servers['owner_context']
++    if (not isinstance(reader, dict) or reader.get('enabled', True) is not True
++            or str(context_path) not in reader.get('args', [])):
++        raise PermissionError('Existing private memory reader required')
++    works = read(base / 'app-private-work-bindings.json')
++    rows = [w for w in works.get('bindings', []) if w.get('owner') == principal]
++    if works.get('version') != 1 or len(rows) != 1:
++        raise PermissionError('Unique private work binding required')
++    work = rows[0]
++    if (work.get('enabled') is not True or work.get('domain') != 'owner_private'
++            or work.get('agent') != 'margot' or work.get('profile') != profile
++            or work.get('privateGrantVersion') != binding['grantVersion']):
++        raise PermissionError('Current private work binding required')
++    grants = read(base / 'app-work-grants.json')
++    grant = grants.get(work.get('workGrantRef'), {})
++    expiry = grant.get('expires_at')
++    if (grant.get('enabled') is not True or grant.get('revoked_at')
++            or type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= time.time()
++            or grant.get('owner') != principal or grant.get('profile_key') != principal
++            or grant.get('profile') != profile or grant.get('domain') != 'owner_private'
++            or grant.get('agent') != 'margot' or grant.get('audience') != 'margot-app'
++            or grant.get('version') != work.get('workGrantVersion')
++            or grant.get('private_grant_ref') != binding.get('grantRef')
++            or grant.get('private_grant_version') != binding['grantVersion']
++            or grant.get('realm') != 'owner:' + principal or grant.get('board') != board):
++        raise PermissionError('Current private work authority required')
++    profiles = read(base / 'caller-profiles.json')
++    rows = [p for p in profiles.get('profiles', []) if p.get('profile_key') == principal]
++    if len(rows) != 1:
++        raise PermissionError('Current private caller enrollment required')
++    caller = rows[0]
++    if (caller.get('enabled', True) is not True or caller.get('revoked_at') or caller.get('revoked')
++            or caller.get('subject_key') != grant.get('subject_key') or caller.get('board') != board
++            or grant['realm'] not in caller.get('allowed_realms', [])
++            or (grant.get('account') is not None and grant['account'] not in caller.get('allowed_accounts', []))):
++        raise PermissionError('Private caller authority changed')
++    owner = enrollment(principal) if enrollment is not None else canonical_enrollment(principal, root)
++    if owner.get('owner') != principal or owner.get('profile') != principal or owner.get('board') != board:
++        raise PermissionError('Current enrolled owner board required')
++    if expiry <= time.time() or any(protected_bytes(path, private=private, anchor=root) != raw
++                                   for path, private, raw in reads):
++        raise PermissionError('Private authority changed during lookup')
++    fingerprint = hashlib.sha256(b''.join(raw for _, _, raw in reads)
++                                 + json.dumps(owner, sort_keys=True).encode()).hexdigest()
++    return dict(toolsets=sorted(expected_tools), profile=profile, principal=principal, board=board,
++                scope_contract=CONTRACT, allowed_boards=[board], fingerprint=fingerprint)
+--- a/gateway/gus_admin_cli.py
++++ b/gateway/gus_admin_cli.py
+@@ -653,7 +653,7 @@
+     if member is not None:
+         if worker is not None or getattr(args, 'board', None) != member['board']:
+             raise PermissionError('Member management outside authenticated board')
+-        if args.kanban_action not in {'archive','restore','specify','resume-triage','unblock','unlink','recover_review'}:
++        if args.kanban_action not in {'archive','restore','specify','resume-triage','unblock','unlink','recover_review','repair_review_reference'}:
+             raise PermissionError('Unsupported member board action')
+         # The exact signed operation/board/target is rechecked in the mutation transaction.
+         return None
+--- a/gateway/josh_board_authority.py
++++ b/gateway/josh_board_authority.py
+@@ -25,7 +25,10 @@
+ def app_binding():
+     bound=_app_binding.get()
+     if bound is None:return None
+-    from gateway.app_business_authority import current
++    if bound.get('scope_contract') == 'margot-owner-private-v1':
++        from gateway.app_private_board_authority import current
++    else:
++        from gateway.app_business_authority import current
+     fresh=current(bound['profile'],bound['principal'])
+     if fresh!=bound:raise PermissionError('App business enrollment changed')
+     return fresh
+@@ -45,7 +48,11 @@
+     home=Path(get_hermes_home())
+     installed_profile=profile or (home.name if home.parent.name=='profiles' else None)
+     if installed_profile and installed_profile not in LEGACY and installed_profile!=principal:
+-        from gateway.app_business_authority import current
++        from gateway.app_private_board_authority import private_profile
++        if private_profile(installed_profile):
++            from gateway.app_private_board_authority import current
++        else:
++            from gateway.app_business_authority import current
+         app=current(installed_profile,principal)
+     elif profile and profile not in LEGACY:
+         if principal!=profile:raise PermissionError('Authenticated named-profile authority required')
+--- a/hermes_cli/board_owner_manage.py
++++ b/hermes_cli/board_owner_manage.py
+@@ -14,7 +14,7 @@
+ from pathlib import Path
+ 
+ _expected = ContextVar('owner_board_expected_state', default=None)
+-ACTIONS = ('archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review')
++ACTIONS = ('archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
+ 
+ 
+ # Set only after the controller verifies a signed gateway request.
+@@ -35,6 +35,9 @@
+         if value.get('owner') != principal or value.get('profile') != principal:
+             raise PermissionError('Member enrollment mismatch')
+     else:
++        from gateway.app_private_board_authority import private_profile
++        if private_profile(profile):
++            from gateway.app_private_board_authority import current
+         value = current(profile, principal, root=ROOT)
+     return dict(principal=principal, profile=profile, board=value['board'], fingerprint=value['fingerprint'])
+ 
+@@ -59,6 +62,11 @@
+     scope = _execution.get()
+     if scope is not None:
+         profile, principal = scope
++        bound = app_binding()
++        if bound is not None and bound.get('scope_contract') == 'margot-owner-private-v1':
++            if bound['principal'] != principal:
++                raise PermissionError('Authenticated private-app owner required')
++            return refresh_member_grant(dict(principal=principal, profile=bound['profile'], board='', fingerprint=''))
+         if principal == 'chris' and profile in (None, '', 'default', 'chris'):
+             return None
+         if not principal or not profile:
+@@ -120,6 +128,8 @@
+     fields = {k: task[k] for k in ('id', 'title', 'body', 'assignee', 'status', 'tenant')}
+     return dict(expected_state=_hash(data), expected_task_sha256=_hash(fields),
+                 expected_goal_sha256=_hash(dict(goal)) if goal else None,
++                expected_artifact_ref=goal['review_artifact_ref'] if goal else None,
++                expected_artifact_digest=goal['review_artifact_digest'] if goal else None,
+                 expected_stop_event_id=stop[0] if stop else None, expected_latest_comment_id=comment,
+                 initial_triage=bool(task['status'] == 'triage' and stop is None and goal is None
+                     and not conn.execute('SELECT 1 FROM task_runs WHERE task_id=?', (task_id,)).fetchone()))
+@@ -179,7 +189,7 @@
+     dry = args.get('dry_run', False)
+     if type(dry) is not bool:
+         raise ValueError('dry_run must be boolean')
+-    if dry and action not in ('start_triage', 'resume_triage', 'recover_review'):
++    if dry and action not in ('start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
+         raise ValueError('Dry run is supported for triage and review operations; other operations are reversible')
+     board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+     actor = member['principal'] if member is not None else 'default'
+@@ -219,6 +229,11 @@
+                     expected_latest_comment_id=evidence.get('expected_latest_comment_id'),
+                     expected_task_sha256=evidence.get('expected_task_sha256'))
+                 changed = not dry
++            elif action == 'repair_review_reference':
++                from hermes_cli.owner_artifact_reference import repair_reference
++                metadata_receipt = repair_reference(conn, task_id, actor=actor, reason=reason, dry_run=dry,
++                                                    **(args.get('evidence') or {}))
++                changed = not dry
+             else:
+                 from hermes_cli.owner_board_recovery import recover_review
+                 result = recover_review(conn, task_id, actor=actor, reason=reason, dry_run=dry,
+@@ -230,6 +245,8 @@
+                           failure_history_preserved=True)
+             if action == 'recover_review':
+                 result['next_action'] = 'Fresh decision by the bound reviewer; recovery is not review approval'
++            if action == 'repair_review_reference':
++                result.update(metadata_receipt)
+             return result
+     finally:
+         _expected.reset(token)
+--- /dev/null
++++ b/hermes_cli/owner_artifact_reference.py
+@@ -0,0 +1,128 @@
++"""Owner-only correction of a redacted review reference, without releasing work."""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++import re
++import stat
++import time
++
++from hermes_cli import kanban_db as kb, owner_cell as oc
++
++
++def _artifact_identity(workspace: str, artifact_ref: str):
++    """Read the exact workspace file via no-follow directory descriptors."""
++    root, path = Path(workspace), Path(artifact_ref)
++    if (not root.is_absolute() or not path.is_absolute()
++            or '..' in root.parts or '..' in path.parts):
++        raise ValueError('An absolute bound workspace file is required')
++    try:
++        relative = path.relative_to(root)
++    except ValueError as exc:
++        raise ValueError('Review artifact must remain within its bound task workspace') from exc
++    if not relative.parts:
++        raise ValueError('Review artifact must be a regular workspace file')
++    if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
++        raise ValueError('Safe no-follow artifact validation is unavailable')
++    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
++    fd = os.open('/', directory_flags)
++    try:
++        for part in path.parts[1:-1]:
++            next_fd = os.open(part, directory_flags, dir_fd=fd)
++            os.close(fd)
++            fd = next_fd
++        file_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
++        try:
++            before = os.fstat(file_fd)
++            if not stat.S_ISREG(before.st_mode):
++                raise ValueError('Review artifact must be a regular file')
++            digest = hashlib.sha256()
++            while chunk := os.read(file_fd, 1024 * 1024):
++                digest.update(chunk)
++            after = os.fstat(file_fd)
++            identity = lambda info: (info.st_dev, info.st_ino, info.st_size,
++                                     info.st_mtime_ns, info.st_ctime_ns)
++            if identity(before) != identity(after):
++                raise ValueError('Review artifact changed while validating its bytes')
++            return digest.hexdigest(), identity(after)
++        finally:
++            os.close(file_fd)
++    except OSError as exc:
++        raise ValueError('Review artifact path is unavailable or contains a symlink') from exc
++    finally:
++        os.close(fd)
++
++
++def repair_reference(conn, task_id, *, expected_goal_sha256,
++                     expected_artifact_ref, expected_artifact_digest,
++                     artifact_ref, actor, reason, dry_run=True):
++    """Correct only an unusable redacted reference to unchanged reviewed bytes.
++
++    The native owner boundary, board grant and complete task/goal snapshot are
++    mandatory. This is operator maintenance, never a reviewer impersonation.
++    Task status, review phase, findings, role bindings and budgets stay intact.
++    """
++    from hermes_cli import board_owner_manage as owner
++    from hermes_cli.owner_board_recovery import goal_snapshot_sha
++
++    owner.require_owner()
++    bound = owner._expected.get()
++    if bound is None or bound.get('action') != 'repair_review_reference':
++        raise PermissionError('A bound native owner reference-repair request is required')
++    if (type(dry_run) is not bool
++            or not isinstance(expected_goal_sha256, str)
++            or not re.fullmatch(r'[a-f0-9]{64}', expected_goal_sha256)
++            or not isinstance(expected_artifact_digest, str)
++            or not re.fullmatch(r'[a-f0-9]{64}', expected_artifact_digest)
++            or not isinstance(expected_artifact_ref, str)
++            or not re.fullmatch(r'redacted://artifact/[A-Za-z0-9._-]+', expected_artifact_ref)
++            or not isinstance(artifact_ref, str) or not artifact_ref.strip()
++            or len(artifact_ref) > 4096):
++        raise ValueError('Exact goal, redacted reference and unchanged artifact digest are required')
++
++    with kb.write_txn(conn):
++        owner.validate_bound_target(conn, task_id, 'repair_review_reference')
++        task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++        goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++        if (task is None or goal is None or task['status'] not in {'triage', 'blocked'}
++                or goal_snapshot_sha(goal) != expected_goal_sha256
++                or goal['router_mode'] != 'reviewed' or goal['phase'] != 'review'
++                or goal['review_artifact_ref'] != expected_artifact_ref
++                or goal['review_artifact_digest'] != expected_artifact_digest
++                or not task['workspace_path']
++                or goal['reviewer_profile'] != goal['required_reviewer_profile']
++                or task['reviewer_profile'] != goal['reviewer_profile']
++                or task['assignee'] != goal['reviewer_profile']
++                or task['current_state_version'] != goal['current_state_version']):
++            raise ValueError('Held review, exact goal and artifact binding must remain unchanged')
++        if (any(task[key] is not None for key in ('current_run_id', 'worker_pid', 'claim_lock', 'claim_expires'))
++                or conn.execute('SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone()
++                or conn.execute('SELECT 1 FROM target_leases WHERE task_id=? AND expires_at>=?',
++                                (task_id, int(time.time()))).fetchone()):
++            raise ValueError('Reference repair requires a held idle task')
++        checked = _artifact_identity(task['workspace_path'], artifact_ref)
++        if checked[0] != expected_artifact_digest:
++            raise ValueError('Reference repair cannot change the bound review artifact digest')
++        if not dry_run:
++            oc.rebind_review_artifact(
++                conn, task_id, reviewer_profile=goal['reviewer_profile'],
++                state_version=goal['current_state_version'],
++                expected_artifact_ref=expected_artifact_ref,
++                expected_artifact_digest=expected_artifact_digest,
++                artifact_ref=artifact_ref, artifact_digest=expected_artifact_digest,
++            )
++            kb._append_event(conn, task_id, 'review_artifact_reference_repaired', {
++                'actor': actor, 'reason': reason, 'status_preserved': task['status'],
++                'reviewer': goal['reviewer_profile'], 'state_version': goal['current_state_version'],
++                'review_loop_count': goal['review_loop_count'],
++                'old_reference_sha256': hashlib.sha256(expected_artifact_ref.encode()).hexdigest(),
++                'new_reference_sha256': hashlib.sha256(artifact_ref.encode()).hexdigest(),
++                'artifact_digest': expected_artifact_digest,
++                'verdict_recorded': False, 'dispatch_enabled': False,
++            })
++        if _artifact_identity(task['workspace_path'], artifact_ref) != checked:
++            raise ValueError('Review artifact changed before reference repair completed')
++        return {'metadata_only': True, 'status_preserved': task['status'],
++                'verdict_recorded': False, 'dispatch_enabled': False,
++                'next_action': ('Preview validated; no reference or lifecycle state changed.' if dry_run else 'Reference corrected only; the card remains held. Inspect again before any separate review recovery.')}
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_artifact_reference.py
+@@ -0,0 +1,183 @@
++"""Metadata-only repair through native control; no workers, services or models."""
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import board_owner_manage as owner, kanban_db as kb, owner_cell as oc
++
++
++@pytest.fixture
++def held(tmp_path, monkeypatch):
++    for key in ('HERMES_PROFILE', 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID',
++                'HERMES_SESSION_SOURCE', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_HOME',
++                'HERMES_KANBAN_WORKSPACES_ROOT'):
++        monkeypatch.delenv(key, raising=False)
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(home / 'board.db'))
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setattr(oc, '_installed_profile', lambda name: name)
++    work = home / 'work'
++    work.mkdir()
++    artifact = work / 'original.txt'
++    artifact.write_text('Existing reviewed document; findings remain unresolved.')
++    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
++    contract = {
++        'goal_id': 'metadata-only-fixture', 'objective': 'Review existing artifact',
++        'owner_profile': 'steven', 'owner_role_alias': 'legal',
++        'runtime_profile': 'legal-drafter', 'required_reviewer_profile': 'steven',
++        'security_realm': 'private', 'router_mode': 'reviewed', 'risk_class': 'material',
++        'capability_bundle': 'legal',
++        'worker_budget': {'producers': 1, 'reviewers': 1, 'extras': 0, 'max_rework_rounds': 2},
++        'targets': [], 'acceptance_test': {'expected': 'pass'},
++        'rollback': {'procedure_ref': 'fixture://rollback'},
++        'callback': {'source_surface': 'test', 'return_surface': 'test', 'report_policy': 'milestones_only'},
++        'approval_gates': ['external_send'], 'owner_acceptance': {'mode': 'accountable_owner'},
++        'delegation_roles': {'maker': 'legal-drafter', 'reviewer': 'steven'},
++    }
++    conn = kb.connect()
++    tid = kb.create_task(conn, title='Held review with redacted locator', assignee='legal-drafter',
++                         workspace_kind='dir', workspace_path=str(work), owner_cell_contract=contract)
++    assert kb.request_review(conn, tid, summary='Review exact artifact', reviewer='steven',
++                             metadata={'owner_cell_artifact': {'ref': str(artifact), 'digest': digest}})
++    oc.record_verdict(conn, tid, reviewer_profile='steven', state_version=1,
++                      artifact_ref=str(artifact), artifact_digest=digest,
++                      verdict='REQUEST_CHANGES', defects=['Retain this unresolved finding'])
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage',block_kind='needs_input',consecutive_failures=1 WHERE id=?", (tid,))
++        conn.execute("UPDATE owner_cell_goals SET review_loop_count=1,review_artifact_ref='redacted://artifact/063' WHERE task_id=?", (tid,))
++        kb._append_event(conn, tid, 'block_loop_detected', {'reason': 'Held old review'})
++    kb.add_comment(conn, tid, 'steven', 'Unresolved findings are still binding.')
++    yield conn, tid, artifact
++    conn.close()
++
++
++def payload(held, **overrides):
++    conn, tid, artifact = held
++    native = owner.describe(conn, tid)
++    args = {'task_id': tid, 'action': 'repair_review_reference',
++            'expected_state': native['expected_state'],
++            'reason': 'Correct redacted locator to the original reviewed bytes; preserve the hold.',
++            'evidence': {key: native[key] for key in ('expected_goal_sha256', 'expected_artifact_ref', 'expected_artifact_digest')}}
++    args['evidence']['artifact_ref'] = str(artifact)
++    args.update(overrides)
++    return args
++
++
++def state(conn, tid):
++    return {
++        'task': dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()),
++        'goal': dict(oc.goal_projection(conn, tid)),
++        'verdicts': [dict(r) for r in conn.execute('SELECT * FROM review_verdicts WHERE task_id=?', (tid,))],
++        'events': [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (tid,))],
++        'runs': [dict(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=?', (tid,))],
++    }
++
++
++def test_dry_run_leaves_every_field_unchanged(held):
++    conn, tid, _ = held
++    before = state(conn, tid)
++    result = owner.execute(payload(held, dry_run=True))
++    assert result['metadata_only'] and result['status'] == 'triage'
++    assert not result['dispatch_enabled'] and not result['changed']
++    assert state(conn, tid) == before
++
++
++def test_repair_changes_only_reference_and_audits_without_releasing_review(held):
++    conn, tid, artifact = held
++    before = state(conn, tid)
++    result = owner.execute(payload(held))
++    after = state(conn, tid)
++    assert result['changed'] and result['metadata_only'] and not result['verdict_recorded']
++    assert result['status'] == result['status_preserved'] == 'triage'
++    assert not result['dispatch_enabled']
++    assert after['task'] == before['task']
++    assert after['verdicts'] == before['verdicts'] and after['runs'] == before['runs']
++    assert after['goal'] == {**before['goal'], 'review_artifact_ref': str(artifact),
++                             'updated_at': after['goal']['updated_at']}
++    assert len(after['events']) == len(before['events']) + 1
++    event = after['events'][-1]
++    assert event['kind'] == 'review_artifact_reference_repaired'
++    assert str(artifact) not in event['payload']
++    assert not kb.has_spawnable_review(conn)
++    with pytest.raises(oc.OwnerCellGuardError, match='PASS'):
++        oc.assert_completion_allowed(conn, tid)
++
++
++@pytest.mark.parametrize('changed', ['task', 'goal', 'digest', 'expected_digest', 'outside',
++                                    'symlink_file', 'symlink_directory', 'traversal', 'directory',
++                                    'worker_pid', 'claim', 'review_status', 'real_reference'])
++def test_refuses_changed_or_unscoped_evidence_atomically(held, tmp_path, changed):
++    conn, tid, artifact = held
++    args = payload(held)
++    if changed == 'task':
++        kb.add_comment(conn, tid, 'owner', 'New current direction')
++    elif changed == 'goal':
++        conn.execute('UPDATE owner_cell_goals SET review_loop_count=2 WHERE task_id=?', (tid,)); conn.commit()
++    elif changed == 'digest':
++        artifact.write_text('Different bytes')
++    elif changed == 'expected_digest':
++        args['evidence']['expected_artifact_digest'] = '0' * 64
++    elif changed == 'outside':
++        outside = tmp_path / 'outside.txt'; outside.write_bytes(artifact.read_bytes())
++        args['evidence']['artifact_ref'] = str(outside)
++    elif changed == 'symlink_file':
++        link = artifact.parent / 'link.txt'; link.symlink_to(artifact)
++        args['evidence']['artifact_ref'] = str(link)
++    elif changed == 'symlink_directory':
++        link = artifact.parent / 'link'; link.symlink_to(artifact.parent, target_is_directory=True)
++        args['evidence']['artifact_ref'] = str(link / artifact.name)
++    elif changed == 'traversal':
++        args['evidence']['artifact_ref'] = str(artifact.parent / '..' / 'work' / artifact.name)
++    elif changed == 'directory':
++        args['evidence']['artifact_ref'] = str(artifact.parent)
++    elif changed == 'worker_pid':
++        conn.execute('UPDATE tasks SET worker_pid=123 WHERE id=?', (tid,)); conn.commit();args = payload(held)
++    elif changed == 'claim':
++        conn.execute("UPDATE tasks SET claim_lock='live' WHERE id=?", (tid,)); conn.commit();args = payload(held)
++    elif changed == 'review_status':
++        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,));conn.commit();args = payload(held)
++    else:
++        conn.execute('UPDATE owner_cell_goals SET review_artifact_ref=? WHERE task_id=?', (str(artifact),tid));conn.commit();args = payload(held)
++    before = state(conn, tid)
++    with pytest.raises((ValueError, PermissionError)):
++        owner.execute(args)
++    assert state(conn, tid) == before
++
++
++def test_late_file_replacement_rolls_back_metadata(held, monkeypatch):
++    from hermes_cli import owner_artifact_reference as repair
++    conn, tid, _ = held
++    real = repair._artifact_identity
++    calls = []
++    def changed_on_second(*args):
++        value = real(*args);calls.append(value)
++        return value if len(calls) == 1 else ('0' * 64, value[1])
++    monkeypatch.setattr(repair, '_artifact_identity', changed_on_second)
++    before = state(conn, tid)
++    with pytest.raises(ValueError, match='changed before'):
++        owner.execute(payload(held))
++    assert state(conn, tid) == before
++
++
++def test_audit_failure_rolls_back_reference(held, monkeypatch):
++    conn, tid, _ = held
++    before = state(conn, tid)
++    def fail(*args, **kwargs): raise RuntimeError('audit unavailable')
++    monkeypatch.setattr(kb, '_append_event', fail)
++    with pytest.raises(RuntimeError, match='audit unavailable'):
++        owner.execute(payload(held))
++    assert state(conn, tid) == before
++
++
++@pytest.mark.parametrize('source', ['kanban', 'cron'])
++def test_worker_or_schedule_cannot_repair(held, monkeypatch, source):
++    conn, tid, _ = held
++    before = state(conn, tid)
++    monkeypatch.setenv('HERMES_SESSION_SOURCE', source)
++    with pytest.raises(PermissionError): owner.execute(payload(held))
++    assert state(conn, tid) == before
++

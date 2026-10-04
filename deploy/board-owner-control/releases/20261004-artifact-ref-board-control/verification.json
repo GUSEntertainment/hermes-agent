@@ -1,0 +1,201 @@
+{
+  "status": "staged_not_activated",
+  "gateway": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-control",
+  "controller": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-controller",
+  "runtime_python": "/Users/Chris/.hermes/releases/hermes-agent-20260925-private-delivery-proof-v57/.venv/bin/python",
+  "focused_tests": {
+    "runner": "scripts/run_tests.sh -j 1; HERMES_TEST_FILE_RETRIES=0",
+    "initial": {
+      "passed": 52,
+      "failed": 0,
+      "seconds": 12.9,
+      "files": [
+        "tests/gateway/test_app_private_board_authority.py",
+        "tests/gateway/test_board_control_transport.py",
+        "tests/gateway/test_member_board_tools.py"
+      ]
+    },
+    "after_capability_marker": {
+      "passed": 15,
+      "failed": 0,
+      "seconds": 4.4,
+      "files": [
+        "tests/gateway/test_app_private_board_authority.py"
+      ]
+    },
+    "distinct_final_tests": 53,
+    "paid_calls": 0,
+    "worker_runs": 0
+  },
+  "existing_private_grants_read_only_validation": "passed with proposed configuration supplied in memory; no live files changed",
+  "configuration": {
+    "path": "/Users/Chris/.hermes/profiles/app-owner-chris-margot/config.yaml",
+    "expected_before_sha256": "a99c853932143d57741f9dd79a224039bf454581591b4ebbecde517d67244bda",
+    "selected_fields": {
+      "toolsets": [
+        "owner_context",
+        "owner_board_control"
+      ],
+      "platform_toolsets.api_server": [
+        "owner_context",
+        "owner_board_control"
+      ],
+      "platforms.api_server.extra.cockpit_principal": "chris",
+      "app_private_board_control": {
+        "enabled": true,
+        "principal": "chris",
+        "board": "chris-home",
+        "scope_contract": "margot-owner-private-v1"
+      }
+    },
+    "preserve": [
+      "port 56711",
+      "profile home",
+      "API credential",
+      "private conversation store",
+      "private read grant",
+      "private work grant",
+      "owner_context MCP configuration",
+      "model",
+      "all other fields"
+    ]
+  },
+  "soul": {
+    "path": "/Users/Chris/.hermes/profiles/app-owner-chris-margot/SOUL.md",
+    "expected_before_sha256": "64146e783ac6e838070fa82186b75ae40595426a909920315805bdb944410a03",
+    "old_sentence": "When the runtime does not provide a verified work hook, this connection is read-only.",
+    "new_sentence": "When the runtime provides neither a verified work hook nor authenticated own-board controls, this connection is read-only.",
+    "append": "When the authenticated runtime provides own_work_list, own_work_show, own_work_comment and own_work_manage, use them directly to inspect and manage Chris's enrolled board. Record his actual existing instruction and verified changed conditions, inspect the current snapshot, and use the matching lifecycle action. These controls do not grant general files, terminal access, new external actions, or another person's board. Preserve the separate private_work path for creating substantive work and returning its results."
+  },
+  "launchagent": {
+    "path": "/Users/Chris/Library/LaunchAgents/com.gus.hermes.profile.app-owner-chris-margot.gateway.plist",
+    "expected_before_sha256": "09f9de7f09dcb19b1003f471b29c2dfde299cd5c52ef537ee3a48b09fda74308",
+    "selected_fields": {
+      "WorkingDirectory": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-control",
+      "ProgramArguments.PYTHONPATH": "/Users/Chris/.hermes/releases/hermes-agent-20261004-artifact-ref-board-control",
+      "ProgramArguments.python_executable": "/Users/Chris/.hermes/releases/hermes-agent-20260925-private-delivery-proof-v57/.venv/bin/python"
+    },
+    "preserve": [
+      "HERMES_HOME",
+      "HOME",
+      "remaining arguments",
+      "logging",
+      "KeepAlive",
+      "RunAtLoad"
+    ]
+  },
+  "capability_marker": {
+    "path": "features.owner_board_control",
+    "authorized_value": {
+      "tools": [
+        "own_work_comment",
+        "own_work_list",
+        "own_work_manage",
+        "own_work_show"
+      ]
+    },
+    "otherwise": null,
+    "proof": "authenticated execution scope, fresh protected private binding and actual exact registry tool admission"
+  },
+  "activation_order": [
+    "Back up exact config, SOUL, launchagent and controller wrapper in a private operator directory; abort if the three expected file digests changed.",
+    "Select the new backwards-compatible controller in the guarded wrapper; keep main member gateway running.",
+    "Apply only the listed private profile config, SOUL and launchagent changes.",
+    "Reload only com.gus.hermes.profile.app-owner-chris-margot.gateway.",
+    "Verify the authenticated capability marker and existing private reader registration without running a model or worker."
+  ],
+  "rollback": [
+    "Restore exact backed-up Personal config, SOUL and launchagent.",
+    "Reload only the Personal launchagent to its prior Sep6 runtime.",
+    "Restore the previous guarded controller wrapper after Personal has stopped issuing the new private grants."
+  ],
+  "limitations": [
+    "No live Personal model conversation or worker execution was performed.",
+    "This migration adds board management only; existing private-work creation and private memory/return authorization remain unchanged.",
+    "No live artifact reference repair, recovery, worker or restart performed. Department capability baseline remains an explicitly unfinished prospective review."
+  ],
+  "activation_helper": {
+    "path": "deploy/board-owner-control/operational/activate_personal_board.py",
+    "dry_run": "passed against successor manifest and preserved protected before-file pins; ready_not_applied",
+    "offline_tests": {
+      "passed": 4,
+      "failed": 0,
+      "path": "deploy/board-owner-control/tests/test_activate_personal_board.py"
+    },
+    "deadline_seconds_per_activation_or_rollback": 90,
+    "main_gateway_service_control": false
+  },
+  "inherited_personal_verification": {
+    "source": "/Users/Chris/projects/hermes-agent/deploy/board-owner-control/releases/20261004-personal-board-control/verification.json",
+    "sha256": "e19ea29ed639f77906121032e1bf7476ced2f9f9319f249cd14a2535c229596a",
+    "performed_on_personal_candidates": true
+  },
+  "metadata_reference_repair": {
+    "status": "staged_not_activated",
+    "action": "repair_review_reference",
+    "changes": "Corrects only redacted review locator to original unchanged-digest file within bound workspace; preserves held status, review findings, role bindings and counters. No worker dispatch.",
+    "tests": {
+      "runner": "bash scripts/run_tests.sh -j 1 --file-retries 0",
+      "passed": 40,
+      "failed": 0,
+      "controller": {
+        "passed": 33,
+        "seconds": 5.1,
+        "files": [
+          "tests/hermes_cli/test_owner_artifact_reference.py",
+          "tests/hermes_cli/test_native_board_management.py"
+        ]
+      },
+      "gateway": {
+        "passed": 7,
+        "seconds": 3.8,
+        "files": [
+          "tests/tools/test_owner_artifact_reference_catalog.py",
+          "tests/tools/test_native_board_owner_tool.py"
+        ]
+      },
+      "paid_calls": 0,
+      "worker_runs": 0
+    },
+    "earlier_test_correction": "First run had 19 passed and one catalog test wrongly in the controller lane. Catalog test moved to gateway and distinct gateway/controller source baselines restored; final lane-specific suite passed."
+  },
+  "controller_wrapper": {
+    "path": "/Users/Chris/.hermes/scripts/hermes-kanban-guarded",
+    "expected_before_sha256": "581bd37d50ded8f685b8cd422c427a91600a545c2925dde221923ea8eadcb170"
+  },
+  "preflight_inherited_from_personal": {
+    "ok": true,
+    "gateway": [
+      "native_manage_registration",
+      "owner_tool_discovery",
+      "new_member_recovery_catalog",
+      "normal_member_delegation_registration"
+    ],
+    "controller": [
+      "native_archive_preserves_evidence",
+      "native_restore_preserves_pause",
+      "dependency_release",
+      "unfinished_prerequisite_retained",
+      "native_evidence_bound_continuation",
+      "native_initial_triage_start"
+    ]
+  },
+  "preflight": {
+    "ok": true,
+    "offline": true,
+    "gateway": [
+      "native_manage_registration",
+      "owner_tool_discovery",
+      "new_member_recovery_catalog",
+      "normal_member_delegation_registration"
+    ],
+    "controller": [
+      "native_archive_preserves_evidence",
+      "native_restore_preserves_pause",
+      "dependency_release",
+      "unfinished_prerequisite_retained",
+      "native_evidence_bound_continuation",
+      "native_initial_triage_start"
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T19:29:27.784924+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-control-v2",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-personal-board-control",
+      "files": [
+        {
+          "path": "gateway/app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "e8b2c6894b157408510bf6ddc0d695d3a82e227e930b6cf761dc25c7b4ac0a50"
+        },
+        {
+          "path": "gateway/josh_board_authority.py",
+          "before_sha256": "8d53da950452809a537d62229ebd0fc8195ead09e79e83b47a04acd4d860ba14",
+          "after_sha256": "34c84167edeabc4ec008a07a479738a3a7fb236de6ccecf0b1c79f1686e5b945"
+        },
+        {
+          "path": "gateway/platforms/api_server.py",
+          "before_sha256": "15ae6c6d721a7302c4da11ba71e92e8e9a9d9b5e5fd60d280e4adcc40818def3",
+          "after_sha256": "46f4075ccc2bd53daa5abca46e9e6cd3631172a09570aab4db68b7efb29ccc6b"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074",
+          "after_sha256": "da638c7c8746d73ff11f47d26857cad6cfbfaad2ac79d3d3addf9b5fc2adf360"
+        },
+        {
+          "path": "tests/gateway/test_app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "b6927d0188a7d55f78ed9bd7044a31c69564c50fcb3af832d1b335c36df4a057"
+        },
+        {
+          "path": "toolsets.py",
+          "before_sha256": "b60274994fcad9f3030810faccce4ced8eeb31f934e02326c1dfaed142dc51f1",
+          "after_sha256": "d6b908118a17342277de9ed674b9e8c1f82e5ea28f54df12a95d46cfbd6e852f"
+        }
+      ],
+      "patch_sha256": "2674bb47f5eaa6dbc7f129f8407c2b67b4c5891a280b02a821ccdf06fe714c4f",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-personal-board-controller",
+      "files": [
+        {
+          "path": "gateway/app_private_board_authority.py",
+          "before_sha256": null,
+          "after_sha256": "e8b2c6894b157408510bf6ddc0d695d3a82e227e930b6cf761dc25c7b4ac0a50"
+        },
+        {
+          "path": "gateway/josh_board_authority.py",
+          "before_sha256": "8d53da950452809a537d62229ebd0fc8195ead09e79e83b47a04acd4d860ba14",
+          "after_sha256": "34c84167edeabc4ec008a07a479738a3a7fb236de6ccecf0b1c79f1686e5b945"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "4bf5b84dcf2ec9c09c91a9fad943baa02481ee2bb4676161e6f0d6b3323ea074",
+          "after_sha256": "da638c7c8746d73ff11f47d26857cad6cfbfaad2ac79d3d3addf9b5fc2adf360"
+        }
+      ],
+      "patch_sha256": "4adfdfd968a84a14f7d6a0c14e70787618c0b8c90e4288047f2417069831f1ed",
+      "patch": "controller.patch"
+    }
+  }
+}

@@ -68,7 +68,7 @@ owner must wire a successful preflight as a prerequisite before activation;
 the existing startup-health rollback remains a separate check. Always preserve
 the previous verified gateway/controller pair and the exact generated package.
 
-Current member package: `releases/20261004-member-board-control-v2` (supersedes the Chris-only v2 overlay). The installed
+Member base package: `releases/20261004-member-board-control-v2` (supersedes the Chris-only v2 overlay). The installed
 controller wrapper selects its controller; the switch script runs the maintained
 preflight before interrupting the gateway. The preflight also distinguishes new
 specified triage (`start_triage`) from stopped-card recovery (`resume_triage`).
@@ -133,3 +133,11 @@ rollout; changing that route requires its own authenticated owner migration.
 The v2 gateway adds own-board listing to normal member catalogs. The app bridge
 continues to pin the byte-identical authority/delegation/return modules in the
 first member release; those pinned files were not changed by v2.
+
+## Personal and held-review reference repair
+
+The combined successor is `releases/20261004-artifact-ref-board-control`. It retains the member controls and adds an authenticated Personal capability report for the four own-board tools. Private memory, conversation storage and existing private-work admission remain separate. The app consumes the fresh tool report before giving board guidance.
+
+`repair_review_reference` corrects only a redacted held-review locator to the exact original regular file within the existing task workspace. It verifies fresh task/goal snapshots, identical content digest and no active work; it preserves status, findings and counters and records an audit event. Recovery and reviewer dispatch remain separate operations.
+
+`operational/activate_personal_board.py --package <combined-package>` defaults to a read-only preparation check. `--apply` backs up pinned operator files and reloads only Personal with authenticated capability health checks; `--rollback <receipt>` restores its exact files. Activate the matching main gateway separately through the existing guarded release switch. Do not treat either health check or deterministic fixture tests as conversational worker acceptance.
