@@ -1,0 +1,211 @@
+--- a/hermes_cli/owner_board_recovery.py
++++ b/hermes_cli/owner_board_recovery.py
+@@ -250,11 +250,11 @@
+             or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000
+             or type(dry_run) is not bool):
+         raise ValueError('An installed reviewer and bounded current work instruction are required')
+-    # Discovery can take tens of seconds; never hold the board writer lock
+-    # across profile/skill/tool admission. The later short transaction compares
+-    # the bound snapshot and exact maker evidence before committing anything.
++    # This is an authenticated owner assignment, not worker admission. The
++    # replacement cannot prove native ownership until this assignment commits.
++    # Normal dispatch must admit it freshly before claim or execution.
+     if conn.in_transaction:
+-        raise ValueError('Reviewer admission must run outside a board write transaction')
++        raise ValueError('Reviewer reassignment requires its own short board transaction')
+     bound = control._expected.get()
+     member = control.require_owner()
+     if (not bound or bound.get('action') != 'work' or bound.get('task_id') != task_id
+@@ -289,32 +289,16 @@
+                 'failure_history_preserved': True,
+                 'next_action': 'The installed reviewer is already queued for the existing maker output.'}
+     handoff = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+-    projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
+-    try:
+-        admission = kb._build_worker_admission(projected, reviewer, board=board)
+-    except kb.WorkerAdmissionError as exc:
+-        if isinstance(exc.__cause__, oc.OwnerCellGuardError):
+-            raise ValueError('Reviewer readiness: ' + ' '.join(str(exc.__cause__).split())[:500]) from exc
+-        raise
+     with kb.write_txn(conn):
+         if control.require_owner() != member or prep._connection_board(conn, member) != board:
+-            raise PermissionError('Owner or board changed during reviewer admission')
++            raise PermissionError('Owner or board changed during reviewer reassignment')
+         control.validate_bound_target(conn, task_id, 'work')
+         # Roster enrollment can change independently of the task transaction.
+         task = prep._task(conn, task_id)
+         prep._idle(conn, {**task, 'status': 'ready'})
+         prep._eligible(conn, task, reviewer, member)
+-        projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
+-        actual_db = next(row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main')
+-        if (admission.contract.get('version') != 'hermes.worker-admission/v1'
+-                or admission.contract.get('status') == 'rejected'
+-                or admission.contract.get('task') != task_id
+-                or admission.contract.get('profile') != reviewer
+-                or admission.contract.get('board_database') != kb._database_identity_contract(actual_db)
+-                or hashlib.sha256(admission.encoded_contract.encode()).hexdigest() != admission.digest
+-                or not kb._admission_still_current(projected, admission)
+-                or _independent_review_binding(conn, task_id) != binding):
+-            raise ValueError('Fresh exact accepted reviewer admission and unchanged maker evidence are required')
++        if _independent_review_binding(conn, task_id) != binding:
++            raise ValueError('Review reassignment requires unchanged maker evidence')
+         if not dry_run:
+             conn.execute('UPDATE tasks SET assignee=? WHERE id=?', (reviewer, task_id))
+             payload = json.loads(handoff['payload'])
+@@ -328,5 +312,5 @@
+                 'reviewer': reviewer, 'previous_reviewer': binding['reviewer'],
+                 'producer_run_id': binding['producer_run_id'],
+                 'failure_history_preserved': True, 'action_restrictions_preserved': True,
+-                'worker_started': False, 'verdict_recorded': False,
+-                'next_action': 'Normal independent-review dispatch using the same maker evidence and existing task budget.'}
++                'worker_started': False, 'verdict_recorded': False, 'worker_admission': 'pending_dispatch',
++                'next_action': 'The newly assigned reviewer must pass normal fresh dispatch admission before claim or execution, using the same maker evidence and existing task budget.'}
+--- a/tests/hermes_cli/test_native_review_handoff_repair.py
++++ b/tests/hermes_cli/test_native_review_handoff_repair.py
+@@ -103,29 +103,6 @@
+     assert snapshot(queued)==before
+ 
+ 
+-@pytest.mark.parametrize('damage',['profile','foreign_admission','revoked_member'])
+-def test_admission_rechecks_exact_evidence_profile_board_and_member(queued,monkeypatch,damage):
+-    token=None;revoked=False
+-    if damage=='revoked_member':
+-        grant,token=member_scope(queued,monkeypatch)
+-        from gateway import owner_delegation
+-        monkeypatch.setattr(owner_delegation,'agents',lambda principal:[{'id':'grace-id'}])
+-        monkeypatch.setattr(owner_delegation,'agent',lambda *a:{'runtime':'grace'})
+-    def changed(*a,**kw):
+-        admitted=queued['build'](*a,**kw)
+-        if damage=='profile':(queued['profile_home']/'config.yaml').write_text('model: changed\n')
+-        elif damage=='foreign_admission':admitted.contract['board_database']={'path':'another-board'}
+-        elif damage=='revoked_member':monkeypatch.setattr(control,'refresh_member_grant',lambda value: (_ for _ in ()).throw(PermissionError('revoked')))
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',changed)
+-    before=snapshot(queued)
+-    try:
+-        with pytest.raises((ValueError,PermissionError)):request(queued)
+-        assert snapshot(queued)==before
+-    finally:
+-        if token is not None:control._member_context.reset(token)
+-
+-
+ def test_member_repair_requires_exact_board_and_active_own_roster(queued,monkeypatch):
+     grant,token=member_scope(queued,monkeypatch)
+     from gateway import owner_delegation
+@@ -149,41 +126,81 @@
+     assert snapshot(queued)==before
+ 
+ 
+-def test_admission_runs_without_transaction_and_other_board_writes_can_finish(queued,monkeypatch):
+-    from hermes_cli import owner_board_recovery as recovery
+-    active={}
+-    original=recovery.reroute_native_review
+-    def track(conn,*a,**kw):
+-        active['conn']=conn
+-        return original(conn,*a,**kw)
+-    monkeypatch.setattr(recovery,'reroute_native_review',track)
+-    def competing_write(*a,**kw):
+-        assert not active['conn'].in_transaction
+-        admitted=queued['build'](*a,**kw)
+-        queued['conn'].execute('PRAGMA busy_timeout=0')
+-        queued['conn'].execute('UPDATE tasks SET priority=priority+1 WHERE id!=?',(queued['task'],))
+-        queued['conn'].commit()
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
+-    assert request(queued)['changed']
+-
+-
+-@pytest.mark.parametrize('changed',['maker_evidence','task_state','new_comment'])
+-def test_short_commit_rejects_state_changes_during_unlocked_admission(queued,monkeypatch,changed):
+-    after_external=[]
+-    def competing_write(*a,**kw):
+-        admitted=queued['build'](*a,**kw)
+-        conn=queued['conn'];conn.execute('PRAGMA busy_timeout=0')
+-        if changed=='maker_evidence':
+-            conn.execute('UPDATE task_runs SET summary=? WHERE id=?',('New maker evidence',queued['maker']))
+-        elif changed=='task_state':
+-            conn.execute('UPDATE tasks SET title=? WHERE id=?',('New task scope',queued['task']))
+-        else:
+-            kb.add_comment(conn,queued['task'],'riley','New information arrived during admission.')
+-        conn.commit();after_external.append(snapshot(queued))
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
+-    with pytest.raises(ValueError,match='state changed|unchanged maker evidence'):
++def test_owner_assignment_does_not_attempt_worker_admission_before_ownership(queued,monkeypatch):
++    def forbidden(*a,**kw):
++        raise AssertionError('Worker admission must happen after the owner assignment commits')
++    monkeypatch.setattr(kb,'_build_worker_admission',forbidden)
++    assert request(queued,dry_run=True)['changed'] is False
++    result=request(queued)
++    assert result['changed'] and result['worker_admission']=='pending_dispatch'
++
++
++@pytest.mark.parametrize('changed',['maker_evidence','task_state','new_comment','profile_removed'])
++def test_short_commit_rejects_changed_state_and_rechecks_installed_profile(queued,monkeypatch,changed):
++    from contextlib import contextmanager
++    after_external=[]; fired=False
++    original=kb.write_txn
++    @contextmanager
++    def competing_write(conn,*a,**kw):
++        nonlocal fired
++        if not fired and conn is not queued['conn']:
++            fired=True
++            external=queued['conn'];external.execute('PRAGMA busy_timeout=0')
++            if changed=='maker_evidence':
++                external.execute('UPDATE task_runs SET summary=? WHERE id=?',('New maker evidence',queued['maker']))
++            elif changed=='task_state':
++                external.execute('UPDATE tasks SET title=? WHERE id=?',('New task scope',queued['task']))
++            elif changed=='new_comment':
++                kb.add_comment(external,queued['task'],'riley','New information arrived before reassignment.')
++            else:
++                # Simulate profile removal through the real eligibility lookup.
++                from hermes_cli import profiles
++                monkeypatch.setattr(profiles,'profile_exists',lambda n:False)
++            external.commit();after_external.append(snapshot(queued))
++        with original(conn,*a,**kw):yield
++    monkeypatch.setattr(kb,'write_txn',competing_write)
++    with pytest.raises(ValueError,match='state changed|unchanged maker evidence|installed non-root'):
+         request(queued)
+     assert after_external and snapshot(queued)==after_external[0]
+     assert kb.get_task(queued['conn'],queued['task']).assignee=='margot'
++
++
++def test_real_native_worker_ownership_denies_projection_then_accepts_owner_assignment(queued,monkeypatch):
++    from gateway import gus_worker_authority as authority
++    home=queued['profile_home'];root=home.parent.parent
++    registry=root.parent/'roles.yaml'
++    registry.write_text(json.dumps({'profile_roster':{'canonical':['grace'],
++        'department_owners':[], 'department_makers':[], 'review_and_bounded_support':['grace']}}))
++    env={'HERMES_PROFILE':'grace','HERMES_SESSION_SOURCE':'kanban',
++         'HERMES_KANBAN_BOARD':queued['board'],'HERMES_KANBAN_TASK':queued['task'],
++         'HERMES_KANBAN_DB':str(kb.kanban_db_path(board=queued['board']))}
++    kwargs=dict(home=home,root=root,registry=registry,env=env)
++    # This is the actual admission-subprocess policy, with real installed
++    # profile/registry protection and native task ownership, not a fake grant.
++    with pytest.raises(PermissionError,match='does not own native assignment'):
++        authority.current(**kwargs)
++    before=snapshot(queued)
++    assert request(queued)['changed']
++    assert authority.current(**kwargs)=={'profile':'grace','board':queued['board'],'task':queued['task']}
++    assert snapshot(queued)['task_runs']==before['task_runs']
++    assert kb.get_task(queued['conn'],queued['task']).current_run_id is None
++    # Ownership recognition is not an admission receipt or permission to skip
++    # the normal dispatcher checks. A fresh rejected admission prevents claim.
++    seen=[]
++    def reject_after_ownership(task,profile,**kw):
++        assert authority.current(**kwargs)['profile']==profile=='grace'
++        assert task.assignee=='grace' and task.status=='review'
++        seen.append(task.id)
++        rejection=queued['build'](task,profile,**kw)
++        rejection.contract['status']='rejected'
++        raise kb.WorkerAdmissionError(rejection)
++    def forbidden_spawn(task,workspace,*,admission_contract=None,**kw):
++        raise AssertionError('Rejected admission must not reach execution')
++    monkeypatch.setattr(kb,'_build_worker_admission',reject_after_ownership)
++    monkeypatch.setattr(kb,'_memory_pressure_level',lambda:'normal')
++    monkeypatch.setattr(kb,'review_dispatch_enabled',lambda:True)
++    result=kb.dispatch_once(queued['conn'],board=queued['board'],max_spawn=1,
++                            spawn_fn=forbidden_spawn,reconcile_orphans=False)
++    assert seen==[queued['task']] and queued['task'] in result.capability_blocked, vars(result)
++    assert snapshot(queued)['task_runs']==before['task_runs']
++    assert kb.get_task(queued['conn'],queued['task']).current_run_id is None

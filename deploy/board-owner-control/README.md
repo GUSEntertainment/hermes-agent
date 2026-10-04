@@ -272,3 +272,19 @@ Validation: final combined gateway suite 43 passed; independent controller
 review, timeout and entry suites passed; both isolated deployment preflights
 passed. No provider calls in these checks. New-profile/member isolation and
 existing final-completion protections remain covered.
+
+## Native reviewer assignment follow-up
+
+`releases/20261004-reviewer-assignment` corrects the ownership ordering found on
+an actual idle review. The owner controller first validates the unchanged native
+handoff, ended maker, requester, privacy boundary, installed reviewer and member
+roster, then records the reassignment atomically. The ordinary dispatcher checks
+fresh worker admission before any claim/run; probing the new worker before its
+assignment exists incorrectly fails the native ownership policy.
+
+Twenty focused checks pass in each lane, including the real ownership policy and
+a dispatcher rejection that proves no worker starts without admission. The shared
+CLI controller can activate this helper independently; both live gateway schemas
+already invoke that controller with the existing work plan. The matching gateway
+source is packaged for the next code load. No additional gateway interruption is
+required for this correction.

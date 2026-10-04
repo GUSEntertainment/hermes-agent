@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T23:11:02.430166+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-review-handoff",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-reviewer-assignment",
+      "files": [
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "6d03fe9e4f8283d85ad0f1121c871631af6f805823eb17a1c9913a6b463e1892",
+          "after_sha256": "7700df9425457a63d8b1bb03ba199d2604e1caceca761550668bec0ab62feddb"
+        },
+        {
+          "path": "tests/hermes_cli/test_native_review_handoff_repair.py",
+          "before_sha256": "50bc11b17004a9adace4621fe9296372e2fcb0de2c6d023f9236eb655bdd4e37",
+          "after_sha256": "e71d637ccf103ccfa77404a19e8b785edbfe48eecb67354771633fe5414b6c5e"
+        }
+      ],
+      "patch_sha256": "c7300186cc34d3311af7e2b5683cd702b2d054d41a1436d8849db825292ae1d9",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-review-handoff-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-reviewer-assignment-controller",
+      "files": [
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "6d03fe9e4f8283d85ad0f1121c871631af6f805823eb17a1c9913a6b463e1892",
+          "after_sha256": "7700df9425457a63d8b1bb03ba199d2604e1caceca761550668bec0ab62feddb"
+        },
+        {
+          "path": "tests/hermes_cli/test_native_review_handoff_repair.py",
+          "before_sha256": "50bc11b17004a9adace4621fe9296372e2fcb0de2c6d023f9236eb655bdd4e37",
+          "after_sha256": "e71d637ccf103ccfa77404a19e8b785edbfe48eecb67354771633fe5414b6c5e"
+        }
+      ],
+      "patch_sha256": "c7300186cc34d3311af7e2b5683cd702b2d054d41a1436d8849db825292ae1d9",
+      "patch": "controller.patch"
+    }
+  }
+}
