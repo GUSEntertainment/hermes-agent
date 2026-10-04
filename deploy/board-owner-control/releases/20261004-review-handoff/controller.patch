@@ -1,0 +1,859 @@
+--- a/hermes_cli/admission_timing.py
++++ b/hermes_cli/admission_timing.py
+@@ -10,7 +10,7 @@
+ 
+ PREFIX = 'HERMES_ADMISSION_TIMING '
+ PHASES = frozenset({'admission_total','profile_hash_before','profile_hash_after',
+- 'discovery_subprocess','admission_validation','claim','spawn','imports',
++ 'profile_skill_sync','discovery_subprocess','admission_validation','claim','spawn','imports',
+  'plugin_discovery','effective_config','tool_schemas','skills','readiness'})
+ TASK = re.compile(r't_[a-f0-9]{8,64}\Z')
+ 
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -2432,9 +2432,11 @@
+ 
+ 
+ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, phase: str = "completion") -> Optional[str]:
+-    """Judge the requested phase while retaining all kernel review gates."""
++    """Judge final completion while retaining all native review gates."""
+     if phase not in {"completion", "review"}:
+         raise ValueError("unknown goal handoff phase")
++    if phase == "review":
++        return None  # Deterministic native checks govern entry to review.
+     if task is None or not task.goal_mode:
+         return None
+     try:
+@@ -2667,18 +2669,8 @@
+             return 2
+     reviewer = getattr(args, "reviewer", None)
+     with kb.connect_closing() as conn:
+-        rejection = _goal_mode_handoff_rejection(
+-            kb.get_task(conn, tid),
+-            summary or "",
+-            phase="review",
+-        )
+-        if rejection is not None:
+-            print(
+-                f"kanban: goal review handoff of {tid} rejected by judge: "
+-                f"{rejection}. Provide acceptance evidence matching the task.",
+-                file=sys.stderr,
+-            )
+-            return 1
++        # Match model-tool semantics: the native reviewer/artifact/claim
++        # checks admit a handoff; final completion still has its own judge.
+         ok, reason = kb.request_review(
+             conn,
+             tid,
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -147,16 +147,18 @@
+ DEPENDENCY_STALE_CHAIN_MAX_ROOTS = 8
+ 
+ CAPABILITY_BLOCK_REASON = "worker capability admission failed"
+-KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS = 15
++KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS = 60
+ 
+ 
+ class WorkerAdmissionError(RuntimeError):
+     """Fail-closed, deliberately non-reflective worker admission rejection."""
+ 
+-    def __init__(self, admission: Optional["WorkerAdmission"] = None, readiness: Optional[dict] = None):
++    def __init__(self, admission: Optional["WorkerAdmission"] = None, readiness: Optional[dict] = None,
++                 *, probe_timeout: Optional[dict] = None):
+         super().__init__(CAPABILITY_BLOCK_REASON)
+         self.admission = admission
+         self.readiness = readiness
++        self.probe_timeout = probe_timeout
+ 
+ 
+ @dataclass(frozen=True)
+@@ -5553,7 +5555,7 @@
+         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
+-        "'worktree_preclaim_blocked'"
++        "'worktree_preclaim_blocked', 'capability_preflight_blocked'"
+         ") ORDER BY id DESC LIMIT 1",
+         (task_id,),
+     ).fetchone()
+@@ -12796,6 +12798,8 @@
+ 
+     profile_home: Optional[str] = None
+     readiness_cfg = {}
++    probe_stage = None
++    probe_started = None
+     try:
+         profile = normalize_profile_name(profile)
+         profile_home = resolve_profile_env(profile)
+@@ -12813,6 +12817,8 @@
+         env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+         env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+         env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
++        probe_stage = "profile_skill_sync"
++        probe_started = time.monotonic()
+         with _timing_phase("profile_skill_sync", task.id):
+             sync = subprocess.run(
+                 [sys.executable, *_python_safe_path_flag(), "-c", _WORKER_SKILL_SYNC_CODE],
+@@ -12848,11 +12854,13 @@
+                    "prepared_requirements": needed if prepared is not None else None}
+         with _timing_phase("profile_hash_before", task.id):
+             before_profile_digest = _profile_config_digest(profile_home)
++        probe_stage = "discovery_subprocess"
++        probe_started = time.monotonic()
+         with _timing_phase("discovery_subprocess", task.id):
+             result = subprocess.run(
+                 [sys.executable, *_python_safe_path_flag(), "-c", _WORKER_ADMISSION_CODE, json.dumps(request)],
+                 env=env, stdin=subprocess.DEVNULL, text=True, capture_output=True,
+-                timeout=(45 if needed and needed.get("mcp") else KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS), check=False,
++                timeout=KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS, check=False,
+             )
+         _relay_timing(result.stderr, task.id)
+         with _timing_phase("admission_validation", task.id):
+@@ -12928,6 +12936,16 @@
+                                    _task_admission_snapshot(task), profile_digest)
+     except WorkerAdmissionError:
+         raise
++    except subprocess.TimeoutExpired as exc:
++        # A slow local probe is not missing authority. Do not queue a model
++        # repair or retry it here; preserve a bounded, non-secret diagnosis.
++        elapsed = max(0.0, time.monotonic() - probe_started) if probe_started is not None else 0.0
++        rejection = _rejected_worker_admission(task, profile, board, profile_home)
++        raise WorkerAdmissionError(rejection, probe_timeout={
++            "stage": probe_stage,
++            "timeout_seconds": KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS,
++            "elapsed_seconds": round(elapsed, 3),
++        }) from exc
+     except Exception as exc:
+         rejection = _rejected_worker_admission(task, profile, board, profile_home)
+         report = None
+@@ -12980,9 +12998,18 @@
+ 
+ 
+ def _block_worker_admission(
+-    conn: sqlite3.Connection, task: Task, lane: str, admission: Optional[WorkerAdmission]
++    conn: sqlite3.Connection, task: Task, lane: str, admission: Optional[WorkerAdmission],
++    *, probe_timeout: Optional[dict] = None,
+ ) -> bool:
+-    """Sticky generic block, CAS-bound to the complete validated snapshot."""
++    """CAS-bound admission hold; transient probes never retry automatically."""
++    kind = "transient" if probe_timeout else "capability"
++    reason = CAPABILITY_BLOCK_REASON
++    if probe_timeout:
++        stage = {"profile_skill_sync": "profile skill synchronization",
++                 "discovery_subprocess": "capability discovery"}.get(probe_timeout.get("stage"), "local admission")
++        reason = (f"Temporary worker startup check timed out during {stage} after "
++                  f"{KANBAN_SKILL_PREFLIGHT_TIMEOUT_SECONDS} seconds. No worker started; "
++                  "resume this task when local startup resources are available.")
+     snapshot = _task_admission_snapshot(task)
+     with write_txn(conn):
+         current = get_task(conn, task.id)
+@@ -12997,17 +13024,20 @@
+         ):
+             return False
+         cur = conn.execute(
+-            "UPDATE tasks SET status='blocked', block_kind='capability', "
++            "UPDATE tasks SET status='blocked', block_kind=?, "
++            "last_failure_error=CASE WHEN ?='transient' THEN ? ELSE last_failure_error END, "
+             "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+             "worker_admission_digest=? WHERE id=? AND status=? AND claim_lock IS NULL",
+-            (admission.digest if admission else None, task.id, lane),
++            (kind, kind, reason, admission.digest if admission else None, task.id, lane),
+         )
+         if cur.rowcount != 1:
+             return False
+         _append_event(conn, task.id, "capability_preflight_blocked", {
+-            "reason": CAPABILITY_BLOCK_REASON,
+-            "kind": "capability",
++            "reason": reason,
++            "kind": kind,
++            "source_status": lane,
+             "admission_digest": admission.digest if admission else None,
++            **({"probe_timeout": probe_timeout} if probe_timeout else {}),
+         })
+         return True
+ 
+@@ -14009,12 +14039,12 @@
+                 )
+         except WorkerAdmissionError as exc:
+             from hermes_cli.worker_readiness import queue_preparation
+-            if exc.readiness and queue_preparation(
++            if not exc.probe_timeout and exc.readiness and queue_preparation(
+                 conn, capability_task, "ready", exc.readiness, board=board
+             ):
+                 continue
+             if _block_worker_admission(
+-                conn, capability_task, "ready", exc.admission
++                conn, capability_task, "ready", exc.admission, probe_timeout=exc.probe_timeout
+             ):
+                 result.capability_blocked.append(row["id"])
+             continue
+@@ -14228,12 +14258,12 @@
+                 )
+         except WorkerAdmissionError as exc:
+             from hermes_cli.worker_readiness import queue_preparation
+-            if exc.readiness and queue_preparation(
++            if not exc.probe_timeout and exc.readiness and queue_preparation(
+                 conn, capability_task, "review", exc.readiness, board=board
+             ):
+                 continue
+             if _block_worker_admission(
+-                conn, capability_task, "review", exc.admission
++                conn, capability_task, "review", exc.admission, probe_timeout=exc.probe_timeout
+             ):
+                 result.capability_blocked.append(row["id"])
+             continue
+--- a/hermes_cli/owner_board_recovery.py
++++ b/hermes_cli/owner_board_recovery.py
+@@ -237,3 +237,96 @@
+         return {'task_id': task_id, 'status': task['status'] if dry_run else 'review',
+                 'reviewer': binding['reviewer'], 'review_binding': binding,
+                 'verdict_recorded': False, 'dispatch_performed': False}
++
++
++def reroute_native_review(conn, task_id: str, *, reviewer: str, actor: str,
++                          reason: str, dry_run: bool) -> dict:
++    """Change one idle native reviewer, preserving its ended maker and evidence."""
++    from hermes_cli import board_owner_manage as control
++    from hermes_cli import owner_work_preparation as prep
++    from hermes_cli.kanban_completion import _independent_review_binding
++
++    if (not isinstance(reviewer, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,99}', reviewer)
++            or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000
++            or type(dry_run) is not bool):
++        raise ValueError('An installed reviewer and bounded current work instruction are required')
++    # Discovery can take tens of seconds; never hold the board writer lock
++    # across profile/skill/tool admission. The later short transaction compares
++    # the bound snapshot and exact maker evidence before committing anything.
++    if conn.in_transaction:
++        raise ValueError('Reviewer admission must run outside a board write transaction')
++    bound = control._expected.get()
++    member = control.require_owner()
++    if (not bound or bound.get('action') != 'work' or bound.get('task_id') != task_id
++            or actor != (member['principal'] if member else 'default')):
++        raise PermissionError('Review reassignment requires a bound authenticated owner work request')
++    control.validate_bound_target(conn, task_id, 'work')
++    if member is not None:
++        control._validate_member_connection(conn, member)
++    board = prep._connection_board(conn, member)
++    task = prep._task(conn, task_id)
++    if task['status'] != 'review' or prep._goal(conn, task_id) is not None:
++        raise ValueError('Reviewer reassignment requires an idle ordinary native review; preserve bound owner-cell review contracts')
++    # Reuse the existing idle check without changing its accepted lifecycle
++    # states, and the same installed-worker/private-route/roster policy.
++    prep._idle(conn, {**task, 'status': 'ready'})
++    prep._eligible(conn, task, reviewer, member)
++    if not kb._parents_satisfied(conn, task_id):
++        raise ValueError('Review prerequisites remain unsatisfied')
++    binding = _independent_review_binding(conn, task_id)
++    if binding is None or binding.get('source') != 'native_review_requested':
++        raise ValueError('Review reassignment needs the existing ended maker, evidence and coherent review handoff')
++    if reviewer == binding['implementer']:
++        raise ValueError('The original maker cannot provide its own independent review')
++    if reviewer == binding['reviewer']:
++        with kb.write_txn(conn):
++            control.validate_bound_target(conn, task_id, 'work')
++            if control.require_owner() != member:
++                raise PermissionError('Owner changed during reviewer check')
++            prep._eligible(conn, prep._task(conn, task_id), reviewer, member)
++        return {'changed': False, 'dry_run': dry_run, 'status': 'review',
++                'reviewer': reviewer, 'worker_started': False,
++                'failure_history_preserved': True,
++                'next_action': 'The installed reviewer is already queued for the existing maker output.'}
++    handoff = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
++    try:
++        admission = kb._build_worker_admission(projected, reviewer, board=board)
++    except kb.WorkerAdmissionError as exc:
++        if isinstance(exc.__cause__, oc.OwnerCellGuardError):
++            raise ValueError('Reviewer readiness: ' + ' '.join(str(exc.__cause__).split())[:500]) from exc
++        raise
++    with kb.write_txn(conn):
++        if control.require_owner() != member or prep._connection_board(conn, member) != board:
++            raise PermissionError('Owner or board changed during reviewer admission')
++        control.validate_bound_target(conn, task_id, 'work')
++        # Roster enrollment can change independently of the task transaction.
++        task = prep._task(conn, task_id)
++        prep._idle(conn, {**task, 'status': 'ready'})
++        prep._eligible(conn, task, reviewer, member)
++        projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
++        actual_db = next(row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main')
++        if (admission.contract.get('version') != 'hermes.worker-admission/v1'
++                or admission.contract.get('status') == 'rejected'
++                or admission.contract.get('task') != task_id
++                or admission.contract.get('profile') != reviewer
++                or admission.contract.get('board_database') != kb._database_identity_contract(actual_db)
++                or hashlib.sha256(admission.encoded_contract.encode()).hexdigest() != admission.digest
++                or not kb._admission_still_current(projected, admission)
++                or _independent_review_binding(conn, task_id) != binding):
++            raise ValueError('Fresh exact accepted reviewer admission and unchanged maker evidence are required')
++        if not dry_run:
++            conn.execute('UPDATE tasks SET assignee=? WHERE id=?', (reviewer, task_id))
++            payload = json.loads(handoff['payload'])
++            kb._append_event(conn, task_id, 'review_requested', {
++                **payload, 'reviewer': reviewer, 'previous_reviewer': binding['reviewer'],
++                'prior_review_requested_event_id': handoff['id'],
++                'owner_actor': actor, 'owner_reason': reason,
++                'failure_history_preserved': True, 'action_restrictions_preserved': True,
++                'approval_granted': False}, run_id=binding['producer_run_id'])
++        return {'changed': not dry_run, 'dry_run': dry_run, 'status': 'review',
++                'reviewer': reviewer, 'previous_reviewer': binding['reviewer'],
++                'producer_run_id': binding['producer_run_id'],
++                'failure_history_preserved': True, 'action_restrictions_preserved': True,
++                'worker_started': False, 'verdict_recorded': False,
++                'next_action': 'Normal independent-review dispatch using the same maker evidence and existing task budget.'}
+--- a/hermes_cli/owner_work_start.py
++++ b/hermes_cli/owner_work_start.py
+@@ -127,8 +127,17 @@
+     before = control.describe(conn, task_id)['expected_state']
+     task, goal = prep._task(conn, task_id), prep._goal(conn, task_id)
+     if task['status'] == 'review':
++        if plan is not None:
++            if not isinstance(plan, dict) or set(plan) != {'assignee'}:
++                raise ValueError('An idle native review can change only its reviewer: use plan={"assignee":"installed-reviewer"}; preserve maker work and evidence')
++            from hermes_cli.owner_board_recovery import reroute_native_review
++            return reroute_native_review(conn, task_id, reviewer=plan['assignee'],
++                actor=actor, reason=instruction, dry_run=dry_run)
+         with kb.write_txn(conn):
+             control.validate_bound_target(conn, task_id, 'work')
++            from hermes_cli.profiles import profile_exists
++            if not task['assignee'] or not profile_exists(task['assignee']) or kb._worker_profile_uses_root_home(task['assignee']):
++                raise ValueError('The assigned reviewer is not an installed non-root worker. For an ordinary native review, use work with plan={"assignee":"installed-reviewer"} to repair the handoff without rerunning its maker')
+         return {'changed': False, 'dry_run': dry_run, 'status': 'review',
+                 'worker_started': False, 'failure_history_preserved': True,
+                 'next_action': 'The existing reviewer is already queued; preserve its independent review.'}
+--- /dev/null
++++ b/tests/hermes_cli/test_native_review_handoff_repair.py
+@@ -0,0 +1,189 @@
++"""Repair a native review handoff through the authenticated owner work surface."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import board_owner_manage as control, kanban_db as kb
++from hermes_cli import kanban_completion as completion
++from tests.hermes_cli.test_ordinary_review_recovery import held, member_scope
++
++
++@pytest.fixture
++def queued(held):
++    conn=held['conn']
++    tid=kb.create_task(conn,title='Review maker output',body='Review the requested result; do not send or publish.',assignee='riley')
++    maker_home=held['profile_home'].parent/'riley';maker_home.mkdir()
++    (maker_home/'config.yaml').write_text('platform_toolsets:\n  cli: [file, terminal, kanban]\n')
++    # The controller correctly keeps the existing no-send hold. Authorize only
++    # local maker work through the real owner route before its native claim.
++    control.execute(dict(action='work',task_id=tid,board=held['board'],
++                         reason='Prepare the requested local evidence; do not send or publish.'))
++    maker=kb.claim_task(conn,tid)
++    assert maker and maker.current_run_id
++    evidence={'artifacts':[{'path':str(held['artifact']), 'sha256':hashlib.sha256(held['artifact'].read_bytes()).hexdigest()}]}
++    assert kb.request_review(conn,tid,summary='Completed maker output ready for independent review.',
++        metadata=evidence,reviewer='margot',expected_run_id=maker.current_run_id)
++    kb.add_comment(conn,tid,'riley','Existing findings and unsent output remain available.')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET consecutive_failures=2,block_recurrences=1,last_failure_error='Historical maker failure' WHERE id=?",(tid,))
++    handoff=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
++    return {**held,'task':tid,'maker':maker.current_run_id,'handoff':dict(handoff)}
++
++
++def request(queued, **kw):
++    return control.execute(dict(action='work',task_id=queued['task'],board=queued['board'],
++        reason='Use Grace to independently review the existing Riley output; preserve the original evidence and restrictions.',
++        plan={'assignee':'grace'},**kw))
++
++
++def snapshot(queued):
++    conn,tid=queued['conn'],queued['task']
++    return {t:[dict(r) for r in conn.execute(f'SELECT * FROM {t} WHERE '+('id' if t=='tasks' else 'task_id')+'=?',(tid,))]
++            for t in ('tasks','task_runs','task_events','task_comments','owner_cell_goals','review_verdicts')}
++
++
++def test_real_native_handoff_changes_only_reviewer_and_appends_exact_lineage(queued):
++    before=snapshot(queued)
++    preview=request(queued,dry_run=True)
++    assert not preview['changed'] and preview['reviewer']=='grace'
++    assert snapshot(queued)==before
++    result=request(queued)
++    assert result['changed'] and result['status']=='review' and result['worker_started'] is False
++    after=snapshot(queued)
++    assert after['tasks']==[{**before['tasks'][0],'assignee':'grace'}]
++    for table in ('task_runs','task_comments','owner_cell_goals','review_verdicts'):
++        assert after[table]==before[table]
++    assert after['task_events'][:-1]==before['task_events']
++    successor=after['task_events'][-1]
++    old=json.loads(queued['handoff']['payload']);new=json.loads(successor['payload'])
++    assert successor['kind']=='review_requested' and successor['run_id']==queued['maker']
++    assert new['implementer']==old['implementer']=='riley'
++    assert new['reviewer']=='grace' and new['previous_reviewer']=='margot'
++    assert new['prior_review_requested_event_id']==queued['handoff']['id']
++    assert new['approval_granted'] is False
++    binding=completion._independent_review_binding(queued['conn'],queued['task'])
++    assert binding['reviewer']=='grace' and binding['producer_run_id']==queued['maker']
++    assert request(queued)['changed'] is False
++
++
++def test_plain_work_reports_missing_reviewer_without_false_queue_success(queued):
++    before=snapshot(queued)
++    with pytest.raises(ValueError,match='reviewer is not an installed'):
++        control.execute(dict(action='work',task_id=queued['task'],board=queued['board'],reason='Please move this work forward.'))
++    assert snapshot(queued)==before
++
++
++@pytest.mark.parametrize('damage',['active','producer_outcome','missing_handoff','superseded','dependency','owner_goal','private_route','self_review','full_plan'])
++def test_repair_refuses_invalid_or_bound_review_without_mutation(queued,monkeypatch,damage):
++    conn,tid=queued['conn'],queued['task'];args={}
++    if damage=='active':conn.execute("UPDATE tasks SET claim_lock='active' WHERE id=?",(tid,))
++    elif damage=='producer_outcome':conn.execute("UPDATE task_runs SET outcome='failed' WHERE id=?",(queued['maker'],))
++    elif damage=='missing_handoff':conn.execute("UPDATE task_events SET run_id=NULL WHERE id=?",(queued['handoff']['id'],))
++    elif damage=='superseded':kb._append_event(conn,tid,'changes_requested',{'reason':'Existing artifact must be revised'})
++    elif damage=='dependency':
++        conn.commit();parent=kb.create_task(conn,title='Pending prerequisite',assignee='riley');kb.link_tasks(conn,parent,tid)
++    elif damage=='owner_goal':
++        # Use the fixture's real bound owner-cell review instead of fabricating a goal.
++        goal=conn.execute('SELECT task_id FROM owner_cell_goals LIMIT 1').fetchone()[0]
++        conn.execute("UPDATE tasks SET status='review' WHERE id=?",(goal,));queued['task']=goal
++    elif damage=='private_route':
++        from gateway import private_action_worker_policy as private
++        monkeypatch.setattr(private,'classified_private',lambda *a:True)
++    elif damage=='self_review':
++        from hermes_cli import profiles
++        monkeypatch.setattr(profiles,'profile_exists',lambda n:n in {'riley','grace'})
++        args={'assignee':'riley'}
++    elif damage=='full_plan':args={'assignee':'grace','brief':'Replace the evidence'}
++    conn.commit();before=snapshot(queued)
++    with pytest.raises(ValueError):
++        if args:
++            control.execute(dict(action='work',task_id=queued['task'],board=queued['board'],reason='Review existing output',plan=args))
++        else:request(queued)
++    assert snapshot(queued)==before
++
++
++@pytest.mark.parametrize('damage',['profile','foreign_admission','revoked_member'])
++def test_admission_rechecks_exact_evidence_profile_board_and_member(queued,monkeypatch,damage):
++    token=None;revoked=False
++    if damage=='revoked_member':
++        grant,token=member_scope(queued,monkeypatch)
++        from gateway import owner_delegation
++        monkeypatch.setattr(owner_delegation,'agents',lambda principal:[{'id':'grace-id'}])
++        monkeypatch.setattr(owner_delegation,'agent',lambda *a:{'runtime':'grace'})
++    def changed(*a,**kw):
++        admitted=queued['build'](*a,**kw)
++        if damage=='profile':(queued['profile_home']/'config.yaml').write_text('model: changed\n')
++        elif damage=='foreign_admission':admitted.contract['board_database']={'path':'another-board'}
++        elif damage=='revoked_member':monkeypatch.setattr(control,'refresh_member_grant',lambda value: (_ for _ in ()).throw(PermissionError('revoked')))
++        return admitted
++    monkeypatch.setattr(kb,'_build_worker_admission',changed)
++    before=snapshot(queued)
++    try:
++        with pytest.raises((ValueError,PermissionError)):request(queued)
++        assert snapshot(queued)==before
++    finally:
++        if token is not None:control._member_context.reset(token)
++
++
++def test_member_repair_requires_exact_board_and_active_own_roster(queued,monkeypatch):
++    grant,token=member_scope(queued,monkeypatch)
++    from gateway import owner_delegation
++    monkeypatch.setattr(owner_delegation,'agents',lambda principal:[])
++    monkeypatch.setattr(owner_delegation,'agent',lambda *a:{'runtime':'grace'})
++    try:
++        before=snapshot(queued)
++        with pytest.raises(PermissionError,match='own roster'):request(queued)
++        with pytest.raises(PermissionError,match='Board outside'):
++            control.execute(dict(action='work',task_id=queued['task'],board='other-board',reason='Review',plan={'assignee':'grace'}))
++        assert snapshot(queued)==before
++        monkeypatch.setattr(owner_delegation,'agents',lambda principal:[{'id':'grace-id'}])
++        assert request(queued)['reviewer']=='grace'
++    finally:control._member_context.reset(token)
++
++
++@pytest.mark.parametrize('key,value',[('HERMES_KANBAN_TASK','t_other'),('HERMES_SESSION_SOURCE','cron')])
++def test_worker_and_cron_cannot_reassign_native_review(queued,monkeypatch,key,value):
++    before=snapshot(queued);monkeypatch.setenv(key,value)
++    with pytest.raises(PermissionError):request(queued)
++    assert snapshot(queued)==before
++
++
++def test_admission_runs_without_transaction_and_other_board_writes_can_finish(queued,monkeypatch):
++    from hermes_cli import owner_board_recovery as recovery
++    active={}
++    original=recovery.reroute_native_review
++    def track(conn,*a,**kw):
++        active['conn']=conn
++        return original(conn,*a,**kw)
++    monkeypatch.setattr(recovery,'reroute_native_review',track)
++    def competing_write(*a,**kw):
++        assert not active['conn'].in_transaction
++        admitted=queued['build'](*a,**kw)
++        queued['conn'].execute('PRAGMA busy_timeout=0')
++        queued['conn'].execute('UPDATE tasks SET priority=priority+1 WHERE id!=?',(queued['task'],))
++        queued['conn'].commit()
++        return admitted
++    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
++    assert request(queued)['changed']
++
++
++@pytest.mark.parametrize('changed',['maker_evidence','task_state','new_comment'])
++def test_short_commit_rejects_state_changes_during_unlocked_admission(queued,monkeypatch,changed):
++    after_external=[]
++    def competing_write(*a,**kw):
++        admitted=queued['build'](*a,**kw)
++        conn=queued['conn'];conn.execute('PRAGMA busy_timeout=0')
++        if changed=='maker_evidence':
++            conn.execute('UPDATE task_runs SET summary=? WHERE id=?',('New maker evidence',queued['maker']))
++        elif changed=='task_state':
++            conn.execute('UPDATE tasks SET title=? WHERE id=?',('New task scope',queued['task']))
++        else:
++            kb.add_comment(conn,queued['task'],'riley','New information arrived during admission.')
++        conn.commit();after_external.append(snapshot(queued))
++        return admitted
++    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
++    with pytest.raises(ValueError,match='state changed|unchanged maker evidence'):
++        request(queued)
++    assert after_external and snapshot(queued)==after_external[0]
++    assert kb.get_task(queued['conn'],queued['task']).assignee=='margot'
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_admission_timeout.py
+@@ -0,0 +1,93 @@
++"""Local startup probe timeouts stay bounded, visible and distinct from denial."""
++import json
++import logging
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++from hermes_cli import admission_timing, kanban_db as kb, worker_readiness
++from tests.hermes_cli.test_worker_skill_sync_admission import board
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++@pytest.mark.parametrize('stage', ['profile_skill_sync', 'discovery_subprocess'])
++def test_timeout_blocks_once_without_worker_or_repair_and_preserves_lane(board, monkeypatch, lane, stage):
++    conn, task, *_ = board
++    if lane == 'review':
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task.id,))
++    calls = []
++    def probe(argv, **kwargs):
++        current = 'profile_skill_sync' if argv[-1] == kb._WORKER_SKILL_SYNC_CODE else 'discovery_subprocess'
++        calls.append(current)
++        assert kwargs['timeout'] == 60
++        if current == stage:
++            raise subprocess.TimeoutExpired(['SECRET_COMMAND'], 60, output='SECRET_OUTPUT', stderr='SECRET_ERROR')
++        return SimpleNamespace(returncode=0, stdout='', stderr='')
++    monkeypatch.setattr(kb.subprocess, 'run', probe)
++    monkeypatch.setattr(kb, '_memory_pressure_level', lambda *a, **kw: 'unknown')
++    monkeypatch.setattr(worker_readiness, 'queue_preparation', lambda *a, **kw: pytest.fail('No model repair for a local timeout'))
++    spawned=[]
++    def spawn(*args, admission_contract=None, **kwargs):
++        spawned.append(args)
++    result = kb.dispatch_once(conn, spawn_fn=spawn)
++    current = kb.get_task(conn, task.id)
++    assert result.capability_blocked == [task.id]
++    assert current.status == 'blocked' and current.block_kind == 'transient'
++    assert current.claim_lock is None and current.current_run_id is None and current.worker_pid is None
++    assert not spawned
++    assert 'Temporary worker startup check timed out' in current.last_failure_error
++    assert 'No worker started' in current.last_failure_error
++    row=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='capability_preflight_blocked' ORDER BY id DESC LIMIT 1", (task.id,)).fetchone()
++    payload=json.loads(row[0])
++    assert payload['kind']=='transient' and payload['source_status']==lane
++    assert payload['probe_timeout']['stage']==stage
++    assert payload['probe_timeout']['timeout_seconds']==60
++    assert payload['probe_timeout']['elapsed_seconds']>=0
++    assert 'SECRET' not in row[0]+current.last_failure_error
++    assert kb._resume_status_from_events(conn, task.id)==lane
++    assert kb._has_sticky_block(conn,task.id)
++    assert kb.recompute_ready(conn)==0
++    calls_before=list(calls)
++    kb.dispatch_once(conn, spawn_fn=spawn)
++    assert calls==calls_before
++    assert conn.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++    assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='capability_preflight_blocked'", (task.id,)).fetchone()[0]==1
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_real_unavailable_provider_remains_capability_denial(board, monkeypatch, lane):
++    conn, task, *_ = board
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET status=?,provider_override=?,model_override=? WHERE id=?',
++                     (lane,'unavailable-provider','unavailable-model',task.id))
++    task=kb.get_task(conn,task.id)
++    with pytest.raises(kb.WorkerAdmissionError) as result:
++        kb._build_worker_admission(task,'worker')
++    error=result.value
++    assert error.probe_timeout is None
++    assert kb._block_worker_admission(conn,task,lane,error.admission,probe_timeout=error.probe_timeout)
++    current=kb.get_task(conn,task.id)
++    assert current.block_kind=='capability'
++    payload=json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='capability_preflight_blocked' ORDER BY id DESC LIMIT 1", (task.id,)).fetchone()[0])
++    assert payload['reason']==kb.CAPABILITY_BLOCK_REASON
++    assert 'probe_timeout' not in payload
++    assert conn.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++
++
++def test_timeout_hold_loses_stale_task_cas(board):
++    conn, task, *_=board
++    admission=kb._rejected_worker_admission(task,'worker',None,str(board[3]))
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET title=? WHERE id=?',('New owner instruction',task.id))
++    assert not kb._block_worker_admission(conn,task,'ready',admission,probe_timeout={
++        'stage':'profile_skill_sync','timeout_seconds':60,'elapsed_seconds':60.1})
++    assert kb.get_task(conn,task.id).status=='ready'
++    assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='capability_preflight_blocked'").fetchone()[0]==0
++
++
++def test_skill_sync_timing_is_allowlisted_and_nonsecret(caplog):
++    with caplog.at_level(logging.INFO, logger='hermes.admission_timing'):
++        admission_timing.emit('profile_skill_sync',60.125,'failed','t_12345678')
++    payload=json.loads(caplog.records[-1].message.split(admission_timing.PREFIX,1)[1])
++    assert payload=={'phase':'profile_skill_sync','seconds':60.125,'outcome':'failed','task':'t_12345678'}
+--- a/tests/tools/test_kanban_review_contract.py
++++ b/tests/tools/test_kanban_review_contract.py
+@@ -30,8 +30,12 @@
+ ])
+ def test_rejected_payload_is_actionable_and_corrected_native_handoff_ends_run(board, monkeypatch, bad):
+     conn, home = board
++    def forbidden_judge(*args, **kwargs):
++        raise AssertionError('Review handoff must use native validation, not an auxiliary judge')
++    monkeypatch.setattr(kt, '_goal_mode_handoff_rejection', forbidden_judge)
+     tid = kb.create_task(conn, title='Produce a verified text artifact', assignee='worker',
+-                         owner_cell_contract=reviewed_contract())
++                         body='Complete requested work and obtain independent reviewer PASS.',
++                         goal_mode=True, owner_cell_contract=reviewed_contract())
+     kb.claim_task(conn, tid)
+     monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
+     monkeypatch.setenv('HERMES_PROFILE', 'worker')
+--- a/tests/tools/test_kanban_review_phase.py
++++ b/tests/tools/test_kanban_review_phase.py
+@@ -1,101 +1,123 @@
+-"""Regression: requesting the review cannot require that future review's PASS."""
++"""Independent review entry must not be mistaken for final goal completion."""
++import hashlib
+ import json
+ from types import SimpleNamespace
+ import pytest
+ 
++from hermes_cli import kanban_db as kb, owner_cell as oc
++from tests.hermes_cli.test_worker_readiness import board, contract
+ 
+-def test_review_phase_exempts_only_future_review_not_maker_obligations(monkeypatch):
++
++def forbidden_judge(*args, **kwargs):
++    raise AssertionError('Review entry must not invoke an auxiliary goal judge')
++
++
++def test_review_phase_never_resolves_or_calls_an_auxiliary_model(monkeypatch):
+     from tools import kanban_tools as kt
+-    task=SimpleNamespace(goal_mode=True,title='Lifecycle repair',body='Implement and test the patch, obtain same-card Grace PASS, then activate.')
++    from hermes_cli import kanban, goals
++    from agent import auxiliary_client
++    task=SimpleNamespace(goal_mode=True,title='Review needed',body='Complete the packet and obtain independent reviewer PASS.')
++    monkeypatch.setattr(kt,'_goal_judge_available',forbidden_judge)
++    monkeypatch.setattr(kt,'judge_goal',forbidden_judge)
++    monkeypatch.setattr(goals,'judge_goal',forbidden_judge)
++    monkeypatch.setattr(auxiliary_client,'get_text_auxiliary_client',forbidden_judge)
++    assert kt._goal_mode_handoff_rejection(task,'Sources captured; reviewer must assess the remaining packet.',phase='review') is None
++    assert kanban._goal_mode_handoff_rejection(task,'Sources captured; reviewer must assess the remaining packet.',phase='review') is None
++
++
++@pytest.mark.parametrize('surface',['tool','cli'])
++def test_native_review_handoff_keeps_final_completion_and_action_gates(board,monkeypatch,surface):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban, goals
++    conn,home=board
++    value=contract()
++    value.update(router_mode='reviewed',required_reviewer_profile='owner',owner_profile='coordinator',
++                 worker_budget={'producers':1,'reviewers':1,'extras':0})
++    value['delegation_roles']['reviewer']='owner'
++    tid=kb.create_task(conn,title='Finish requested packet',assignee='worker',goal_mode=True,
++        body='Produce the final packet, obtain independent reviewer PASS, and retain publish approval.',
++        owner_cell_contract=value)
++    claimed=kb.claim_task(conn,tid)
++    monkeypatch.setenv('HERMES_KANBAN_TASK',tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID',str(claimed.current_run_id))
++    monkeypatch.setenv('HERMES_PROFILE','worker')
++    monkeypatch.setattr(kt,'_goal_mode_handoff_rejection',forbidden_judge)
++    monkeypatch.setattr(kanban,'_goal_mode_handoff_rejection',forbidden_judge)
++    artifact=home/'captured-sources.txt';artifact.write_text('Verified source capture; remaining packet needs independent assessment.\n')
++    artifact_digest=hashlib.sha256(artifact.read_bytes()).hexdigest()
++    metadata={'owner_cell_artifact':{'ref':str(artifact),'digest':artifact_digest}}
++    summary='Source capture verified. Independent reviewer must inspect evidence and identify remaining packet work; no final approval claimed.'
++    if surface=='tool':
++        out=json.loads(kt._handle_request_review(dict(task_id=tid,summary=summary,reviewer='owner',metadata=metadata)))
++        assert out.get('status')=='review',out
++    else:
++        assert kanban._cmd_request_review(SimpleNamespace(task_id=tid,summary=summary,reviewer='owner',metadata=json.dumps(metadata),force=False))==0
++    task=kb.get_task(conn,tid);goal=kb.owner_cell_read_state(conn,tid)
++    assert task.status=='review' and task.assignee=='owner'
++    assert kb.latest_run(conn,tid).outcome=='review_requested'
++    assert goal['phase']=='review' and goal['review_artifact_digest']==artifact_digest
++    stored=json.loads(conn.execute('SELECT contract_json FROM owner_cell_goals WHERE task_id=?',(tid,)).fetchone()[0])
++    assert stored['approval_gates']==['publish']
++    assert conn.execute('SELECT COUNT(*) FROM review_verdicts WHERE task_id=?',(tid,)).fetchone()[0]==0
++    with pytest.raises(oc.OwnerCellGuardError):oc.assert_completion_allowed(conn,tid)
++    # Quiet CLI recognizes a successful handoff before any further model turn.
++    monkeypatch.setattr(goals,'judge_goal',forbidden_judge)
++    outcome=goals.run_kanban_goal_loop(task_id=tid,goal_text=task.body,first_response=summary,
++        task_status_fn=lambda:kb.get_task(conn,tid).status,run_turn=forbidden_judge,block_fn=forbidden_judge)
++    assert outcome['outcome']=='review_requested_by_worker'
++
++
++def test_final_completion_keeps_full_goal_and_future_review_gate(board,monkeypatch):
++    from tools import kanban_tools as kt
++    conn,_=board
++    tid=kb.create_task(conn,title='Completion gate',body='Final packet and reviewer PASS are required.',assignee='worker',goal_mode=True)
++    claimed=kb.claim_task(conn,tid)
++    monkeypatch.setenv('HERMES_KANBAN_TASK',tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID',str(claimed.current_run_id))
++    monkeypatch.setenv('HERMES_PROFILE','worker')
+     calls=[]
+     def judge(**kwargs):
+         calls.append(kwargs)
+-        assert 'missing required tests or missing handoff artifacts' in kwargs['goal']
+-        if 'REQUEST INDEPENDENT REVIEW' in kwargs['goal'] and kwargs['last_response']=='Patch and regression tests verified. Exact handoff sealed.':
+-            return 'done','Ready for review',False,None,False
+-        return 'continue','Required work remains incomplete',False,None,False
++        return 'continue','Final packet and reviewer PASS are missing',False,None,False
+     monkeypatch.setattr(kt,'_goal_judge_available',lambda:True)
+     monkeypatch.setattr(kt,'judge_goal',judge)
+-    assert kt._goal_mode_handoff_rejection(task,'Patch and regression tests verified. Exact handoff sealed.',phase='review') is None
+-    assert kt._goal_mode_handoff_rejection(task,'Only a plan; tests not run.',phase='review')
+-    assert task.body in calls[0]['goal']
++    out=json.loads(kt._handle_complete({'summary':'Sources captured only'}))
++    assert 'Goal completion rejected by judge' in out['error']
++    assert calls[0]['goal']=='Completion gate\n\nFinal packet and reviewer PASS are required.'
++    assert kb.get_task(conn,tid).status=='running'
+ 
+ 
+-def test_final_completion_keeps_full_goal_and_future_review_gate(monkeypatch):
+-    from tools import kanban_tools as kt
+-    task=SimpleNamespace(goal_mode=True,title='Lifecycle repair',body='Implement and test; require Grace PASS before completion.')
+-    def judge(**kwargs):
+-        assert kwargs['goal']==task.title+'\n\n'+task.body
+-        return 'continue','Grace PASS is still required',False,None,False
+-    monkeypatch.setattr(kt,'_goal_judge_available',lambda:True)
+-    monkeypatch.setattr(kt,'judge_goal',judge)
+-    assert kt._goal_mode_handoff_rejection(task,'Maker finished')=='Grace PASS is still required'
+-
+-
+-def test_unknown_phase_cannot_disable_judgment():
+-    from tools import kanban_tools as kt
+-    with pytest.raises(ValueError): kt._goal_mode_handoff_rejection(None,'',phase='skip')
+-
+-
+-def test_cli_and_tool_judges_use_identical_phase_scope(monkeypatch):
+-    from hermes_cli import kanban, goals
++def test_cli_and_tool_final_completion_judges_keep_same_scope(monkeypatch):
++    from hermes_cli import kanban,goals
+     from tools import kanban_tools as kt
+     from agent import auxiliary_client
+-    task=SimpleNamespace(goal_mode=True,title='Maker patch',body='Test patch; get Grace PASS; then deploy after approval.')
++    task=SimpleNamespace(goal_mode=True,title='Maker patch',body='Test patch; get independent PASS; deploy only after approval.')
+     captured=[]
+     def judge(**kwargs):
+-        captured.append(kwargs)
+-        return 'done','Ready',False,None,False
++        captured.append(kwargs);return 'continue','Approval is missing',False,None,False
+     monkeypatch.setattr(auxiliary_client,'get_text_auxiliary_client',lambda *_:(object(),'judge'))
+     monkeypatch.setattr(goals,'judge_goal',judge)
+     monkeypatch.setattr(kt,'_goal_judge_available',lambda:True)
+     monkeypatch.setattr(kt,'judge_goal',judge)
+-    for phase in ('review','completion'):
+-        assert kanban._goal_mode_handoff_rejection(task,'Evidence',phase=phase) is None
+-        assert kt._goal_mode_handoff_rejection(task,'Evidence',phase=phase) is None
+-        assert captured[-1]==captured[-2]
+-    assert 'REQUEST INDEPENDENT REVIEW' in captured[0]['goal']
+-    assert captured[-1]['goal']==task.title+'\n\n'+task.body
++    assert kanban._goal_mode_handoff_rejection(task,'Evidence')=='Approval is missing'
++    assert kt._goal_mode_handoff_rejection(task,'Evidence')=='Approval is missing'
++    assert captured[0]==captured[1]
++    assert captured[0]['goal']==task.title+'\n\n'+task.body
+ 
+ 
+-def test_cli_request_review_passes_review_phase_and_retains_kernel_rejection(monkeypatch,capsys):
++def test_unknown_phase_cannot_disable_completion_judgment():
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban
++    for module in (kt,kanban):
++        with pytest.raises(ValueError):module._goal_mode_handoff_rejection(None,'',phase='skip')
++
++
++def test_cli_request_review_retains_native_rejection(monkeypatch,capsys):
+     from contextlib import nullcontext
+     from hermes_cli import kanban
+-    phases=[]
+     monkeypatch.setattr(kanban.kb,'connect_closing',lambda:nullcontext(object()))
+-    monkeypatch.setattr(kanban.kb,'get_task',lambda *_:object())
+-    def gate(task,evidence,*,phase='completion'):
+-        phases.append(phase);return None
+-    monkeypatch.setattr(kanban,'_goal_mode_handoff_rejection',gate)
++    monkeypatch.setattr(kanban,'_goal_mode_handoff_rejection',forbidden_judge)
+     monkeypatch.setattr(kanban,'_worker_run_id_for',lambda _:None)
+     monkeypatch.setattr(kanban.kb,'request_review',lambda *a,**kw:(False,'stale exact artifact'))
+-    result=kanban._cmd_request_review(SimpleNamespace(task_id='t_fixture',summary='tested',metadata=None,reviewer='grace',force=False))
+-    assert result==1 and phases==['review']
+-    assert 'stale exact artifact' in capsys.readouterr().err
+-
+-
+-def test_handler_selects_review_phase_and_keeps_db_artifact_gate(monkeypatch,tmp_path):
+-    from hermes_cli import kanban_db as kb
+-    from tools import kanban_tools as kt
+-    from pathlib import Path
+-    home=tmp_path/'.hermes';home.mkdir()
+-    monkeypatch.setenv('HERMES_HOME',str(home));monkeypatch.setattr(Path,'home',lambda:tmp_path)
+-    monkeypatch.delenv('HERMES_SESSION_ID',raising=False)
+-    monkeypatch.setenv('HERMES_PROFILE','maker')
+-    kb._INITIALIZED_PATHS.clear();kb.init_db()
+-    with kb.connect_closing() as c:
+-        tid=kb.create_task(c,title='Repair',assignee='maker',goal_mode=True)
+-        kb.claim_task(c,tid)
+-    monkeypatch.setenv('HERMES_KANBAN_TASK',tid)
+-    phases=[]
+-    def judge(task,evidence,*,phase='completion'):
+-        phases.append(phase);return None
+-    monkeypatch.setattr(kt,'_goal_mode_handoff_rejection',judge)
+-    def reject_bound_artifact(*args,**kwargs):
+-        assert kwargs['with_reason'] is True
+-        return False,'review artifact binding is missing'
+-    monkeypatch.setattr(kb,'request_review',reject_bound_artifact)
+-    out=json.loads(kt._handle_request_review({'summary':'Maker work tested','reviewer':'grace'}))
+-    assert phases==['review']
+-    assert 'artifact binding is missing' in out['error']
+-    with kb.connect_closing() as c: assert kb.get_task(c,tid).status=='running'
++    result=kanban._cmd_request_review(SimpleNamespace(task_id='t_fixture',summary='Captured evidence',metadata=None,reviewer='owner',force=False))
++    assert result==1 and 'stale exact artifact' in capsys.readouterr().err
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -319,9 +319,11 @@
+ def _goal_mode_handoff_rejection(
+     task, evidence: str, *, phase: str = "completion",
+ ) -> Optional[str]:
+-    """Judge the requested transition, not an as-yet unreachable later phase."""
++    """Judge final completion; review entry retains its native checks."""
+     if phase not in {"completion", "review"}:
+         raise ValueError("unknown goal handoff phase")
++    if phase == "review":
++        return None  # Deterministic native checks govern entry to review.
+     if not task or not task.goal_mode or not _goal_judge_available():
+         return None
+     from hermes_cli.kanban_judgment import handoff_goal
+@@ -1237,13 +1239,9 @@
+             input_error = _review_handoff_input_error(conn, tid, reviewer, metadata)
+             if input_error is not None:
+                 return input_error
+-            rejection = _goal_mode_handoff_rejection(task, summary, phase="review")
+-            if rejection is not None:
+-                return tool_error(
+-                    f"Goal review handoff rejected by judge: {rejection}. "
+-                    "Provide acceptance evidence matching the card before "
+-                    "requesting review."
+-                )
++            # Review entry is not final completion. The native transition
++            # validates the live maker, required reviewer and bound artifact;
++            # that reviewer owns assessment of the evidence and remaining work.
+             with kb.write_txn(conn):
+                 admission = conn.execute("SELECT worker_admission_contract FROM tasks WHERE id=?", (tid,)).fetchone()
+                 if admission and admission[0] and _worker_run_id(tid) is not None:

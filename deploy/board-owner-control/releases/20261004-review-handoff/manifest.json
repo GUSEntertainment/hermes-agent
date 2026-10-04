@@ -1,0 +1,127 @@
+{
+  "format": 1,
+  "created_at": "2026-10-04T22:57:34.779879+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-adaptive-work",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-review-handoff",
+      "files": [
+        {
+          "path": "hermes_cli/admission_timing.py",
+          "before_sha256": "e321db4abb61cff656082722e21af4cbb33b0a18e4018c715c85225c77645704",
+          "after_sha256": "de9c22f1d390e35894d9f5f9c0d081036aa9d18c7ff08af22d1273f038008e66"
+        },
+        {
+          "path": "hermes_cli/kanban.py",
+          "before_sha256": "8fdf00e56930d7190387e1fc4f202351d387927e140519cd2df778d9655f2599",
+          "after_sha256": "3f24ed1dda25f61a19c412deaebf8aed9000ce450dbce9107bf0bee144e93bf0"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "60af2b5e0343e7971fffb2fed0844ff26a8f5205fea0417b446b699ec85a645f",
+          "after_sha256": "414bfe8a40957e36b7a14c746dd02edf1291d18571b04f2478ac1cf0fd39239b"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "d0955117b75c0e5cbb50398574e7d04f75fc0bbb606299fa673d5663685d733e",
+          "after_sha256": "6d03fe9e4f8283d85ad0f1121c871631af6f805823eb17a1c9913a6b463e1892"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "07d22331e50aecb831507525259dc1dac0173be74415064157807ea20d7f8f6d",
+          "after_sha256": "5250b1311df995b954b2c270b816131d8ac7ff63fe092110c38d4b16b66b2348"
+        },
+        {
+          "path": "tests/hermes_cli/test_native_review_handoff_repair.py",
+          "before_sha256": null,
+          "after_sha256": "50bc11b17004a9adace4621fe9296372e2fcb0de2c6d023f9236eb655bdd4e37"
+        },
+        {
+          "path": "tests/hermes_cli/test_worker_admission_timeout.py",
+          "before_sha256": null,
+          "after_sha256": "63e4e93990dd9578ae42ff5d456ea263bcc0bd8a985f11ad108dfa60d410ca28"
+        },
+        {
+          "path": "tests/tools/test_kanban_review_contract.py",
+          "before_sha256": "153b426b8dae8025847d60cead62645ebbbc183a3a0736b39fe9a259f2d58b69",
+          "after_sha256": "e30451f00057bdee4d7da110f86595489f79ca974bb172ac2bc0c4123aed650c"
+        },
+        {
+          "path": "tests/tools/test_kanban_review_phase.py",
+          "before_sha256": "bd0d312fc0bb598a6cd1a6baf55a60d8d937386bdfd533dd7de37b99adbee2c7",
+          "after_sha256": "121009460d61c72a0f9cd86a9b566833cd2f53990e604448f458274feeac7646"
+        },
+        {
+          "path": "tests/tools/test_review_handoff_manage_schema.py",
+          "before_sha256": null,
+          "after_sha256": "e4599b1e1b5f27550fbd2b16729b7ece566e628eb6cc10f7b58e203647d0f0df"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "41cda7f4ad823549c8b3d1449c2bd8349ad433b1f52564f6f941540eb26bab08",
+          "after_sha256": "fa395e1faa45ee1889b0526a814d601c6ef6aaaa58a4cb785c88784168419463"
+        }
+      ],
+      "patch_sha256": "a4bdb1beb91fa8e76091424ddeb07414a3a62b6452ba5bc824dab4c8840944c1",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-adaptive-work-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-review-handoff-controller",
+      "files": [
+        {
+          "path": "hermes_cli/admission_timing.py",
+          "before_sha256": "e321db4abb61cff656082722e21af4cbb33b0a18e4018c715c85225c77645704",
+          "after_sha256": "de9c22f1d390e35894d9f5f9c0d081036aa9d18c7ff08af22d1273f038008e66"
+        },
+        {
+          "path": "hermes_cli/kanban.py",
+          "before_sha256": "4f8844f3b7732ec3271c774b67957a18661e93f120f52cfbd0ba1e08d71055cc",
+          "after_sha256": "d12e5f5c77ec0f037b550e97ff3d5fcce5101bf2dc7cace03c8d351b57cfba75"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "40e9a1d6d001c636b4c62a44fff7ed5e29d2786dfb1a3db9b72b4b05044c4f51",
+          "after_sha256": "469dffb296973eb44807a328f22379e537c789da7c0b6be3e6a2e19899cb1dba"
+        },
+        {
+          "path": "hermes_cli/owner_board_recovery.py",
+          "before_sha256": "d0955117b75c0e5cbb50398574e7d04f75fc0bbb606299fa673d5663685d733e",
+          "after_sha256": "6d03fe9e4f8283d85ad0f1121c871631af6f805823eb17a1c9913a6b463e1892"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "07d22331e50aecb831507525259dc1dac0173be74415064157807ea20d7f8f6d",
+          "after_sha256": "5250b1311df995b954b2c270b816131d8ac7ff63fe092110c38d4b16b66b2348"
+        },
+        {
+          "path": "tests/hermes_cli/test_native_review_handoff_repair.py",
+          "before_sha256": null,
+          "after_sha256": "50bc11b17004a9adace4621fe9296372e2fcb0de2c6d023f9236eb655bdd4e37"
+        },
+        {
+          "path": "tests/hermes_cli/test_worker_admission_timeout.py",
+          "before_sha256": null,
+          "after_sha256": "63e4e93990dd9578ae42ff5d456ea263bcc0bd8a985f11ad108dfa60d410ca28"
+        },
+        {
+          "path": "tests/tools/test_kanban_review_contract.py",
+          "before_sha256": "153b426b8dae8025847d60cead62645ebbbc183a3a0736b39fe9a259f2d58b69",
+          "after_sha256": "e30451f00057bdee4d7da110f86595489f79ca974bb172ac2bc0c4123aed650c"
+        },
+        {
+          "path": "tests/tools/test_kanban_review_phase.py",
+          "before_sha256": "bd0d312fc0bb598a6cd1a6baf55a60d8d937386bdfd533dd7de37b99adbee2c7",
+          "after_sha256": "121009460d61c72a0f9cd86a9b566833cd2f53990e604448f458274feeac7646"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "ab33c67912824273947bd2eeb0343ebef51c4f9358a8c99a8a778c84ecee87a3",
+          "after_sha256": "e54726394414d0fabc5e17e55ad42de3ff96d593c59b5b8d35b58723bee8a8a1"
+        }
+      ],
+      "patch_sha256": "19f866097354f94045f1054452a9a1d6cda1b20b3e30b2822a99dab2ff7f8fbe",
+      "patch": "controller.patch"
+    }
+  }
+}

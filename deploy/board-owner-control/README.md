@@ -250,3 +250,25 @@ action/privacy restrictions and existing budgets remain. Workers stop when
 reasonable authorized methods are exhausted instead of blindly repeating calls.
 It does not modify already-running conversation prompts, add tools, increase
 budgets, or create retry jobs. Syntax and isolated deployment preflight verified.
+
+## Review handoffs and slow worker admission (October 4)
+
+Apply `releases/20261004-review-handoff` after adaptive-work. Both model-tool and
+CLI review entry now rely on the existing deterministic reviewer, evidence,
+privacy and native handoff checks. The auxiliary final-goal judge no longer
+rejects work before its reviewer can inspect it; final completion still keeps
+its checks. An authenticated owner can repair an idle ordinary native review
+with `work` and `plan={"assignee":"installed-reviewer"}`, retaining its ended
+maker, evidence, findings and handoff lineage. Bound private/owner-cell routes
+are not reassigned. Expensive admission runs outside the database write lock,
+then a short transaction revalidates the exact state and requester.
+
+Local skill sync and discovery allow 60 seconds. A timeout records the stage and
+elapsed time as a transient startup hold, preserving the review/ready recovery
+lane. It does not claim missing permission, start a repair agent, or retry
+unattended. Actual capability failures still fail closed.
+
+Validation: final combined gateway suite 43 passed; independent controller
+review, timeout and entry suites passed; both isolated deployment preflights
+passed. No provider calls in these checks. New-profile/member isolation and
+existing final-completion protections remain covered.
