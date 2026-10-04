@@ -10,7 +10,7 @@
 # t_e4360514: activated reviewed retire/forward QA-fix release (t_fa49d830 round15 PASS).
 # Rollback: cp hermes-kanban-guarded.bak-pre-t_e4360514 hermes-kanban-guarded (REL=hermes-agent-20261001-cleanup-specify-t1cc)
 # Owner archival preserves scratch files; rollback is in kanban-owner-control-20261004.
-REL=/Users/Chris/.hermes/releases/hermes-agent-20261004-native-board-controller-v2
+REL=/Users/Chris/.hermes/releases/hermes-agent-20261004-member-board-controller
 unset PYTHONHOME
 if [[ "${1:-}" == "--owner-tool-json" ]]; then
   exec env PYTHONPATH="$REL" /Users/Chris/.hermes/releases/hermes-agent-20260925-private-delivery-proof-v57/.venv/bin/python -P -m hermes_cli.board_owner_manage

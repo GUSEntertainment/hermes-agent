@@ -68,7 +68,7 @@ owner must wire a successful preflight as a prerequisite before activation;
 the existing startup-health rollback remains a separate check. Always preserve
 the previous verified gateway/controller pair and the exact generated package.
 
-Current packaged release: `releases/20261004-native-owner-v2`. The installed
+Current member package: `releases/20261004-member-board-control` (supersedes the Chris-only v2 overlay). The installed
 controller wrapper selects its controller; the switch script runs the maintained
 preflight before interrupting the gateway. The preflight also distinguishes new
 specified triage (`start_triage`) from stopped-card recovery (`resume_triage`).
@@ -80,3 +80,44 @@ start: its new-triage fixture was routed to stopped-task recovery. Two bounded A
 turns ended, no worker ran, and both fixture cards were retired. This package does
 not claim a successful live worker/dependency chain. The new-triage correction
 passed deterministic tests; no further paid acceptance run was started.
+
+
+## Authenticated member controls (October 4)
+
+The member package derives the board, roster and return destination from protected
+current enrollment. No model argument, environment profile name, or caller-selected
+board grants access. Josh, Connor and new enrolled members use the same controls.
+`own_work_show`, `own_work_manage` and `own_work_comment` provide inspection,
+reversible cleanup, triage/review recovery and exact obsolete-dependency removal.
+Existing attempt history, active work and real prerequisites remain enforced.
+Normal fully specified delegation creates ready work, or dependency-waiting work;
+there is no new automatic retry or triage sweeping scheduler.
+
+Before activation, run the explicit one-time private transport installer:
+
+```sh
+python3 deploy/board-owner-control/initialize_member_controller.py --runtime "$gateway_candidate"
+```
+
+It installs a local 32-byte signing key and replay ledger, never prints their
+contents and does not rotate existing material. Member controller requests bind
+the exact task snapshot, payload, account, profile, board and session; expire
+after 30 seconds; consume a nonce once; and revalidate enrollment inside the
+mutation transaction. Scheduled jobs and delegated workers cannot inherit this
+interactive account authority. The private transport directory must remain
+outside worker filesystem access.
+
+Deploy the matched gateway/controller pair and the corresponding app bridge
+pins together. Preserve the previous controller wrapper and gateway plist;
+restore the wrapper as well if gateway activation rolls back. The public app
+must be built from origin/main through its supported deployment script. Do not
+edit the stable deployment checkout manually. The app bridge manifest pins
+`owner_delegation.py` and `owner_app_returns.py`; update its reviewed hashes for
+any later changes to those two modules.
+
+The acceptance checks use temporary accounts, databases and documents, without
+provider calls or live worker jobs. They cover current and future member
+creation, independent review, dependency release, conversation returns and Desk
+custody. They do not claim a live user conversation or successful execution of
+every existing blocked project. New profile names alone are not enrollment;
+profiles must have their authenticated canonical account/board binding.

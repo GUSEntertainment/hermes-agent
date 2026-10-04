@@ -48,12 +48,12 @@ def controller_probe():
             conn.execute("UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id=?",
                          (str(workspace), task))
         receipt = execute(dict(action="archive", task_id=task,
-                               reason="obsolete isolated preflight fixture", **describe(conn, task)))
+                               reason="obsolete isolated preflight fixture", expected_state=describe(conn, task)["expected_state"]))
         require(receipt.get("ok") and receipt.get("status") == "archived", "Native archive failed")
         require(artifact.read_text() == "unfinished evidence\n", "Archive deleted evidence")
         require(kb.get_task(conn, task).completed_at is None, "Archive fabricated completion")
         receipt = execute(dict(action="restore", task_id=task,
-                               reason="owner restores fixture", **describe(conn, task)))
+                               reason="owner restores fixture", expected_state=describe(conn, task)["expected_state"]))
         require(receipt.get("ok") and receipt.get("status") == "triage", "Native restore lost lane")
         kb.recompute_ready(conn)
         require(kb.get_task(conn, task).status == "triage", "Restore resumed paused work")
@@ -115,7 +115,25 @@ def gateway_probe():
     require(entry.check_fn is not None and entry.check_fn(), "Owner cannot discover kanban_manage")
     definitions = registry.get_definitions({"kanban_manage"}, quiet=True)
     require(len(definitions) == 1, "Owner schema resolution did not expose kanban_manage")
-    return ["native_manage_registration", "owner_tool_discovery"]
+    from hermes_cli import board_owner_manage as owner
+    grant = dict(principal="future-member", profile="future-member", board="future-home", fingerprint="a" * 64)
+    original = owner.require_owner
+    owner.require_owner = lambda: dict(grant)
+    try:
+        from gateway.member_board_tools import TOOLS
+        require(TOOLS == {"own_work_show", "own_work_manage", "own_work_comment"}, "Member recovery catalog incomplete")
+        schemas = registry.get_definitions(set(TOOLS), quiet=True)
+        require(len(schemas) == 3, "Enrolled member cannot discover recovery controls")
+        for name in TOOLS:
+            require(callable(registry.get_entry(name).handler), "Member control handler missing")
+    finally:
+        owner.require_owner = original
+    from gateway.owner_delegation import TOOLS as delegation_tools
+    from toolsets import TOOLSETS
+    require("owner_delegation" in TOOLSETS["kanban"]["includes"], "Normal member catalog cannot delegate")
+    for name in delegation_tools:
+        require(registry.get_entry(name) is not None and callable(registry.get_entry(name).handler), "Member delegation handler missing")
+    return ["native_manage_registration", "owner_tool_discovery", "new_member_recovery_catalog", "normal_member_delegation_registration"]
 
 
 def isolated_child(lane, root):
