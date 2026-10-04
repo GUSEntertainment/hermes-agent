@@ -94,8 +94,15 @@ def controller_probe():
         receipt = execute(operation)
         require(receipt.get("ok") and receipt.get("status") == "ready", "Native continuation failed")
         require(kb.get_task(conn, triage).consecutive_failures == 1, "Continuation erased failure history")
+        fresh = kb.create_task(conn, title="New specified local work", body="Read a local receipt", assignee="maker", triage=True)
+        kb.add_comment(conn, fresh, "owner", "Authorized to start this new specified local work")
+        fields = describe(conn, fresh)
+        require(fields["initial_triage"], "New triage was not distinguished from stopped work")
+        op = dict(action="start_triage", task_id=fresh, reason="Existing local work authorized", expected_state=fields["expected_state"], evidence={"authorization_comment_id": fields["expected_latest_comment_id"]})
+        require(execute(dict(op, dry_run=True))["dry_run"], "New triage preview failed")
+        require(execute(op)["status"] == "ready", "New specified triage did not become ready")
     return ["native_archive_preserves_evidence", "native_restore_preserves_pause", "dependency_release",
-            "unfinished_prerequisite_retained", "native_evidence_bound_continuation"]
+            "unfinished_prerequisite_retained", "native_evidence_bound_continuation", "native_initial_triage_start"]
 
 
 def gateway_probe():

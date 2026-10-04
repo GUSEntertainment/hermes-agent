@@ -1,6 +1,6 @@
 --- a/skills/devops/kanban-operations/SKILL.md
 +++ b/skills/devops/kanban-operations/SKILL.md
-@@ -6,7 +6,22 @@
+@@ -6,7 +6,23 @@
  
  # Kanban Operations
  
@@ -9,8 +9,9 @@
 +
 +The main Margot owner session now has `kanban_manage`. After `kanban_show`, use
 +`board_administration.native.expected_state` for one exact action: `archive`,
-+`restore`, `unblock`, `resume_triage`, `unlink_dependency`, or `recover_review`.
-+For resume/review, copy the native evidence fields and the actual existing
++`restore`, `unblock`, `start_triage`, `resume_triage`, `unlink_dependency`, or `recover_review`.
++For `native.initial_triage=true`, use `start_triage` with the same-card authorization comment. For stopped triage use `resume_triage`.
++For triage/review, copy the native evidence fields and the actual existing
 +same-card authorization/reviewer comment IDs; preview with `dry_run=true`, then
 +apply once with false. Stale state means reread, not override. Preserve actual
 +external-action restrictions, failed reviews and private account custody.

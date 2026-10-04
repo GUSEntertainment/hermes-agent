@@ -67,3 +67,16 @@ The live gateway switch script is not changed by these assets. The release
 owner must wire a successful preflight as a prerequisite before activation;
 the existing startup-health rollback remains a separate check. Always preserve
 the previous verified gateway/controller pair and the exact generated package.
+
+Current packaged release: `releases/20261004-native-owner-v2`. The installed
+controller wrapper selects its controller; the switch script runs the maintained
+preflight before interrupting the gateway. The preflight also distinguishes new
+specified triage (`start_triage`) from stopped-card recovery (`resume_triage`).
+A no-op unblock is an explicit error, never a successful receipt.
+
+Live acceptance on October 4 verified Margot invoking native archival and
+preserving the obsolete card history. The attempted worker acceptance did not
+start: its new-triage fixture was routed to stopped-task recovery. Two bounded API
+turns ended, no worker ran, and both fixture cards were retired. This package does
+not claim a successful live worker/dependency chain. The new-triage correction
+passed deterministic tests; no further paid acceptance run was started.
