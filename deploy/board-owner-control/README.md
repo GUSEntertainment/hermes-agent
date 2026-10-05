@@ -331,7 +331,7 @@ hold remains accountable after a later native re-block; terminal work stops it.
 Twenty-seven focused backend tests and six app notice tests passed. The
 independent review checked the superseded-source wake path and delivery-mode
 containment. App bridge commit `6075066c4d` pins the source-binding module as
-well as the existing passive reader. Two old Chris cards were attached to his
+well as the existing passive reader. Three old Chris cards were attached to his
 verified private Telegram DM by a one-time local-owner repair from existing
 SessionDB/registry/identity evidence; their tasks and completion routes did not
 change. The private receipt is at
