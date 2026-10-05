@@ -1,0 +1,193 @@
+--- a/gateway/owner_attention_binding.py
++++ b/gateway/owner_attention_binding.py
+@@ -24,6 +24,38 @@
+     return conn.execute('SELECT * FROM owner_attention_sources WHERE task_id=?',(task_id,)).fetchone()
+ 
+ 
++def _check_binding_owner(binding, requester):
++    """A private original/attention return never changes recipient ownership."""
++    if binding.get('kind') == work.KIND:
++        owners = (binding.get('principal'), binding.get('authority', {}).get('owner'))
++    elif binding.get('kind') == 'native-api-return-v1':
++        authority = binding.get('authority') or {}
++        owners = tuple(authority[k] for k in ('owner', 'principal') if k in authority)
++        if not owners:
++            raise PermissionError('Native follow-up source owner is missing')
++    else:
++        return
++    if not owners or any(owner != requester for owner in owners):
++        raise PermissionError('Follow-up belongs to another private task owner')
++
++
++def _require_task_owner(conn, task_id, requester, board):
++    """Administrative board access is not permission to receive its notices."""
++    authority = work.enrollment(requester)  # Fresh protected enrollment, including root.
++    if authority['board'] != board:
++        raise PermissionError('Follow-up board belongs to another owner')
++    control._validate_member_connection(conn, {'board': authority['board']})
++    task = conn.execute('SELECT tenant,security_realm FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is None:
++        raise PermissionError('Follow-up task is missing')
++    for value, prefix in ((task['tenant'], 'app:private:'), (task['security_realm'], 'owner:')):
++        if isinstance(value, str) and value.startswith(prefix) and value != prefix + requester:
++            raise PermissionError('Follow-up belongs to another private task owner')
++    original = conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?', (task_id,)).fetchone()
++    if original is not None:
++        _check_binding_owner(json.loads(original[0]), requester)
++
++
+ def bind_current(conn, task_id, *, action):
+     if action not in {'work','block','follow_up'}:
+         raise ValueError('Unsupported follow-up binding action')
+@@ -37,6 +69,7 @@
+     if not session:
+         raise PermissionError('No authenticated current conversation for follow-up')
+     requester = grant['principal'] if grant else 'chris'
++    _require_task_owner(conn, task_id, requester, board)
+     from hermes_cli.task_return_intents import capture
+     binding = capture(conn,session_id=session,request={'task_id':task_id,'action':action,'tenant':work.tenant(requester)})
+     if not binding or binding.get('board') != board or binding.get('target',{}).get('platform') not in {'telegram','photon','api_server'}:
+@@ -53,6 +86,10 @@
+     board=_connection_board(conn,grant)
+     if source.get('board')!=board or kb.get_task(conn,task_id) is None:
+         raise PermissionError('Follow-up source outside current owner board')
++    _require_task_owner(conn, task_id, source['requester'], board)
++    if source['binding'].get('board') != board:
++        raise PermissionError('Follow-up return is outside the owner board')
++    _check_binding_owner(source['binding'], source['requester'])
+     target = dict(source['binding']['target'])
+     digest = work.digest(source)
+     target['delivery_metadata'] = {**target.get('delivery_metadata',{}), MARKER:digest}
+@@ -88,7 +125,11 @@
+     from hermes_cli.owner_work_preparation import _connection_board
+     if _connection_board(conn,grant) != source['board']:
+         raise PermissionError('Follow-up moved outside enrolled board')
++    _require_task_owner(conn, sub['task_id'], source['requester'], source['board'])
+     binding=source['binding'];meta=sub.get('delivery_metadata') or {}
++    if binding.get('board') != source['board']:
++        raise PermissionError('Follow-up return is outside the owner board')
++    _check_binding_owner(binding, source['requester'])
+     if isinstance(meta,str):meta=json.loads(meta)
+     if meta.get(MARKER) != work.digest(source):
+         raise PermissionError('Follow-up binding changed')
+--- a/tests/gateway/test_owner_attention_binding.py
++++ b/tests/gateway/test_owner_attention_binding.py
+@@ -12,6 +12,12 @@
+ @pytest.fixture
+ def root_board(tmp_path,monkeypatch):
+     root=tmp_path.resolve();monkeypatch.setenv('HERMES_HOME',str(root));monkeypatch.setattr(control,'ROOT',root)
++    monkeypatch.setattr(work,'ROOT',root)
++    from gateway import app_business_authority
++    def enrollment(principal, anchor):
++        assert principal == 'chris' and anchor == root
++        return dict(owner='chris',profile='chris',board='chris-home',fingerprint='fixture')
++    monkeypatch.setattr(app_business_authority,'canonical_enrollment',enrollment)
+     path=root/'kanban/boards/chris-home/kanban.db';conn=kb.connect(path)
+     env={'HERMES_SESSION_ID':'20260802_104816_357e6852','HERMES_SESSION_KEY':'agent:main:telegram:dm:own','HERMES_SESSION_PLATFORM':'telegram','HERMES_SESSION_CHAT_ID':'own','HERMES_SESSION_CHAT_TYPE':'dm','HERMES_SESSION_USER_ID':'own','HERMES_SESSION_MESSAGE_ID':'123','HERMES_SESSION_PROFILE':'default'}
+     from gateway import josh_board_authority
+@@ -106,3 +112,105 @@
+     assert len(attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW))==1
+     conn.execute("UPDATE kanban_notify_subs SET chat_id='foreign' WHERE task_id=?",(tid,));conn.commit()
+     assert attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW)==[]
++
++
++def _chris_source(env, catalog):
++    catalog['chris']=dict(owner='chris',profile='chris',board='chris-home',fingerprint='chris-fixture')
++    env.clear()
++    env.update(HERMES_SESSION_ID='current-chris-session',HERMES_SESSION_KEY='agent:main:telegram:dm:chris',
++               HERMES_SESSION_PLATFORM='telegram',HERMES_SESSION_CHAT_ID='chris',
++               HERMES_SESSION_CHAT_TYPE='dm',HERMES_SESSION_USER_ID='chris',
++               HERMES_SESSION_MESSAGE_ID='123',HERMES_SESSION_PROFILE='default')
++
++
++def test_chris_administrative_access_cannot_attach_or_deliver_josh_private_followup(enrolled,monkeypatch):
++    root,catalog,env=enrolled
++    monkeypatch.setenv('HERMES_HOME',str(root));monkeypatch.setattr(control,'ROOT',root)
++    with request('joshgarcia'):
++        created=json.loads(work.create(INTENT))
++    tid=created['task_id']
++    with kb.connect(work.database('josh-home')) as conn:
++        assert kb.block_task(conn,tid,kind='needs_input',reason='Reconnect your private login')
++        original=conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]
++        original_subs=kb.list_notify_subs(conn,tid,include_internal_metadata=True)
++        before=[tuple(r) for r in conn.execute('SELECT * FROM tasks')]
++        _chris_source(env,catalog)
++        # Administrative board access is real and deliberately remains available.
++        assert control.require_owner() is None
++        from hermes_cli.owner_work_preparation import _connection_board
++        assert _connection_board(conn,None)=='josh-home'
++        monkeypatch.setattr(scope,'admitted_board',lambda board:board)
++        from hermes_cli.task_return_intents import capture
++        captured=capture(conn,session_id=env['HERMES_SESSION_ID'],request={'task_id':tid})
++        unsafe=dict(requester='chris',grant=None,board='josh-home',binding=captured)
++        with pytest.raises(PermissionError,match='board belongs to another owner'):
++            source.bind_current(conn,tid,action='follow_up')
++        with pytest.raises(PermissionError,match='board belongs to another owner'):
++            source._store(conn,tid,unsafe)
++        assert source.subscriptions(conn)==[]
++        assert before==[tuple(r) for r in conn.execute('SELECT * FROM tasks')]
++        assert original==conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]
++        assert original_subs==kb.list_notify_subs(conn,tid,include_internal_metadata=True)
++        work.verify_return(conn,original_subs[0])
++        assert attention.collect(conn,original_subs,CONFIG,now=NOW)[0]['requester']=='joshgarcia'
++        # A row written by the old bug must be refused again at delivery time.
++        target={**captured['target'],'delivery_mode':'notify'}
++        target['delivery_metadata']={**target['delivery_metadata'],source.MARKER:work.digest(unsafe)}
++        sub=dict(task_id=tid,**target)
++        source._schema(conn)
++        conn.execute('INSERT INTO owner_attention_sources VALUES(?,?,?,?,?,?)',
++                     (tid,'chris',work.encode(unsafe),source.identity(sub),work.encode(sub),NOW))
++        conn.commit()
++        with pytest.raises(PermissionError,match='board belongs to another owner'):
++            source.validate(conn,sub)
++        assert attention.collect(conn,[sub],CONFIG,now=NOW)==[]
++        work.verify_return(conn,original_subs[0])
++
++
++def test_missing_original_binding_does_not_authorize_chris_on_josh_board(enrolled,monkeypatch):
++    root,catalog,env=enrolled
++    monkeypatch.setenv('HERMES_HOME',str(root));monkeypatch.setattr(control,'ROOT',root)
++    with kb.connect(work.database('josh-home')) as conn:
++        tid=kb.create_task(conn,title='Unbound private-board task',initial_status='blocked')
++        _chris_source(env,catalog)
++        assert conn.execute('SELECT 1 FROM task_return_intents WHERE task_id=?',(tid,)).fetchone() is None
++        with pytest.raises(PermissionError,match='board belongs to another owner'):
++            source.bind_current(conn,tid,action='block')
++        assert source.subscriptions(conn)==[]
++
++
++@pytest.mark.parametrize('private_marker',['original_return','tenant','realm'])
++def test_private_task_owner_cannot_be_overridden_on_own_board(root_board,private_marker):
++    conn,tid,_env=root_board
++    if private_marker=='original_return':
++        binding={'kind':'native-api-return-v1','authority':{'owner':'joshgarcia'},'board':'chris-home'}
++        conn.execute('INSERT INTO task_return_intents(task_id,binding_json) VALUES(?,?)',(tid,json.dumps(binding)))
++    elif private_marker=='tenant':
++        conn.execute("UPDATE tasks SET tenant='app:private:joshgarcia' WHERE id=?",(tid,))
++    else:
++        conn.execute("UPDATE tasks SET security_realm='owner:joshgarcia' WHERE id=?",(tid,))
++    conn.commit()
++    with pytest.raises(PermissionError,match='another private task owner'):
++        source.bind_current(conn,tid,action='follow_up')
++    assert source.subscriptions(conn)==[]
++
++
++def test_josh_own_followup_succeeds_and_fresh_board_move_revokes(enrolled,monkeypatch):
++    root,catalog,_env=enrolled
++    monkeypatch.setenv('HERMES_HOME',str(root));monkeypatch.setattr(control,'ROOT',root)
++    with request('joshgarcia'):
++        created=json.loads(work.create(INTENT))
++    with kb.connect(work.database('josh-home')) as conn:
++        tid=created['task_id']
++        original=conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]
++        assert kb.block_task(conn,tid,kind='needs_input',reason='Reconnect your private login')
++        with request('joshgarcia'):
++            assert source.bind_current(conn,tid,action='follow_up')['follow_up_bound']
++        sub=source.subscriptions(conn)[0]
++        assert source.validate(conn,sub)['requester']=='joshgarcia'
++        assert attention.collect(conn,[sub],CONFIG,now=NOW)[0]['requester']=='joshgarcia'
++        assert original==conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]
++        catalog['joshgarcia']['board']='other-home'
++        with pytest.raises(PermissionError,match='enrollment changed'):
++            source.validate(conn,sub)
++        assert attention.collect(conn,[sub],CONFIG,now=NOW)==[]

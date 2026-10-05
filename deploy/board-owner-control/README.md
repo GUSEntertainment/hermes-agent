@@ -337,3 +337,16 @@ SessionDB/registry/identity evidence; their tasks and completion routes did not
 change. The private receipt is at
 `~/.hermes/private/board-owner-control/owner-attention/legacy-source-repair-receipt.json`.
 No paid model calls or worker retry jobs were used for this repair.
+
+
+## Follow-up ownership regression correction
+
+`releases/20261004-owner-attention-scope` prevents an administrative repair on
+another member's board from attaching the administrator's inbox. Follow-up
+creation and delivery both check fresh canonical enrollment, actual board path,
+private tenant/realm and original return principal. Administrative board control
+and original worker/completion/Desk returns are unchanged. Twelve binding tests
+pass, including real Josh private return preservation, root cross-board rejection,
+old unsafe-source rejection, absent-intent rejection and enrollment revocation.
+The existing attention suite and paired deployment preflights pass. The app
+bridge pins this helper in commit `6aba602`; no provider calls were used.
