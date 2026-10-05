@@ -1,0 +1,97 @@
+{
+  "format": 1,
+  "created_at": "2026-10-05T02:26:24.981512+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-attention-scope",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-instruction-recovery",
+      "files": [
+        {
+          "path": "gateway/member_board_tools.py",
+          "before_sha256": "60440a5aa956567934da27c056476a5976633533b4cab05f5fa184793274ece5",
+          "after_sha256": "a95ca09058cc1706c8b213f333fafc1009c58cdf508e7149b6161bebc1191cb2"
+        },
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "414bfe8a40957e36b7a14c746dd02edf1291d18571b04f2478ac1cf0fd39239b",
+          "after_sha256": "f5ada96ec21eec144c9d6ba8f52e74a63b73c6367ee2378dd6792ae4e80f6626"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "7d1ca3fcb1d046b7898a2a7c2d2af35d523bd6b98060897853b4ef52b4647804",
+          "after_sha256": "8c48f2b8abc72fbdae51c85ee72a7a0b4b21b2359cb8049c22b36e236b723ef1"
+        },
+        {
+          "path": "hermes_cli/owner_workflow.py",
+          "before_sha256": "bb518268b5df589b2b022da1fb9828384fff8cf2e1d6afe6bf673408b393fce4",
+          "after_sha256": "e94bf47ce4d010b5a00e8f8ca172937813b12470c7d4780e2b21f26a1c51587a"
+        },
+        {
+          "path": "tests/gateway/test_member_board_tools.py",
+          "before_sha256": "6d35b23d32b673493b46241a73bf2a8736263eb781a15bd364b628ae3b7e15d5",
+          "after_sha256": "26e91e5be5b51d7e2cd72172e5e0f3aaa056c7ee4e901f7de44542623de08f07"
+        },
+        {
+          "path": "tests/hermes_cli/test_block_failure_identity.py",
+          "before_sha256": null,
+          "after_sha256": "0370618319f2867f7afa22d5c19a1a1ed4a0fc097f26f147b4ce856a733a4f9a"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": "6db6dbfc9caf9bcbf457f89923623be7e19dc1d409b6fdf7239cad971782f752",
+          "after_sha256": "947134a17951e7ddbfabeb636d7d778fc769ff89ab21e02af75ff759a1eb130f"
+        },
+        {
+          "path": "tests/hermes_cli/test_simple_owner_work.py",
+          "before_sha256": "7977e52d0dfc6f797e5b6a57429163fa3242bbb211f09e765c8f6b486de4a469",
+          "after_sha256": "f617aea5fb59e463a43c234479d09e54f5ba0958914216dc63359608732c3249"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "53799f7cfbc897dc89f50334c7e150972284d284de2944194eb81c2390a68635",
+          "after_sha256": "094efdd201ae4c4e5b5ac56a2c0b6cc9d855ebffa48f65da96e5a4b839437cad"
+        }
+      ],
+      "patch_sha256": "40b4f26d653c9e5e1064e6e5571cf5e08c80921e8826d4e3d2fed4e200117da1",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-attention-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-instruction-recovery-controller",
+      "files": [
+        {
+          "path": "hermes_cli/kanban_db.py",
+          "before_sha256": "469dffb296973eb44807a328f22379e537c789da7c0b6be3e6a2e19899cb1dba",
+          "after_sha256": "b9fa567764b156233ba54abce0541e4824b947ad27bfb046385847ae9e88eda0"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "7d1ca3fcb1d046b7898a2a7c2d2af35d523bd6b98060897853b4ef52b4647804",
+          "after_sha256": "8c48f2b8abc72fbdae51c85ee72a7a0b4b21b2359cb8049c22b36e236b723ef1"
+        },
+        {
+          "path": "hermes_cli/owner_workflow.py",
+          "before_sha256": "bb518268b5df589b2b022da1fb9828384fff8cf2e1d6afe6bf673408b393fce4",
+          "after_sha256": "e94bf47ce4d010b5a00e8f8ca172937813b12470c7d4780e2b21f26a1c51587a"
+        },
+        {
+          "path": "tests/hermes_cli/test_block_failure_identity.py",
+          "before_sha256": null,
+          "after_sha256": "0370618319f2867f7afa22d5c19a1a1ed4a0fc097f26f147b4ce856a733a4f9a"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_work_preparation.py",
+          "before_sha256": "6db6dbfc9caf9bcbf457f89923623be7e19dc1d409b6fdf7239cad971782f752",
+          "after_sha256": "947134a17951e7ddbfabeb636d7d778fc769ff89ab21e02af75ff759a1eb130f"
+        },
+        {
+          "path": "tests/hermes_cli/test_simple_owner_work.py",
+          "before_sha256": "7977e52d0dfc6f797e5b6a57429163fa3242bbb211f09e765c8f6b486de4a469",
+          "after_sha256": "f617aea5fb59e463a43c234479d09e54f5ba0958914216dc63359608732c3249"
+        }
+      ],
+      "patch_sha256": "2dc2acd116edb4ea2ab3736514e3eeda36ca23c410da5a22da3b77579544369f",
+      "patch": "controller.patch"
+    }
+  }
+}

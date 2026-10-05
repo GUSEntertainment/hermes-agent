@@ -350,3 +350,30 @@ pass, including real Josh private return preservation, root cross-board rejectio
 old unsafe-source rejection, absent-intent rejection and enrollment revocation.
 The existing attention suite and paired deployment preflights pass. The app
 bridge pins this helper in commit `6aba602`; no provider calls were used.
+
+
+## Instruction mismatch diagnosis and correction (October 4)
+
+`releases/20261004-instruction-recovery` adds a read-only `instruction_recovery`
+projection to the shared native/member card reader. It shows the verified current
+work order or prepared brief, the exact two recent worker failure reasons and
+their identities. Original requests, action holds and private board checks stay
+authoritative. The normal owner recovery context now explicitly directs an owner
+to fix conflicting internal briefs/tools/sources before handing work back, within
+the existing recovery budget. This reuses `work`, `prepare` and department
+`kanban_handoff`; no extra core tool, background model sweep or new automatic
+retry allowance is introduced. Existing passive owner attention keeps real
+unresolved questions attached to the source conversation.
+
+The changed-brief tests use real temporary board/controller operations and verify
+that worker context changes while original no-send instructions and failure
+history survive. These are deterministic acceptance checks, not a claim that
+every live blocked project or idle Margot conversation has recovered. The broad
+legacy owner-workflow test file has readiness-fixture failures; a representative
+`maker_not_ready`/OperationalError failure reproduces on the unchanged baseline.
+The focused change tests and paired deployment preflight are the release checks.
+
+The cumulative blocked-attempt ceiling cannot be reset by changed error wording
+or categories, including legacy unblock. Actual failure fingerprints are for
+diagnosis; the stop receipt distinguishes repeated failures from exhausted
+blocked attempts. Successful completion resets this existing counter.
