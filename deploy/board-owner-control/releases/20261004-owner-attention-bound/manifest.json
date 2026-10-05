@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "created_at": "2026-10-05T01:42:09.440842+00:00",
+  "lanes": {
+    "gateway": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-attention",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-attention-bound",
+      "files": [
+        {
+          "path": "gateway/kanban_watchers.py",
+          "before_sha256": "040758ed668ad64082e1c3bbf9822e2cb570372ffe93babbf7e34be6b607ecb5",
+          "after_sha256": "44f61f040cc82ebdcf31a39324b6ddd4bca782767437eca907f288ff2738873b"
+        },
+        {
+          "path": "gateway/owner_attention.py",
+          "before_sha256": "8af74f28523a989f8e0552e89b7692bd2bb2b4c163404e011c19e0de5475e83b",
+          "after_sha256": "61b90c4d852637d865efb4a93464400ce77f3c826019b550eece1c664ace0368"
+        },
+        {
+          "path": "gateway/owner_attention_app.py",
+          "before_sha256": "778f6c4e763c669963ae8abc96fe057309f2556dfa70c65cd5d94db1987bbc5c",
+          "after_sha256": "06548daa0ec57fe69348ce36bb3b2236dc3d21e40510d767f65d3f122bca5737"
+        },
+        {
+          "path": "gateway/owner_attention_binding.py",
+          "before_sha256": null,
+          "after_sha256": "e5a1335f51c43759219aa713c0c39957af47fc63bf13ee30f8c59000388f7229"
+        },
+        {
+          "path": "tests/gateway/test_owner_attention_binding.py",
+          "before_sha256": null,
+          "after_sha256": "861f9c8702d0a45d95291dcdda4ebe9e8f88fe3a9042584ef382c775634532a9"
+        },
+        {
+          "path": "tools/kanban_tools.py",
+          "before_sha256": "3e91aaa856cfdba657fb1a5f44b3be805c724523c1e95ef77680ebf92caf72a0",
+          "after_sha256": "53799f7cfbc897dc89f50334c7e150972284d284de2944194eb81c2390a68635"
+        }
+      ],
+      "patch_sha256": "2edba9af225792bad8cc1b61e0b6093621398e125584e85976bd8f961622d0c3",
+      "patch": "gateway.patch"
+    },
+    "controller": {
+      "baseline": "/Users/Chris/.hermes/releases/hermes-agent-20261004-reviewer-assignment-controller",
+      "candidate": "/Users/Chris/.hermes/releases/hermes-agent-20261004-owner-attention-controller",
+      "files": [
+        {
+          "path": "gateway/gus_admin_cli.py",
+          "before_sha256": "3f8bc9b51b9e0f67f0346d150062b48f520426e5ab76406deaee103f02d54670",
+          "after_sha256": "5ee3922875ae96c01bb01a9a999342bfb0c790f70deb9318de189fe35bbd9811"
+        },
+        {
+          "path": "hermes_cli/board_owner_manage.py",
+          "before_sha256": "92701dbacd794ccbec97d191997e44417ffd344c57baf481bfa5519bdc757dc0",
+          "after_sha256": "00fda3f0cd21916e3b8539758c7df3431bc7919119c2c5e6b9faba328536598c"
+        },
+        {
+          "path": "hermes_cli/owner_board_hold.py",
+          "before_sha256": null,
+          "after_sha256": "9c6cd1d730dad74745eab403db699741263c5165786b7b3d425213003236c188"
+        },
+        {
+          "path": "hermes_cli/owner_work_start.py",
+          "before_sha256": "5250b1311df995b954b2c270b816131d8ac7ff63fe092110c38d4b16b66b2348",
+          "after_sha256": "7d1ca3fcb1d046b7898a2a7c2d2af35d523bd6b98060897853b4ef52b4647804"
+        },
+        {
+          "path": "tests/hermes_cli/test_owner_board_hold.py",
+          "before_sha256": null,
+          "after_sha256": "b67df9514604763b22ee66d933b2cc53a772cf5796210d862bce3e3b62aea156"
+        }
+      ],
+      "patch_sha256": "815f99766aaf781c54d42b5f891e0ccaf72faed21cbd3ef615db709f9d1983e9",
+      "patch": "controller.patch"
+    }
+  }
+}

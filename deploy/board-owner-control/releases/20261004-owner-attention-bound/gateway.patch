@@ -1,0 +1,422 @@
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -577,7 +577,8 @@
+                                 include_unowned=include_unowned,
+                             ) == 0 and not (
+                                 (_attention_config.get("kanban") or {}).get("owner_attention", {}).get("enabled") is True
+-                                and _kb.count_notify_subs(board=slug, platform="api_server") > 0
++                                and (_kb.count_notify_subs(board=slug, platform="api_server") > 0
++                                     or __import__('gateway.owner_attention_binding',fromlist=['count_sources']).count_sources(slug) > 0)
+                             ):
+                                 logger.debug(
+                                     "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
+@@ -649,6 +650,10 @@
+                                 for api_sub in _kb.list_notify_subs(conn, include_internal_metadata=True):
+                                     if api_sub.get("platform") == "api_server":
+                                         attention_subs[notification_identity(api_sub)] = api_sub
++                                from gateway.owner_attention_binding import subscriptions as bound_attention_subscriptions
++                                for bound_sub in bound_attention_subscriptions(conn):
++                                    if bound_sub.get("platform") == "api_server" or bound_sub.get("notifier_profile") in notifier_profiles:
++                                        attention_subs[notification_identity(bound_sub)] = bound_sub
+                                 for attention in collect_owner_attention(conn, list(attention_subs.values()), _attention_config):
+                                     deliveries.append({"attention": attention, "board": slug})
+                             if not subs:
+--- a/gateway/owner_attention.py
++++ b/gateway/owner_attention.py
+@@ -52,8 +52,10 @@
+         raise ValueError('Owner hold is no longer idle')
+     from hermes_cli.owner_work_preparation import _idle
+     _idle(conn, dict(conn.execute('SELECT * FROM tasks WHERE id=?',(task.id,)).fetchone()))
++    from gateway.owner_attention_binding import validate as validate_follow_up
++    follow_up = validate_follow_up(conn, sub)
+     current = kb.list_notify_subs(conn, sub['task_id'], include_internal_metadata=True)
+-    if not any(identity(row) == identity(sub) for row in current):
++    if follow_up is None and not any(identity(row) == identity(sub) for row in current):
+         raise PermissionError('Owner notification source was revoked')
+     meta = _json(sub.get('delivery_metadata'))
+     if meta.get('_kanban_inherited_subscription'):
+@@ -75,16 +77,40 @@
+         actor = _json(order[0]).get('actor') if order else None
+         requester = ('chris' if actor == 'default' else actor) or (
+             private_binding.get('principal') if private_binding.get('kind') == work.KIND else None)
++        terminal=conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=? AND kind IN ('completed','archived','cancelled') AND id<?",(task.id,row['id'])).fetchone()[0]
++        if not requester:
++            for held in conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='blocked' AND id>? AND id<? ORDER BY id DESC",(task.id,terminal,row['id'])):
++                candidate=_json(held['payload'])
++                if opted(candidate):
++                    requester=candidate['requester'];break
++        requester = follow_up['requester'] if follow_up else requester
++        if not requester and private_binding.get('kind') == 'gateway-return-v1' and private_binding.get('profile') == 'default':
++            requester='chris'
+         if not requester and private_binding.get('kind') == 'native-api-return-v1':
+             authority = private_binding.get('authority') or {}
+             requester = authority.get('principal') or authority.get('owner')
+         if not requester:
+             raise ValueError('Owner did not request follow-up on this blocker')
+         payload = {**payload, 'requester':requester}
+-    if private_binding.get('kind') == work.KIND:
++    if follow_up is not None:
++        if follow_up['requester'] != payload['requester']:
++            raise PermissionError('Follow-up requester changed')
++    elif private_binding.get('kind') == work.KIND:
+         if private_binding.get('principal') != payload['requester']:
+             raise PermissionError('Blocker requester differs from private source')
+         work.verify_return(conn, sub)  # includes fresh enrollment, board and target
++    elif private_binding.get('kind') == 'gateway-return-v1':
++        from hermes_cli.owner_work_preparation import _connection_board
++        target=private_binding.get('target') or {}
++        if (payload['requester']!='chris' or private_binding.get('profile')!='default'
++                or private_binding.get('board')!=_connection_board(conn,None)
++                or task.session_id!=private_binding.get('session_id')):
++            raise PermissionError('Native gateway follow-up source changed')
++        for key in ('platform','chat_id','thread_id','user_id','user_id_alt','chat_type','notifier_profile','delivery_mode'):
++            if (sub.get(key) or None)!=(target.get(key) or None):
++                raise PermissionError('Native gateway return target changed')
++        if any(meta.get(k)!=v for k,v in target.get('delivery_metadata',{}).items()):
++            raise PermissionError('Native gateway return source metadata changed')
+     elif sub.get('platform') == 'api_server':
+         from gateway.owner_attention_app import source_binding
+         source_binding(conn, sub, payload['requester'])
+@@ -251,6 +277,11 @@
+         return False
+     if sub.get('platform') not in {'telegram','photon','api_server'}:
+         return False
++    from gateway.owner_attention_binding import _row as bound_follow_up
++    if bound_follow_up(conn,sub['task_id']) is not None:
++        # Once attention has an explicit owner destination, superseded legacy
++        # subscriptions never regain model-wake/delivery authority on failure.
++        return True
+     try:
+         current = _validate(conn, sub)
+         return event.id <= current['event_id']
+--- a/gateway/owner_attention_app.py
++++ b/gateway/owner_attention_app.py
+@@ -15,14 +15,21 @@
+     actual = Path(next(r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'))
+     if actual != work.database(enrolled['board']) or sub.get('platform') != 'api_server':
+         raise PermissionError('Canonical owner app board required')
+-    if not any(identity(s) == identity(sub) for s in kb.list_notify_subs(conn, item['task_id'], include_internal_metadata=True)):
++    from gateway.owner_attention_binding import validate as validate_follow_up
++    follow_up = validate_follow_up(conn, sub, owner)
++    if follow_up is None and not any(identity(s) == identity(sub) for s in kb.list_notify_subs(conn, item['task_id'], include_internal_metadata=True)):
+         raise PermissionError('Original app subscription changed')
+     row = conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?', (item['task_id'],)).fetchone()
+     binding = json.loads(row[0]) if row else None
++    if follow_up is not None:
++        binding = follow_up['binding']
+     meta = attention._json(sub.get('delivery_metadata'))
+     if meta.get('_kanban_inherited_subscription'):
+         raise PermissionError('Inherited app destination denied')
+-    if binding and binding.get('kind') == work.KIND:
++    if follow_up is not None:
++        if binding.get('kind') not in {work.KIND, 'native-api-return-v1'}:
++            raise PermissionError('Current app follow-up source required')
++    elif binding and binding.get('kind') == work.KIND:
+         work.verify_return(conn, sub)
+         _, task, _, binding = work.verify_task(conn, item['task_id'])
+         if binding.get('principal') != owner:
+@@ -49,7 +56,7 @@
+         return dict(kind='handoff', taskId=item['task_id'], board=enrolled['board'])
+     target = binding.get('target', {})
+     for key in ('platform','chat_id','notifier_profile','user_id','user_id_alt','chat_type','delivery_mode'):
+-        if sub.get(key) != target.get(key):
++        if not (key == 'delivery_mode' and follow_up is not None) and sub.get(key) != target.get(key):
+             raise PermissionError('App subscription changed')
+     if (sub.get('thread_id') or None) != (target.get('thread_id') or None):
+         raise PermissionError('App thread changed')
+--- /dev/null
++++ b/gateway/owner_attention_binding.py
+@@ -0,0 +1,127 @@
++"""Follow-up ownership from the actual authenticated caller, not model routes.
++
++Separate from immutable original completion/document return intents. This binds
++only passive attention; it never changes the task, claims work or grants actions.
++"""
++import json
++from pathlib import Path
++import time
++from gateway.kanban_delivery_receipts import identity
++from gateway import owner_delegation as work
++from hermes_cli import kanban_db as kb, board_owner_manage as control
++
++MARKER = '_owner_attention_binding'
++TABLE = 'owner_attention_sources'
++
++
++def _schema(conn):
++    conn.execute('CREATE TABLE IF NOT EXISTS owner_attention_sources(task_id TEXT PRIMARY KEY,requester TEXT NOT NULL,source_json TEXT NOT NULL,subscription TEXT NOT NULL,subscription_json TEXT NOT NULL,updated_at INTEGER NOT NULL)')
++
++
++def _row(conn, task_id):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?",(TABLE,)).fetchone():
++        return None
++    return conn.execute('SELECT * FROM owner_attention_sources WHERE task_id=?',(task_id,)).fetchone()
++
++
++def bind_current(conn, task_id, *, action):
++    if action not in {'work','block','follow_up'}:
++        raise ValueError('Unsupported follow-up binding action')
++    grant = control.require_owner()
++    from hermes_cli.owner_work_preparation import _connection_board
++    board = _connection_board(conn, grant)
++    if kb.get_task(conn,task_id) is None:
++        raise ValueError('Unknown task on the authenticated board')
++    from gateway.session_context import get_bound_session_env as get
++    session = get('HERMES_SESSION_ID')
++    if not session:
++        raise PermissionError('No authenticated current conversation for follow-up')
++    requester = grant['principal'] if grant else 'chris'
++    from hermes_cli.task_return_intents import capture
++    binding = capture(conn,session_id=session,request={'task_id':task_id,'action':action,'tenant':work.tenant(requester)})
++    if not binding or binding.get('board') != board or binding.get('target',{}).get('platform') not in {'telegram','photon','api_server'}:
++        raise PermissionError('No supported authenticated follow-up conversation')
++    return _store(conn, task_id, dict(requester=requester, grant=grant, board=board, binding=binding))
++
++
++def _store(conn, task_id, source):
++    """Internal operator/gateway storage; not a model-callable destination API."""
++    from hermes_cli.owner_work_preparation import _connection_board
++    grant=control.require_owner()
++    if source.get('grant') != grant or source.get('requester') != (grant['principal'] if grant else 'chris'):
++        raise PermissionError('Follow-up source does not belong to the current owner')
++    board=_connection_board(conn,grant)
++    if source.get('board')!=board or kb.get_task(conn,task_id) is None:
++        raise PermissionError('Follow-up source outside current owner board')
++    target = dict(source['binding']['target'])
++    digest = work.digest(source)
++    target['delivery_metadata'] = {**target.get('delivery_metadata',{}), MARKER:digest}
++    target['delivery_mode'] = 'notify'
++    _schema(conn)
++    with kb.write_txn(conn):
++        if control.require_owner() != grant or _connection_board(conn,grant) != board:
++            raise PermissionError('Owner context changed before follow-up binding')
++        sub=dict(task_id=task_id, **target)
++        conn.execute('INSERT INTO owner_attention_sources VALUES(?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET requester=excluded.requester,source_json=excluded.source_json,subscription=excluded.subscription,subscription_json=excluded.subscription_json,updated_at=excluded.updated_at',
++            (task_id,source['requester'],work.encode(source),identity(sub),work.encode(sub),int(time.time())))
++        validate(conn,sub,source['requester'])
++    return {'follow_up_bound':True,'follow_up_surface':target['platform'],'task_id':task_id,'board':board,'worker_started':False}
++
++
++def validate(conn, sub, requester=None):
++    """Fresh enrollment and exact subscription checks before passive delivery."""
++    row=_row(conn,sub['task_id'])
++    if row is None:
++        return None
++    source=json.loads(row['source_json'])
++    if requester is not None and source['requester'] != requester:
++        raise PermissionError('Follow-up belongs to another owner')
++    if row['requester'] != source['requester'] or row['subscription'] != identity(sub):
++        raise PermissionError('Superseded or changed follow-up conversation')
++    grant=source['grant']
++    if grant is not None:
++        if control.refresh_member_grant(grant) != grant or grant['principal'] != source['requester']:
++            raise PermissionError('Follow-up owner enrollment changed')
++        control._validate_member_connection(conn,grant)
++    elif source['requester'] != 'chris':
++        raise PermissionError('Invalid root follow-up owner')
++    from hermes_cli.owner_work_preparation import _connection_board
++    if _connection_board(conn,grant) != source['board']:
++        raise PermissionError('Follow-up moved outside enrolled board')
++    binding=source['binding'];meta=sub.get('delivery_metadata') or {}
++    if isinstance(meta,str):meta=json.loads(meta)
++    if meta.get(MARKER) != work.digest(source):
++        raise PermissionError('Follow-up binding changed')
++    target=binding['target']
++    for key in ('platform','chat_id','thread_id','user_id','user_id_alt','chat_type','notifier_profile'):
++        if (sub.get(key) or None) != (target.get(key) or None):
++            raise PermissionError('Follow-up target changed')
++    if binding['kind']==work.KIND:
++        work.custody_authority(binding)  # fresh canonical API/Photon owner identity
++    elif binding['kind']=='native-api-return-v1':
++        from gateway.app_business_authority import current
++        authority=binding['authority']
++        if authority.get('scope_contract')=='margot-owner-private-v1':
++            from gateway.app_private_board_authority import current as private_current
++            fresh=private_current(binding['profile'],source['requester'],root=control.ROOT)
++        else:
++            fresh=current(binding['profile'],source['requester']) if authority.get('scope_contract')=='gus-company-work-v1' else work.enrollment(source['requester'])
++        if authority!=fresh:raise PermissionError('Native app follow-up enrollment changed')
++    elif binding['kind']!='gateway-return-v1' or source['requester']!='chris' or binding['profile'] not in ('default',''):
++        raise PermissionError('Unsupported follow-up source authority')
++    return source
++
++
++def subscriptions(conn):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?",(TABLE,)).fetchone():
++        return []
++    return [json.loads(r[0]) for r in conn.execute('SELECT subscription_json FROM owner_attention_sources')]
++
++
++def count_sources(board):
++    import sqlite3
++    path=kb.kanban_db_path(board=board)
++    if not path.is_file():return 0
++    with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True) as conn:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?",(TABLE,)).fetchone():return 0
++        return conn.execute('SELECT COUNT(*) FROM owner_attention_sources').fetchone()[0]
+--- /dev/null
++++ b/tests/gateway/test_owner_attention_binding.py
+@@ -0,0 +1,108 @@
++"""Trusted current caller binds passive follow-up without changing old returns."""
++import json
++from types import SimpleNamespace
++import pytest
++from gateway import owner_attention as attention, owner_attention_binding as source
++from gateway import owner_delegation as work, session_context as sc
++from hermes_cli import board_owner_manage as control, kanban_db as kb
++from tests.gateway.test_member_owner_delegation import enrolled, request, INTENT, scope
++from tests.gateway.test_owner_attention import CONFIG,NOW
++
++
++@pytest.fixture
++def root_board(tmp_path,monkeypatch):
++    root=tmp_path.resolve();monkeypatch.setenv('HERMES_HOME',str(root));monkeypatch.setattr(control,'ROOT',root)
++    path=root/'kanban/boards/chris-home/kanban.db';conn=kb.connect(path)
++    env={'HERMES_SESSION_ID':'20260802_104816_357e6852','HERMES_SESSION_KEY':'agent:main:telegram:dm:own','HERMES_SESSION_PLATFORM':'telegram','HERMES_SESSION_CHAT_ID':'own','HERMES_SESSION_CHAT_TYPE':'dm','HERMES_SESSION_USER_ID':'own','HERMES_SESSION_MESSAGE_ID':'123','HERMES_SESSION_PROFILE':'default'}
++    from gateway import josh_board_authority
++    monkeypatch.setattr(josh_board_authority,'admitted_board',lambda b:b)
++    tid=kb.create_task(conn,title='Orphan blocked card',assignee='riley',initial_status='blocked',session_id='missing-original')
++    monkeypatch.setattr(sc,'get_bound_session_env',lambda n,default='':env.get(n,default))
++    conn.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,));conn.commit()
++    kb._append_event(conn,tid,'blocked',{'kind':'needs_input','reason':'Please reconnect your own login'})
++    yield conn,tid,env
++    conn.close()
++
++
++def test_root_orphan_binds_only_current_source_without_card_or_return_changes(root_board):
++    conn,tid,env=root_board
++    before=[tuple(r) for r in conn.execute('SELECT * FROM tasks')]
++    assert source.bind_current(conn,tid,action='follow_up')['follow_up_bound']
++    assert before==[tuple(r) for r in conn.execute('SELECT * FROM tasks')]
++    assert kb.list_notify_subs(conn,tid)==[]
++    assert conn.execute('SELECT 1 FROM task_return_intents WHERE task_id=?',(tid,)).fetchone() is None
++    bound=source.subscriptions(conn)
++    assert len(bound)==1 and bound[0]['chat_id']=='own'
++    assert len(attention.collect(conn,bound,CONFIG,now=NOW))==1
++
++
++def test_env_only_source_rejected_and_worker_cannot_bind(root_board,monkeypatch):
++    conn,tid,env=root_board
++    env.clear();monkeypatch.setenv('HERMES_SESSION_PLATFORM','telegram');monkeypatch.setenv('HERMES_SESSION_CHAT_ID','foreign')
++    with pytest.raises(PermissionError,match='authenticated current'):source.bind_current(conn,tid,action='follow_up')
++    monkeypatch.setenv('HERMES_KANBAN_TASK',tid)
++    with pytest.raises(PermissionError,match='worker'):source.bind_current(conn,tid,action='follow_up')
++    assert source.subscriptions(conn)==[]
++
++
++def test_original_notify_subscription_is_untouched_and_no_stale_model_wake(root_board):
++    conn,tid,env=root_board
++    kb.add_notify_sub(conn,task_id=tid,platform='telegram',chat_id='old',notifier_profile='default',delivery_mode='notify+wake')
++    original=kb.list_notify_subs(conn,tid,include_internal_metadata=True)
++    source.bind_current(conn,tid,action='work')
++    assert kb.list_notify_subs(conn,tid,include_internal_metadata=True)==original
++    row=conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
++    assert attention.owns_event(conn,original[0],SimpleNamespace(id=row['id'],kind='blocked',payload=json.loads(row['payload'])),CONFIG)
++    assert attention.collect(conn,original,CONFIG,now=NOW)==[]
++
++
++def test_prior_trusted_owner_hold_survives_later_native_reblock(root_board):
++    conn,tid,env=root_board
++    conn.execute('UPDATE tasks SET session_id=? WHERE id=?',(env['HERMES_SESSION_KEY'],tid));conn.commit()
++    kb.add_notify_sub(conn,task_id=tid,platform='telegram',chat_id='own',notifier_profile='default')
++    kb._append_event(conn,tid,'blocked',{'kind':'needs_input','reason':'First owner hold','owner_board_hold':True,'owner_attention_requested':True,'requester':'chris'})
++    kb._append_event(conn,tid,'unblocked',{})
++    kb._append_event(conn,tid,'blocked',{'kind':'needs_input','reason':'Still need the actual account login'})
++    items=attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW)
++    assert len(items)==1 and items[0]['items'][0]['reason']=='Still need the actual account login'
++    kb._append_event(conn,tid,'completed',{})
++    kb._append_event(conn,tid,'blocked',{'kind':'needs_input','reason':'Different later request'})
++    assert attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW)==[]
++
++
++def test_member_current_app_followup_retains_original_completion_and_rechecks_enrollment(enrolled,monkeypatch):
++    root,catalog,env=enrolled;monkeypatch.setattr(control,'ROOT',root)
++    with request('newmember'):created=json.loads(work.create(INTENT))
++    tid=created['task_id'];conn=kb.connect(work.database(catalog['newmember']['board']))
++    try:
++        original=conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]
++        old_subs=kb.list_notify_subs(conn,tid,include_internal_metadata=True)
++        assert kb.block_task(conn,tid,kind='needs_input',reason='Please reconnect this account')
++        env.update(HERMES_SESSION_ID='current-session',HERMES_SESSION_CHAT_ID='current-session',HERMES_SESSION_KEY='new-key')
++        with scope.execution_scope('newmember','newmember'),work.bind('newmember','newmember','current-session','new-run','Please follow up here'):
++            assert source.bind_current(conn,tid,action='follow_up')['follow_up_bound']
++        assert conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?',(tid,)).fetchone()[0]==original
++        assert kb.list_notify_subs(conn,tid,include_internal_metadata=True)==old_subs
++        bound=source.subscriptions(conn)
++        assert len(attention.collect(conn,bound,CONFIG,now=NOW))==1
++        from gateway.owner_attention_app import persist,read
++        due=attention.collect(conn,bound,CONFIG,now=NOW)[0]
++        persist(conn,due,attention._text(due['items']))
++        assert read('newmember')[0]['sources'][0]['sessionId']=='current-session'
++        catalog.pop('newmember')
++        assert attention.collect(conn,bound,CONFIG,now=NOW)==[]
++    finally:conn.close()
++
++
++def test_original_gateway_return_supports_real_short_dm_session_key(root_board):
++    conn,tid,env=root_board
++    env['HERMES_SESSION_KEY']='agent:main:telegram:dm'
++    conn.execute('UPDATE tasks SET session_id=? WHERE id=?',(env['HERMES_SESSION_ID'],tid));conn.commit()
++    from hermes_cli.task_return_intents import capture
++    binding=capture(conn,session_id=env['HERMES_SESSION_ID'],request={'task_id':tid})
++    with kb.write_txn(conn):
++        conn.execute('INSERT INTO task_return_intents(task_id,binding_json) VALUES(?,?)',(tid,json.dumps(binding)))
++        kb.add_notify_sub(conn,task_id=tid,**binding['target'])
++    assert len(attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW))==1
++    conn.execute("UPDATE kanban_notify_subs SET chat_id='foreign' WHERE task_id=?",(tid,));conn.commit()
++    assert attention.collect(conn,kb.list_notify_subs(conn,include_internal_metadata=True),CONFIG,now=NOW)==[]
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -720,7 +720,31 @@
+             raise PermissionError('The owner profile must enable its existing kanban toolset')
+         board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+         payload = dict(args, board=board)
+-        return json.dumps(_invoke_board_controller(payload))
++        action = args.get('action')
++        if action == 'follow_up':
++            if set(args) - {'action','task_id','reason','board'} or not args.get('reason'):
++                raise ValueError('follow_up needs only task_id and the existing request; routes are never model arguments')
++            kb, conn = _connect(board=board)
++            try:
++                from gateway.owner_attention_binding import bind_current
++                return json.dumps(bind_current(conn,args.get('task_id'),action=action))
++            finally:
++                conn.close()
++        receipt = _invoke_board_controller(payload)
++        if action in {'work','block'} and not args.get('dry_run') and receipt.get('ok') is not False and not receipt.get('error'):
++            try:
++                kb, conn = _connect(board=board)
++                try:
++                    from gateway.owner_attention_binding import bind_current
++                    bound = bind_current(conn,args.get('task_id'),action=action)
++                    receipt.update({key:value for key,value in bound.items() if key.startswith('follow_up_')})
++                finally:
++                    conn.close()
++            except Exception:
++                # The work action already succeeded: never imply it should be
++                # repeated because a separate source binding was unavailable.
++                receipt.update(follow_up_bound=False,follow_up_error='No verified current conversation was attached; use follow_up from the owner conversation.')
++        return json.dumps(receipt)
+     except Exception as exc:
+         return tool_error(f'kanban_manage: {exc}')
+ 
+@@ -2167,6 +2191,10 @@
+             except Exception:
+                 notifier_profile = "default"
+         delivery_metadata: dict[str, Any] = {}
++        from gateway.session_context import get_bound_session_env
++        bound_source_key = get_bound_session_env("HERMES_SESSION_KEY")
++        if bound_source_key:
++            delivery_metadata["session_key"] = bound_source_key
+         if thread_id:
+             delivery_metadata["thread_id"] = thread_id
+         if chat_type:
+@@ -3089,7 +3117,7 @@
+     "parameters": {"type": "object", "properties": {
+         "task_id": {"type": "string"},
+         "board": _board_schema_prop(),
+-        "action": {"type": "string", "enum": ["work", "block", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
++        "action": {"type": "string", "description": "follow_up attaches passive blocker follow-ups to this authenticated conversation without changing the card or starting a worker. work/block also attach the current conversation after success.", "enum": ["follow_up", "work", "block", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
+         "expected_state": {"type": "string", "description": "Not needed for work or block. Other actions require expected_state from the latest kanban_show native fields; reread after a state change."},
+         "reason": {"type": "string", "description": "For work: preserve the user's actual instruction in plain language; do not invent a one-shot tool limit or stop-after-first-error condition. A one-run recovery limit still permits authorized alternatives within that run. Otherwise the verified correction or retirement reason. Existing external-action restrictions remain in force."},
+         "kind": {"type": "string", "enum": ["needs_input", "capability", "transient"], "description": "Required for block: record a real missing input/decision, missing capability, or temporary failure. Include what resolves it in reason. Real prerequisite links remain unchanged."},

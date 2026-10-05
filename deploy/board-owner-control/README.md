@@ -316,3 +316,24 @@ typecheck and production build passed. Browser checks were 6 passed and one
 existing navigation expectation failure outside the changed UI. These results
 do not establish completion of the waiting projects or a live delivered
 reminder receipt; activation occurred outside push hours.
+
+
+## Follow-up source continuity
+
+`releases/20261004-owner-attention-bound` extends that package. Successful
+`work` and `block` calls attach passive follow-up to the actual authenticated
+caller; `follow_up` attaches the current conversation without changing or
+starting the card. Routes are not model arguments. The separate source receipt
+preserves the original completion and Desk destination, rechecks account and
+board ownership, and suppresses duplicate legacy blocker wakes. A prior owner
+hold remains accountable after a later native re-block; terminal work stops it.
+
+Twenty-seven focused backend tests and six app notice tests passed. The
+independent review checked the superseded-source wake path and delivery-mode
+containment. App bridge commit `6075066c4d` pins the source-binding module as
+well as the existing passive reader. Two old Chris cards were attached to his
+verified private Telegram DM by a one-time local-owner repair from existing
+SessionDB/registry/identity evidence; their tasks and completion routes did not
+change. The private receipt is at
+`~/.hermes/private/board-owner-control/owner-attention/legacy-source-repair-receipt.json`.
+No paid model calls or worker retry jobs were used for this repair.
