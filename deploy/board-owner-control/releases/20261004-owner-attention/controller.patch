@@ -1,0 +1,476 @@
+--- a/gateway/gus_admin_cli.py
++++ b/gateway/gus_admin_cli.py
+@@ -653,7 +653,7 @@
+     if member is not None:
+         if worker is not None or getattr(args, 'board', None) != member['board']:
+             raise PermissionError('Member management outside authenticated board')
+-        if args.kanban_action not in {'archive','restore','specify','resume-triage','unblock','unlink','recover_review','repair_review_reference'}:
++        if args.kanban_action not in {'block','archive','restore','specify','resume-triage','unblock','unlink','recover_review','repair_review_reference'}:
+             raise PermissionError('Unsupported member board action')
+         # The exact signed operation/board/target is rechecked in the mutation transaction.
+         return None
+--- a/hermes_cli/board_owner_manage.py
++++ b/hermes_cli/board_owner_manage.py
+@@ -14,7 +14,7 @@
+ from pathlib import Path
+ 
+ _expected = ContextVar('owner_board_expected_state', default=None)
+-ACTIONS = ('work', 'prepare', 'archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
++ACTIONS = ('work', 'block', 'prepare', 'archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
+ 
+ 
+ # Set only after the controller verifies a signed gateway request.
+@@ -171,7 +171,7 @@
+     member = require_owner()
+     if member is not None and _member_context.get() is None:
+         raise PermissionError('Member mutations require the signed controller request')
+-    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence', 'plan', 'instruction'}
++    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence', 'plan', 'instruction', 'kind'}
+     if not isinstance(args, dict) or set(args) - allowed:
+         raise ValueError('Unsupported board operation fields')
+     from gateway.gus_admin_cli import admission
+@@ -184,12 +184,12 @@
+     reason = args.get('reason', '')
+     if not re.fullmatch(r't_[A-Za-z0-9_]+', task_id) or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+         raise ValueError('Exact task id and a concise disposition/resolution reason required')
+-    if action != 'work' and not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
++    if action not in ('work', 'block') and not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
+         raise ValueError('Use expected_state from the latest kanban_show board_administration.native fields')
+     dry = args.get('dry_run', False)
+     if type(dry) is not bool:
+         raise ValueError('dry_run must be boolean')
+-    if dry and action not in ('work', 'prepare', 'start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
++    if dry and action not in ('work', 'block', 'prepare', 'start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
+         raise ValueError('Dry run is supported for triage and review operations; other operations are reversible')
+     board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+     actor = member['principal'] if member is not None else 'default'
+@@ -211,6 +211,20 @@
+                     receipt = work(conn, task_id, args.get('instruction') or reason,
+                                    actor=actor, member=member, board=board,
+                                    plan=args.get('plan'), dry_run=dry)
++                return dict(ok=True, action=action, task_id=task_id, board=board,
++                            native=describe(conn, task_id), **receipt)
++            finally:
++                _expected.reset(token)
++    if action == 'block':
++        from hermes_cli.owner_board_hold import hold
++        with kb.connect_closing(board=board) as conn:
++            fresh = describe(conn, task_id)
++            if args.get('expected_state') is not None and args['expected_state'] != fresh['expected_state']:
++                raise ValueError('Board state changed; repeat the current hold request')
++            token = _expected.set({**args, 'expected_state': fresh['expected_state']})
++            try:
++                with admission(Namespace(kanban_action='block', board=board)):
++                    receipt = hold(conn, task_id, reason=reason, kind=args.get('kind'), dry_run=dry)
+                 return dict(ok=True, action=action, task_id=task_id, board=board,
+                             native=describe(conn, task_id), **receipt)
+             finally:
+--- /dev/null
++++ b/hermes_cli/owner_board_hold.py
+@@ -0,0 +1,101 @@
++"""Authenticated owner board holds, separate from worker failure accounting."""
++import json
++from hermes_cli import kanban_db as kb
++from hermes_cli import board_owner_manage as control
++
++KINDS = frozenset({'needs_input', 'capability', 'transient'})
++
++
++def _latest_stop(conn, task_id):
++    row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind IN "
++        "('blocked','block_loop_detected','triaged','escalated','dependency_wait','archived','restored','changes_requested') "
++        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return None
++    try:
++        payload = json.loads(row['payload'])
++        return payload if isinstance(payload, dict) else None
++    except (ValueError, TypeError):
++        return None
++
++
++def _review_binding(conn, task_id):
++    task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
++    # Holding a queue changes only these two fields. Everything that selected
++    # the original reviewer and review evidence remains exactly bound.
++    for key in ('status', 'block_kind'):
++        task.pop(key, None)
++    goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++    handoff = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    return control._hash({'task': task, 'goal': dict(goal) if goal else None,
++                          'handoff': dict(handoff) if handoff else None})
++
++
++def resume_queued_review(conn, task_id):
++    """An unchanged owner-paused queue needs no fabricated reviewer findings.
++
++    This is not recovery of a worker's failed review: only a hold placed while
++    that same independent review was already queued can match this receipt.
++    The caller retains normal work-order budgeting, dependencies and admission.
++    """
++    bound = control._expected.get()
++    if not bound or bound.get('action') != 'work' or bound.get('task_id') != task_id:
++        return False
++    member = control.require_owner()
++    if member is not None:
++        control._validate_member_connection(conn, member)
++    task = kb.get_task(conn, task_id)
++    stop = _latest_stop(conn, task_id)
++    if not task or task.status != 'blocked' or not stop or stop.get('owner_board_hold') is not True:
++        return False
++    if not stop.get('resume_queued_review') or stop.get('source_status') != 'review':
++        return False
++    if stop.get('review_binding') != _review_binding(conn, task_id):
++        raise ValueError('The held review changed; inspect its current reviewer and evidence before resuming')
++    control.validate_bound_target(conn, task_id, 'work')
++    return True
++
++
++def hold(conn, task_id, *, reason, kind, dry_run=False):
++    member = control.require_owner()
++    bound = control._expected.get()
++    if not bound or bound.get('action') != 'block' or bound.get('task_id') != task_id:
++        raise PermissionError('A bound authenticated owner hold request is required')
++    if kind not in KINDS:
++        raise ValueError('block requires kind=needs_input, capability or transient; use actual prerequisite links for dependency waits')
++    if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000 or type(dry_run) is not bool:
++        raise ValueError('A concise concrete wait and what resolves it are required')
++    if member is not None:
++        control._validate_member_connection(conn, member)
++    actor = member['principal'] if member else 'default'
++    with kb.write_txn(conn):
++        control.validate_bound_target(conn, task_id, 'block')
++        if control.require_owner() != member:
++            raise PermissionError('Owner identity changed')
++        task = kb.get_task(conn, task_id)
++        if task.status not in {'triage', 'todo', 'ready', 'review', 'blocked'}:
++            raise ValueError('Only idle unfinished cards may be held; restore completed/archived work separately')
++        goal = conn.execute('SELECT phase,owner_profile FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++        source = 'review' if task.status == 'review' or (goal and goal['phase'] == 'review') else kb._resume_status_from_events(conn, task_id)
++        prior = _latest_stop(conn, task_id)
++        binding = _review_binding(conn, task_id) if source == 'review' else None
++        queued_review = bool(task.status == 'review' or (task.status == 'blocked' and prior
++            and prior.get('owner_board_hold') is True and prior.get('resume_queued_review') is True
++            and prior.get('review_binding') == binding))
++        payload = {'reason': reason.strip(), 'kind': kind, 'source_status': source,
++                   'previous_status': task.status, 'actor': actor, 'owner_profile': (goal['owner_profile'] if goal else None) or actor,
++                   'owner_board_hold': True, 'approval_granted': False,
++                   'requester': member['principal'] if member else 'chris',
++                   'owner_attention_requested': kind in {'needs_input', 'capability'},
++                   'failure_history_preserved': True, 'action_restrictions_preserved': True,
++                   'resume_queued_review': queued_review, 'review_binding': binding}
++        if not dry_run:
++            conn.execute("UPDATE tasks SET status='blocked',block_kind=? WHERE id=?", (kind, task_id))
++            kb._append_event(conn, task_id, 'blocked', payload)
++        return {'changed': not dry_run, 'dry_run': dry_run, 'status': task.status if dry_run else 'blocked',
++                'proposed_status': 'blocked', 'block_kind': kind, 'reason': reason.strip(),
++                'source_status': source, 'worker_started': False, 'failure_history_preserved': True,
++                'action_restrictions_preserved': True, 'approval_granted': False,
++                'next_action': 'Keep ownership of this card. Resolve or follow up on the recorded wait: '
++                    + reason.strip() + '. When it is resolved or the owner provides a changed instruction, '
++                    'use action=work on this same card; retain its assigned worker/reviewer, real dependencies and external-action restrictions.'}
+--- a/hermes_cli/owner_work_start.py
++++ b/hermes_cli/owner_work_start.py
+@@ -92,6 +92,9 @@
+ 
+ 
+ def _review(conn, task_id, goal, actor, instruction, dry_run):
++    from hermes_cli.owner_board_hold import resume_queued_review
++    if resume_queued_review(conn, task_id):
++        return
+     from hermes_cli.owner_board_recovery import recover_review, recover_native_review, goal_snapshot_sha
+     if goal is None:
+         return recover_native_review(conn, task_id, actor=actor, reason=instruction, dry_run=dry_run)
+@@ -142,8 +145,8 @@
+                 'worker_started': False, 'failure_history_preserved': True,
+                 'next_action': 'The existing reviewer is already queued; preserve its independent review.'}
+     prep._idle(conn, task)
+-    if not task.get('assignee') or not str(task.get('body') or '').strip():
+-        raise ValueError('This task needs a worker and its actual requested work before it can start')
++    if not str(task.get('body') or '').strip():
++        raise ValueError('This task needs its actual requested work before it can start')
+     is_review = bool(goal and goal.get('phase') == 'review')
+     is_review = is_review or kb._resume_status_from_events(conn, task_id) == 'review'
+     if goal is None and not is_review:
+@@ -154,17 +157,32 @@
+             is_review = bool(handoff and json.loads(handoff['payload']).get('reviewer') == task['assignee'])
+         except (ValueError, TypeError, AttributeError):
+             pass
+-    if not is_review:
+-        prep._eligible(conn, task, task['assignee'], member)
+     normalized = readiness = None
++    replacement_worker = None
+     if plan is not None:
+         if is_review:
+             raise ValueError('A review continuation retains its bound reviewer; prepare maker work separately')
+-        normalized = prep._normalise(plan, task)
+-        prep._eligible(conn, task, normalized['assignee'], member)
+-        readiness = prep._readiness(conn, task, normalized, member)
+-        if readiness['issues']:
+-            raise ValueError('Prepared worker is missing resources: ' + json.dumps(readiness['issues'], sort_keys=True))
++        if isinstance(plan, dict) and set(plan) == {'assignee'}:
++            from hermes_cli.profiles import normalize_profile_name
++            if not isinstance(plan['assignee'], str) or not plan['assignee'].strip():
++                raise ValueError('Choose an installed non-root worker profile')
++            replacement_worker = normalize_profile_name(plan['assignee'])
++            prep._eligible(conn, task, replacement_worker, member)
++            existing_plan = prep.current(conn, task_id)
++            if existing_plan is not None:
++                normalized = {key: existing_plan[key] for key in ('brief','acceptance','requirements','assignee','skills','budget')}
++                normalized['assignee'] = replacement_worker
++        else:
++            normalized = prep._normalise(plan, task)
++            prep._eligible(conn, task, normalized['assignee'], member)
++        if normalized is not None:
++            readiness = prep._readiness(conn, task, normalized, member)
++            if readiness['issues']:
++                raise ValueError('Prepared worker is missing resources: ' + json.dumps(readiness['issues'], sort_keys=True))
++    elif not is_review:
++        if not task.get('assignee'):
++            raise ValueError('This task needs an existing worker; use plan={assignee: installed-worker} to assign it')
++        prep._eligible(conn, task, task['assignee'], member)
+     previous = current(conn, task_id)
+     prior_preparation = prep.current(conn, task_id)
+     preparation_changed = normalized is not None and (prior_preparation is None or any(
+@@ -182,6 +200,11 @@
+             budget.update(execution_budget=normalized['budget'], preparation_digest=prep._hash(normalized))
+             conn.execute('UPDATE tasks SET assignee=?,skills=?,worker_budget_json=? WHERE id=?',
+                          (normalized['assignee'], json.dumps(normalized['skills']), json.dumps(budget, sort_keys=True), task_id))
++        if replacement_worker is not None and normalized is None and replacement_worker != task.get('assignee') and not dry_run:
++            conn.execute('UPDATE tasks SET assignee=? WHERE id=?', (replacement_worker, task_id))
++            kb._append_event(conn, task_id, 'assigned', {'assignee': replacement_worker,
++                'previous_assignee': task.get('assignee'), 'actor': actor,
++                'reason': instruction, 'source': 'owner_work_requested'})
+         selected_plan = normalized or ({key: prior_preparation[key] for key in ('brief','acceptance','requirements','assignee','skills','budget')} if prior_preparation else None)
+         # Same instruction is the same input; a later stopped run does not make
+         # another credit-consuming attempt available just by repeating it.
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_board_hold.py
+@@ -0,0 +1,227 @@
++"""Owner-only idle holds on real temporary boards; no workers or providers."""
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++from hermes_cli import board_owner_manage as control, kanban_db as kb
++from hermes_cli import owner_work_start as start, owner_work_preparation as prep
++from tests.hermes_cli.test_simple_owner_work import board, task, request, snap
++from tests.hermes_cli.test_owner_work_preparation import plan
++
++
++def hold(tid, **kwargs):
++    return control.execute(dict(action='block', task_id=tid,
++        reason='Waiting for the owner to provide the source file; follow up on that input.',
++        kind='needs_input', **kwargs))
++
++
++@pytest.mark.parametrize('status', ['triage','todo','ready','blocked'])
++def test_hold_preserves_everything_except_status_and_kind(board, tmp_path, status):
++    tid=task(board); child=kb.create_task(board,title='Dependent',body='Consume the prerequisite',assignee='maker',parents=[tid])
++    f=tmp_path/'working-file.txt';f.write_text('Preserved original output')
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET status=?,consecutive_failures=3,block_recurrences=2,workspace_path=? WHERE id=?',
++            (status,str(tmp_path),tid))
++    before=dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++    old_events=[dict(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?',(tid,))]
++    assert hold(tid,dry_run=True)['proposed_status']=='blocked'
++    assert dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())==before
++    receipt=hold(tid)
++    after=dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++    assert after=={**before,'status':'blocked','block_kind':'needs_input'}
++    assert receipt['worker_started'] is False and receipt['approval_granted'] is False
++    assert 'source file' in receipt['next_action']
++    events=[dict(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?',(tid,))]
++    assert events[:-1]==old_events
++    payload=json.loads(events[-1]['payload'])
++    assert payload['owner_board_hold'] and payload['owner_attention_requested']
++    assert payload['actor']=='default' and payload['requester']=='chris'
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++    kb.recompute_ready(board)
++    assert kb.get_task(board,tid).status=='blocked'
++    assert kb.get_task(board,child).status=='todo'
++    assert f.read_text()=='Preserved original output'
++
++
++@pytest.mark.parametrize('kind', ['needs_input','capability','transient'])
++def test_simple_work_resumes_hold_without_granting_external_actions(board, kind):
++    tid=task(board)
++    control.execute({'action':'block','task_id':tid,'kind':kind,'reason':'Wait for the recorded missing file.'})
++    payload=json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",(tid,)).fetchone()[0])
++    assert payload['owner_attention_requested']==(kind!='transient')
++    result=request(tid,'Use the newly provided local source; do not send or publish.')
++    assert result['status']=='ready'
++    assert result.get('approval_granted', False) is False
++    assert result['work_order']['preserved_stop']['reason']=='Wait for the recorded missing file.'
++    assert kb.get_task(board,tid).block_kind==kind
++    assert 'Do not send or publish' in kb.get_task(board,tid).body
++    assert start.allows_claim(board,kb.get_task(board,tid))
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++
++
++@pytest.mark.parametrize('kind', ['dependency','',None,'arbitrary'])
++def test_invalid_hold_kind_cannot_create_fake_dependency_or_mutate(board,kind):
++    tid=task(board);before=snap(board,tid)
++    with pytest.raises(ValueError,match='block requires'):
++        control.execute({'action':'block','task_id':tid,'kind':kind,'reason':'Wait'})
++    assert snap(board,tid)==before
++
++
++def test_stale_snapshot_and_active_work_are_preserved(board):
++    tid=task(board);snapshot=control.describe(board,tid)['expected_state']
++    kb.add_comment(board,tid,'owner','New instruction')
++    with pytest.raises(ValueError,match='state changed'):
++        hold(tid,expected_state=snapshot)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET worker_pid=123 WHERE id=?',(tid,))
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='active work'):
++        hold(tid)
++    assert snap(board,tid)==before
++
++
++@pytest.mark.parametrize('key,value',[('HERMES_PROFILE','other'),('HERMES_KANBAN_TASK','t_other'),('HERMES_SESSION_SOURCE','cron')])
++def test_unbound_profile_worker_or_cron_cannot_hold(board,monkeypatch,key,value):
++    tid=task(board);before=snap(board,tid)
++    monkeypatch.setenv(key,value)
++    with pytest.raises(PermissionError): hold(tid)
++    assert snap(board,tid)==before
++
++
++@pytest.mark.parametrize('reviewed',[False,True])
++def test_owner_paused_queued_review_returns_to_same_reviewer_without_fake_findings(board,tmp_path,monkeypatch,reviewed):
++    from hermes_cli import owner_cell as oc
++    from tests.hermes_cli.test_owner_cell_qa_regressions import contract
++    monkeypatch.setattr(oc,'_installed_profile',lambda value:value)
++    extra={'owner_cell_contract':contract(owner_profile='maker',runtime_profile='maker')} if reviewed else {}
++    tid=kb.create_task(board,title='Review local output',body='Original complete request. Do not publish.',assignee='maker',**extra)
++    artifact=tmp_path/'review.txt';artifact.write_text('Reviewable original evidence')
++    digest=hashlib.sha256(artifact.read_bytes()).hexdigest()
++    reviewer='grace' if reviewed else 'second'
++    assert kb.request_review(board,tid,summary='Review saved artifact',reviewer=reviewer,
++        metadata={'owner_cell_artifact':{'ref':str(artifact),'digest':digest}})
++    goal_before=[dict(r) for r in board.execute('SELECT * FROM owner_cell_goals WHERE task_id=?',(tid,))]
++    runs_before=[dict(r) for r in board.execute('SELECT * FROM task_runs WHERE task_id=?',(tid,))]
++    assert hold(tid)['source_status']=='review'
++    assert kb._resume_status_from_events(board,tid)=='review'
++    result=request(tid,'The requested input is present; continue the already queued independent review.')
++    assert result['status']=='review' and result['work_order']['phase']=='review'
++    assert kb.get_task(board,tid).assignee==reviewer
++    assert [dict(r) for r in board.execute('SELECT * FROM owner_cell_goals WHERE task_id=?',(tid,))]==goal_before
++    assert [dict(r) for r in board.execute('SELECT * FROM task_runs WHERE task_id=?',(tid,))]==runs_before
++
++
++@pytest.mark.parametrize('old',[None,'default','missing-old'])
++@pytest.mark.parametrize('full',[False,True])
++def test_work_validates_new_worker_before_absent_or_invalid_old_worker(board,old,full):
++    tid=task(board)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET assignee=? WHERE id=?',(old,tid))
++    value=plan(assignee='second') if full else {'assignee':'second'}
++    result=request(tid,'Complete the existing local work with the selected worker.',plan=value)
++    assert result['status']=='ready' and kb.get_task(board,tid).assignee=='second'
++    assert 'Do not send or publish' in kb.get_task(board,tid).body
++    if not full:
++        assert prep.current(board,tid) is None
++        assert 'execution_budget' not in json.loads(kb.get_task(board,tid).worker_budget_json)
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++
++
++@pytest.mark.parametrize('worker',['default','missing',''])
++def test_bad_replacement_worker_is_denied_atomically(board,worker):
++    tid=task(board);before=snap(board,tid)
++    with pytest.raises(ValueError): request(tid,plan={'assignee':worker})
++    assert snap(board,tid)==before
++
++
++def test_assignee_only_preserves_existing_plan_and_budget(board):
++    tid=task(board)
++    request(tid,plan=plan())
++    before=prep.current(board,tid)
++    result=request(tid,'Use the second eligible worker for this same prepared scope.',plan={'assignee':'second'})
++    after=prep.current(board,tid)
++    assert result['status']=='ready' and after['assignee']=='second'
++    for key in ['brief','acceptance','requirements','skills','budget']:
++        assert after[key]==before[key]
++
++
++def test_reassignment_cannot_change_bound_route_or_fill_missing_body(board):
++    tid=task(board)
++    with kb.write_txn(board): board.execute("UPDATE tasks SET runtime_profile='maker' WHERE id=?",(tid,))
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='bound maker'): request(tid,plan={'assignee':'second'})
++    assert snap(board,tid)==before
++    with kb.write_txn(board): board.execute("UPDATE tasks SET runtime_profile=NULL,body='' WHERE id=?",(tid,))
++    with pytest.raises(ValueError,match='actual requested work'): request(tid,plan={'assignee':'second'})
++
++
++def test_authenticated_member_hold_is_bound_to_own_board_and_requester(tmp_path,monkeypatch):
++    from gateway import josh_board_authority
++    home=tmp_path/'home';home.mkdir(mode=0o700)
++    monkeypatch.setenv('HERMES_HOME',str(home));monkeypatch.setattr(Path,'home',lambda:tmp_path)
++    monkeypatch.setattr(control,'ROOT',home)
++    for name in ('HERMES_KANBAN_DB','HERMES_KANBAN_HOME','HERMES_KANBAN_BOARD','HERMES_PROFILE','HERMES_KANBAN_TASK','HERMES_SESSION_SOURCE'):
++        monkeypatch.delenv(name,raising=False)
++    grant={'principal':'new-member','profile':'new-member','board':'member-space','fingerprint':'a'*64}
++    monkeypatch.setattr(control,'refresh_member_grant',lambda value:dict(grant))
++    with kb.connect_closing(board='member-space') as own:
++        tid=kb.create_task(own,title='Own wait',assignee='maker',triage=True)
++    with kb.connect_closing(board='other-space') as other:
++        other_id=kb.create_task(other,title='OTHER_PRIVATE_SENTINEL',assignee='maker',triage=True)
++    from gateway import board_control_transport as transport, session_context
++    monkeypatch.setattr(transport,'ROOT',home)
++    transport.key_path().parent.mkdir(parents=True,mode=0o700)
++    transport.key_path().write_bytes(b'k'*32);transport.key_path().chmod(0o600)
++    transport.initialize_ledger(transport.ledger_path())
++    monkeypatch.setattr(session_context,'get_bound_session_env',lambda key,*a:'session-1' if key=='HERMES_SESSION_ID' else '')
++    direct=josh_board_authority._execution.set(('new-member','new-member'))
++    try:
++        envelope=transport.issue({'action':'block','task_id':tid,'board':'member-space',
++            'kind':'needs_input','reason':'Waiting for the requested source file.'},grant,'session-1')
++        verified_payload,verified_grant=transport.verify(envelope)
++    finally:
++        josh_board_authority._execution.reset(direct)
++    token=control._member_context.set(verified_grant)
++    try:
++        result=control.execute(verified_payload)
++        assert result['board']=='member-space' and result['status']=='blocked'
++        with kb.connect_closing(board='member-space') as own:
++            payload=json.loads(own.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'",(tid,)).fetchone()[0])
++            assert payload['requester']==payload['actor']=='new-member'
++        with pytest.raises(PermissionError,match='outside authenticated member'):
++            hold(other_id,board='other-space')
++        with pytest.raises(ValueError,match='Unknown task'):
++            hold(other_id)
++        with kb.connect_closing(board='other-space') as other:
++            assert kb.get_task(other,other_id).status=='triage'
++        grant['fingerprint']='revoked'
++        with pytest.raises(PermissionError,match='enrollment changed'):
++            hold(tid)
++    finally:
++        control._member_context.reset(token)
++    token=josh_board_authority._execution.set(('new-member','new-member'))
++    try:
++        with pytest.raises(PermissionError,match='signed controller'):
++            hold(tid)
++    finally:
++        josh_board_authority._execution.reset(token)
++
++
++def test_new_hold_does_not_override_prior_worker_review_failure(board,tmp_path,monkeypatch):
++    from hermes_cli import owner_cell as oc
++    from tests.hermes_cli.test_owner_cell_qa_regressions import contract
++    monkeypatch.setattr(oc,'_installed_profile',lambda value:value)
++    tid=kb.create_task(board,title='Independent review',body='Original local task.',assignee='maker',
++        owner_cell_contract=contract(owner_profile='maker',runtime_profile='maker'))
++    artifact=tmp_path/'review-original.txt';artifact.write_text('Original artifact')
++    assert kb.request_review(board,tid,summary='Review saved original',reviewer='grace',
++        metadata={'owner_cell_artifact':{'ref':str(artifact),'digest':hashlib.sha256(artifact.read_bytes()).hexdigest()}})
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?",(tid,))
++        kb._append_event(board,tid,'blocked',{'reason':'Reviewer needs original missing input','source_status':'review'})
++    hold(tid)
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='reviewer findings|recorded stop and findings'):
++        request(tid,'Continue the existing review after the owner wait.')
++    assert snap(board,tid)==before

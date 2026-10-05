@@ -288,3 +288,31 @@ CLI controller can activate this helper independently; both live gateway schemas
 already invoke that controller with the existing work plan. The matching gateway
 source is packaged for the next code load. No additional gateway interruption is
 required for this correction.
+
+
+## Owner holds and passive follow-up (October 4)
+
+`releases/20261004-owner-attention` adds the missing `block` action to owner
+and authenticated member tools. It can place idle triage, ready, todo, review,
+or blocked cards on an explicit wait without deleting history, changing
+approvals, completing work, or starting a worker. Review holds retain the
+reviewer and evidence for ordinary `work` recovery. A work plan can also replace
+an absent/default worker before the old worker is validated.
+
+The opt-in `kanban.owner_attention` watcher publishes exact missing-input asks
+to the verified requesting conversation. App notices are passive; Telegram and
+Photon follow-ups are grouped per destination, limited to once per 24 hours,
+and sent only from 09:00 to 18:00 in the configured owner's timezone. It never
+wakes a model or retries a worker. Resolution withdraws the wait. Missing or
+unverified legacy source bindings remain undeliverable rather than guessing a
+recipient; those require source repair. This package does not add a snooze UI.
+
+Both live gateways and the controller activated successfully. Seven existing
+owner cards moved from triage to Blocked via these controls with concrete next
+actions and their history preserved. The app integration is on production main
+at `f53cd94a06ab08b4c2c8e322382d4e329c8f17d8`. Validation used deterministic
+fixtures: gateway 65, controller 48, attention 24, app unit suite 2093 passed;
+typecheck and production build passed. Browser checks were 6 passed and one
+existing navigation expectation failure outside the changed UI. These results
+do not establish completion of the waiting projects or a live delivered
+reminder receipt; activation occurred outside push hours.

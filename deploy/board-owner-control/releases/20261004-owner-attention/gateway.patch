@@ -1,0 +1,1510 @@
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -472,13 +472,13 @@
+                 # a fail-closed state: no Desk materialization, platform send,
+                 # or cursor claim/finalization is allowed for the tick.
+                 _report_back_settings = None
++                _attention_config = {}
+                 _report_back_error: Optional[str] = None
+                 try:
+                     from hermes_cli.config import load_config as _load_report_cfg
+ 
+-                    _report_back_settings = _resolve_report_back_settings(
+-                        _load_report_cfg()
+-                    )
++                    _attention_config = _load_report_cfg() or {}
++                    _report_back_settings = _resolve_report_back_settings(_attention_config)
+                 except ValueError as exc:
+                     _report_back_error = str(exc)
+                 except Exception as exc:
+@@ -575,7 +575,10 @@
+                                 board=slug,
+                                 notifier_profiles=notifier_profiles,
+                                 include_unowned=include_unowned,
+-                            ) == 0:
++                            ) == 0 and not (
++                                (_attention_config.get("kanban") or {}).get("owner_attention", {}).get("enabled") is True
++                                and _kb.count_notify_subs(board=slug, platform="api_server") > 0
++                            ):
+                                 logger.debug(
+                                     "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
+                                     slug, sorted(notifier_profiles),
+@@ -637,6 +640,17 @@
+                                 include_unowned=include_unowned,
+                                 include_internal_metadata=True,
+                             )
++                            from gateway.owner_attention import collect as collect_owner_attention, settings as owner_attention_settings
++                            if _report_back_error is None and owner_attention_settings(_attention_config):
++                                # API-native owner profiles need not own a push adapter.
++                                # This widens only passive scoped inbox collection.
++                                from gateway.kanban_delivery_receipts import identity as notification_identity
++                                attention_subs = {notification_identity(sub): sub for sub in subs}
++                                for api_sub in _kb.list_notify_subs(conn, include_internal_metadata=True):
++                                    if api_sub.get("platform") == "api_server":
++                                        attention_subs[notification_identity(api_sub)] = api_sub
++                                for attention in collect_owner_attention(conn, list(attention_subs.values()), _attention_config):
++                                    deliveries.append({"attention": attention, "board": slug})
+                             if not subs:
+                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+                             for sub in subs:
+@@ -690,6 +704,9 @@
+                                         events = sorted({event.id:event for event in [*events,*recoverable]}.values(), key=lambda event:event.id)
+                                     if secondary_document:
+                                         events = [event for event in events if event.kind == "completed"]
++                                    from gateway.owner_attention import owns_event as attention_owns_event
++                                    events = [event for event in events if not attention_owns_event(
++                                        conn, sub, event, _attention_config)]
+                                     if not events:
+                                         continue
+                                     task = _kb.get_task(conn, sub["task_id"])
+@@ -801,6 +818,21 @@
+ 
+                 deliveries = await asyncio.to_thread(_collect)
+                 for d in deliveries:
++                    if "attention" in d:
++                        from gateway.owner_attention import deliver as deliver_owner_attention
++                        attention = d["attention"]
++                        source = attention["sub"]
++                        try:
++                            platform = _Platform(source["platform"])
++                            adapter = self._authorization_adapter(platform, source.get("notifier_profile") or None)
++                            conn = _kb.connect(board=d["board"])
++                            try:
++                                await deliver_owner_attention(conn, attention, adapter, _attention_config)
++                            finally:
++                                conn.close()
++                        except (PermissionError, ValueError):
++                            pass  # missing/revoked original source never falls back
++                        continue
+                     sub = d["sub"]
+                     task = d["task"]
+                     board_slug = d.get("board")
+--- a/gateway/member_board_tools.py
++++ b/gateway/member_board_tools.py
+@@ -66,7 +66,10 @@
+             "Within the same run and budget, correct routine tool errors or try "
+             "equivalent already-authorized tools and sources. Do not invent a "
+             "stop-after-first-error or one-shot capture restriction. Honor actual "
+-            "user stops, privacy and action restrictions. Precise reversible cleanup and "
++            "user stops, privacy and action restrictions. For a genuine wait, use "
++            "action=block with task_id, kind=needs_input/capability/transient and a "
++            "concrete reason naming what resolves it; triage is supported and no "
++            "worker starts. Precise reversible cleanup and "
+             "review repair actions remain available with their inspection snapshots."
+         )
+     return json.dumps(data)
+@@ -143,7 +146,9 @@
+         "Work on cards in your authenticated workspace. Prefer action=work with "
+         "task_id and a short current instruction in reason; no state hashes, "
+         "special approval phrase or detailed plan needed. Use the existing worker "
+-        "and tools, optionally update its plan, or use precise reversible cleanup "
++        "and tools, optionally update its plan, or use action=block with a concrete "
++        "reason and kind=needs_input/capability/transient to hold idle unfinished "
++        "work, including triage. No snapshot is required for block. Use precise reversible cleanup "
+         "and review repair actions. Real waits, member privacy, action restrictions "
+         "and existing budgets still apply. A recovery attempt limits worker starts, "
+         "not individual tool calls. Within the same run and budget, correct routine "
+@@ -156,7 +161,7 @@
+     if "required" in schema["parameters"]:
+         schema["parameters"]["required"] = [key for key in schema["parameters"]["required"] if key != "board"]
+     state = schema["parameters"]["properties"].get("expected_state", {})
+-    state["description"] = "Not required for work. Other actions use expected_state from the latest own_work_show native fields; reread if state changed."
++    state["description"] = "Not required for work or block. Other actions use expected_state from the latest own_work_show native fields; reread if state changed."
+     registry.register(name=MANAGE_TOOL, toolset=toolset, schema=schema, handler=manage, check_fn=enabled)
+     registry.register(name=SHOW_TOOL, toolset=toolset, schema={
+         "name": SHOW_TOOL,
+--- /dev/null
++++ b/gateway/owner_attention.py
+@@ -0,0 +1,258 @@
++"""Passive, source-bound reminders for explicitly requested owner holds.
++
++Never wakes an agent, starts a worker, changes a card, or grants an approval.
++The service is opt-in; each hold must independently opt in through owner control.
++"""
++from __future__ import annotations
++
++from datetime import datetime
++from hashlib import sha256
++import json
++import time
++from zoneinfo import ZoneInfo
++
++from hermes_cli import kanban_db as kb
++from gateway import owner_delegation as work
++from gateway.kanban_delivery_receipts import identity, send_once
++
++DAY = 24 * 60 * 60
++
++
++def settings(config):
++    if not isinstance(config, dict) or not isinstance(config.get('kanban'), dict):
++        return None
++    value = config['kanban'].get('owner_attention')
++    return value if isinstance(value, dict) and value.get('enabled') is True else None
++
++
++def opted(event):
++    p = event.payload if hasattr(event, 'payload') else event
++    return (isinstance(p, dict) and p.get('owner_board_hold') is True
++            and p.get('owner_attention_requested') is True
++            and p.get('kind') in {'needs_input', 'capability'}
++            and isinstance(p.get('requester'), str) and bool(p['requester']))
++
++
++def schema(conn):
++    conn.execute('''CREATE TABLE IF NOT EXISTS owner_attention_deliveries (
++        destination TEXT NOT NULL, delivery_id TEXT NOT NULL, state TEXT NOT NULL,
++        created_at INTEGER NOT NULL, receipt TEXT, PRIMARY KEY(destination,delivery_id))''')
++    conn.execute('''CREATE TABLE IF NOT EXISTS owner_attention_destinations (
++        destination TEXT PRIMARY KEY, last_attempt INTEGER NOT NULL, snoozed_until INTEGER NOT NULL DEFAULT 0)''')
++
++
++def _json(value):
++    return json.loads(value) if isinstance(value, str) else value or {}
++
++
++def _validate(conn, sub, event_id=None):
++    """Return current exact owner hold, never inherited or secondary delivery."""
++    task = kb.get_task(conn, sub['task_id'])
++    if task is None or task.status not in {'blocked', 'triage'} or (task.current_run_id is not None or task.claim_lock or task.worker_pid):
++        raise ValueError('Owner hold is no longer idle')
++    from hermes_cli.owner_work_preparation import _idle
++    _idle(conn, dict(conn.execute('SELECT * FROM tasks WHERE id=?',(task.id,)).fetchone()))
++    current = kb.list_notify_subs(conn, sub['task_id'], include_internal_metadata=True)
++    if not any(identity(row) == identity(sub) for row in current):
++        raise PermissionError('Owner notification source was revoked')
++    meta = _json(sub.get('delivery_metadata'))
++    if meta.get('_kanban_inherited_subscription'):
++        raise PermissionError('Inherited notification is not the requester')
++    row = conn.execute("SELECT id,kind,payload,created_at FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','capability_preflight_blocked','status','triaged','unblocked','review_work_resumed','review_requested','changes_requested','completed','archived','owner_work_requested') ORDER BY id DESC LIMIT 1", (task.id,)).fetchone()
++    if not row or (event_id is not None and row['id'] != event_id):
++        raise ValueError('Owner blocker changed')
++    if row['kind'] not in {'blocked','block_loop_detected','capability_preflight_blocked'}:
++        raise ValueError('Owner hold was superseded by another state')
++    payload = _json(row['payload'])
++    if payload.get('kind') not in {'needs_input','capability'} or task.block_kind != payload['kind']:
++        raise ValueError('Not a current owner-action blocker')
++    binding = conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?', (task.id,)).fetchone()
++    private_binding = _json(binding[0]) if binding else {}
++    if not opted(payload):
++        # Existing authenticated work requests and private delegation contracts
++        # also request accountability for their later native worker blockers.
++        order = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='owner_work_requested' AND id<? ORDER BY id DESC LIMIT 1", (task.id,row['id'])).fetchone()
++        actor = _json(order[0]).get('actor') if order else None
++        requester = ('chris' if actor == 'default' else actor) or (
++            private_binding.get('principal') if private_binding.get('kind') == work.KIND else None)
++        if not requester and private_binding.get('kind') == 'native-api-return-v1':
++            authority = private_binding.get('authority') or {}
++            requester = authority.get('principal') or authority.get('owner')
++        if not requester:
++            raise ValueError('Owner did not request follow-up on this blocker')
++        payload = {**payload, 'requester':requester}
++    if private_binding.get('kind') == work.KIND:
++        if private_binding.get('principal') != payload['requester']:
++            raise PermissionError('Blocker requester differs from private source')
++        work.verify_return(conn, sub)  # includes fresh enrollment, board and target
++    elif sub.get('platform') == 'api_server':
++        from gateway.owner_attention_app import source_binding
++        source_binding(conn, sub, payload['requester'])
++    else:
++        # UUID task sessions retain their canonical source key in native metadata.
++        # The origin marker alone is insufficient: every explicit subscription
++        # receives it, including separately selected destinations.
++        from types import SimpleNamespace
++        from gateway.kanban_watchers import _session_id_matches_subscription, _has_exact_notification_origin
++        exact = (_session_id_matches_subscription(task, sub) or (
++            _has_exact_notification_origin(task, {**sub,'delivery_metadata':meta})
++            and _session_id_matches_subscription(SimpleNamespace(session_id=meta.get('session_key')), sub)))
++        if (payload['requester'] != 'chris' or sub.get('notifier_profile') not in {None, '', 'default'} or not exact):
++            raise PermissionError('No authenticated original owner source')
++    from gateway.secondary_documents import current as secondary_current
++    if secondary_current(conn, sub):
++        raise PermissionError('Document-only secondary destination is not an owner inbox')
++    return {'task_id':task.id, 'event_id':row['id'], 'created_at':row['created_at'],
++            'requester':payload['requester'], 'reason':str(payload.get('reason') or ''),
++            'title':task.title, 'sub':sub}
++
++
++def destination(item):
++    sub = item['sub']
++    # Exclude task-specific metadata, retain exact owner, thread and session.
++    meta = _json(sub.get('delivery_metadata'))
++    material = [item['requester'], *(sub.get(k) or '' for k in
++        ('platform','chat_id','thread_id','notifier_profile','user_id','user_id_alt','chat_type')),
++        meta.get('session_key') or '']
++    return sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
++
++
++def collect(conn, subs, config, *, now=None):
++    cfg = settings(config)
++    if cfg is None:
++        return []
++    now = int(time.time() if now is None else now)
++    schema(conn)
++    groups = {}
++    for sub in subs:
++        if sub.get('platform') not in {'telegram','photon','api_server'}:
++            continue
++        try:
++            item = _validate(conn, sub)
++            # A passive app inbox does not interrupt anyone. Publish the ask
++            # immediately; quiet hours apply only to outward push channels.
++            if sub.get('platform') != 'api_server':
++                tz = (cfg.get('timezones') or {}).get(item['requester']) or cfg.get('default_timezone')
++                local = datetime.fromtimestamp(now, ZoneInfo(tz)) if tz else None
++                if local is None or not 9 <= local.hour < 18:
++                    continue  # absent timezone never guesses the owner's daytime
++            groups.setdefault(destination(item), []).append(item)
++        except (PermissionError, ValueError, TypeError, KeyError):
++            continue
++    due = []
++    for key, items in groups.items():
++        row = conn.execute('SELECT * FROM owner_attention_destinations WHERE destination=?', (key,)).fetchone()
++        if row and (row['snoozed_until'] > now or row['last_attempt'] + DAY > now):
++            continue
++        # Each day's follow-up is a distinct authorized logical message. An
++        # uncertain send is not retried; its attempt still consumes today's slot.
++        items.sort(key=lambda x:(x['created_at'], x['task_id']))
++        stamp = (row['last_attempt'] if row else 0)
++        delivery_id = sha256(json.dumps([stamp, [(i['task_id'],i['event_id'],identity(i['sub'])) for i in items]], sort_keys=True).encode()).hexdigest()
++        due.append({'destination':key, 'delivery_id':delivery_id, 'items':items,
++                    'sub':items[0]['sub'], 'requester':items[0]['requester'], 'created_at':now})
++    return due
++
++
++def _text(items):
++    from gateway.kanban_watchers import _safe_review_reason
++    lines = ["I need your help to move this work forward:"]
++    for item in items[:8]:
++        title = _safe_review_reason(item['title'], 90)
++        reason = _safe_review_reason(item['reason'], 170)
++        lines.append(f"• {title} ({item['task_id']}): {reason or 'Please check the blocker on this card.'}")
++    if len(items)>8:
++        lines.append(f"Plus {len(items)-8} other items in this same conversation's board.")
++    lines.append("Reply here when the missing access or decision is ready. I’ll keep this to one daytime reminder a day while it’s unresolved.")
++    return '\n'.join(lines)
++
++
++def _claim(conn, delivery, config, now):
++    if settings(config) is None:
++        return None
++    # Re-read source, current blocker and quiet period immediately before effect.
++    current = collect(conn, [i['sub'] for i in delivery['items']], config, now=now)
++    fresh = next((d for d in current if d['destination']==delivery['destination'] and d['delivery_id']==delivery['delivery_id']),None)
++    if fresh is None:
++        return None
++    with kb.write_txn(conn):
++        for i in fresh['items']:
++            _validate(conn, i['sub'], i['event_id'])
++        row = conn.execute('SELECT * FROM owner_attention_destinations WHERE destination=?',(fresh['destination'],)).fetchone()
++        if row and (row['snoozed_until']>now or row['last_attempt']+DAY>now):
++            return None
++        inserted = conn.execute('INSERT OR IGNORE INTO owner_attention_deliveries VALUES(?,?,?,?,NULL)',(fresh['destination'],fresh['delivery_id'],'inflight',now)).rowcount
++        if inserted:
++            conn.execute('INSERT INTO owner_attention_destinations VALUES(?,?,0) ON CONFLICT(destination) DO UPDATE SET last_attempt=excluded.last_attempt',(fresh['destination'],now))
++        return fresh if inserted else None
++
++
++async def deliver(conn, delivery, adapter, config, *, now=None):
++    """One provider attempt; unavailable adapters remain queued without a claim."""
++    now = int(time.time() if now is None else now)
++    sub = delivery['sub']
++    platform = sub.get('platform')
++    if platform != 'api_server' and adapter is None:
++        return False
++    if platform == 'telegram' and getattr(adapter,'_bot',None) is None:
++        return False
++    if platform == 'photon' and getattr(adapter,'_http_client',None) is None:
++        return False
++    fresh = _claim(conn, delivery, config, now)
++    if fresh is None:
++        return False
++    text = _text(fresh['items'])
++    from gateway.kanban_watchers import _external_delivery_metadata
++    meta = _external_delivery_metadata(dict(_json(sub.get('delivery_metadata'))))
++    if sub.get('thread_id'):
++        meta['thread_id'] = sub['thread_id']
++    if platform == 'photon':
++        meta['logical_message_id'] = 'owner-attention:'+fresh['delivery_id']
++    try:
++        if platform == 'api_server':
++            from gateway.owner_attention_app import persist
++            result = persist(conn, fresh, text)
++            message_id = result.get('message_id')
++            if result.get('accepted_locally') is not True or not message_id:
++                raise RuntimeError('Local app receipt not confirmed')
++        else:
++            result = await send_once(adapter, sub['chat_id'], meta, text=text)
++            message_id = getattr(result,'message_id',None)
++            if getattr(result,'success',False) is not True or not message_id:
++                raise RuntimeError('Provider receipt not confirmed')
++        with kb.write_txn(conn):
++            conn.execute("UPDATE owner_attention_deliveries SET state='accepted',receipt=? WHERE destination=? AND delivery_id=?",(json.dumps({'message_id':str(message_id)}),fresh['destination'],fresh['delivery_id']))
++    except BaseException as exc:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE owner_attention_deliveries SET state='uncertain',receipt=? WHERE destination=? AND delivery_id=?",(json.dumps({'reason':type(exc).__name__}),fresh['destination'],fresh['delivery_id']))
++        with kb.write_txn(conn):
++            for item in fresh['items']:
++                kb._append_event(conn,item['task_id'],'owner_attention_delivery_held',{'reason':'Provider receipt unconfirmed; do not repeat this send. A distinct daily follow-up may be due later.','delivery_id':fresh['delivery_id']})
++        if not isinstance(exc,Exception):
++            raise
++        return False
++    # App consumer records the passive note in its original conversation.
++    if platform == 'api_server':
++        return True
++    # Preserve reply continuity, best effort and strictly in the same source.
++    try:
++        from gateway.mirror import find_owner_dm_session, mirror_proactive_message
++        sid = find_owner_dm_session(platform,str(sub['chat_id']),sub.get('thread_id'))
++        if sid:
++            mirror_proactive_message(platform,str(sub['chat_id']),text,source='owner blocker follow-up',ref=fresh['delivery_id'],thread_id=sub.get('thread_id'),session_id=sid)
++    except Exception:
++        pass
++    return True
++
++
++def owns_event(conn, sub, event, config):
++    """Prevent duplicate legacy pings/model wakes for this passive-only hold."""
++    if settings(config) is None or event.kind not in {'blocked','block_loop_detected','capability_preflight_blocked'}:
++        return False
++    if sub.get('platform') not in {'telegram','photon','api_server'}:
++        return False
++    try:
++        current = _validate(conn, sub)
++        return event.id <= current['event_id']
++    except (PermissionError, ValueError, TypeError, KeyError):
++        return False
+--- /dev/null
++++ b/gateway/owner_attention_app.py
+@@ -0,0 +1,122 @@
++"""Passive attention receipts. Never completion, delivery approval, or a model turn."""
++import json
++from pathlib import Path
++from contextlib import closing
++from gateway import owner_delegation as work
++from gateway.kanban_delivery_receipts import identity
++from hermes_cli import kanban_db as kb
++
++
++def _source(conn, item):
++    from gateway import owner_attention as attention
++    sub = item['sub']
++    owner = item['requester']
++    enrolled = work.enrollment(owner)
++    actual = Path(next(r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'))
++    if actual != work.database(enrolled['board']) or sub.get('platform') != 'api_server':
++        raise PermissionError('Canonical owner app board required')
++    if not any(identity(s) == identity(sub) for s in kb.list_notify_subs(conn, item['task_id'], include_internal_metadata=True)):
++        raise PermissionError('Original app subscription changed')
++    row = conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?', (item['task_id'],)).fetchone()
++    binding = json.loads(row[0]) if row else None
++    meta = attention._json(sub.get('delivery_metadata'))
++    if meta.get('_kanban_inherited_subscription'):
++        raise PermissionError('Inherited app destination denied')
++    if binding and binding.get('kind') == work.KIND:
++        work.verify_return(conn, sub)
++        _, task, _, binding = work.verify_task(conn, item['task_id'])
++        if binding.get('principal') != owner:
++            raise PermissionError('Private owner changed')
++    elif binding and binding.get('kind') == 'native-api-return-v1':
++        from gateway.app_business_authority import current
++        profile = binding.get('profile')
++        authority = binding.get('authority', {})
++        fresh = current(profile, owner) if authority.get('scope_contract') == 'gus-company-work-v1' else enrolled
++        if (authority != fresh or binding.get('board') != enrolled['board']
++                or ('principal' not in authority and profile != ('default' if owner == 'chris' else owner))):
++            raise PermissionError('Native app enrollment changed')
++        task = conn.execute('SELECT * FROM tasks WHERE id=?', (item['task_id'],)).fetchone()
++        if not task or task['session_id'] != binding.get('session_id'):
++            raise PermissionError('Native app source changed')
++    else:
++        # Legacy app handoffs have no native API run. The app must additionally
++        # match its existing same-owner handoff ledger; never invent a thread.
++        if owner != 'chris' or sub.get('notifier_profile') not in {None, '', 'default'}:
++            raise PermissionError('Missing enrolled native app source')
++        from gateway.kanban_watchers import _has_exact_notification_origin
++        if not _has_exact_notification_origin(kb.get_task(conn, item['task_id']), {**sub, 'delivery_metadata':meta}):
++            raise PermissionError('Original app handoff missing')
++        return dict(kind='handoff', taskId=item['task_id'], board=enrolled['board'])
++    target = binding.get('target', {})
++    for key in ('platform','chat_id','notifier_profile','user_id','user_id_alt','chat_type','delivery_mode'):
++        if sub.get(key) != target.get(key):
++            raise PermissionError('App subscription changed')
++    if (sub.get('thread_id') or None) != (target.get('thread_id') or None):
++        raise PermissionError('App thread changed')
++    if any(meta.get(k) != v for k,v in target.get('delivery_metadata', {}).items()):
++        raise PermissionError('App session key changed')
++    sid, run, key = binding.get('session_id'), binding.get('run_id'), meta.get('session_key')
++    if not all(isinstance(v,str) and 0 < len(v) <= 200 for v in (sid,run,key)):
++        raise PermissionError('Complete original app run required')
++    return dict(kind='native', taskId=item['task_id'], board=enrolled['board'],
++                sessionId=sid, runId=run, sessionKey=key, bindingDigest=work.digest(binding))
++
++
++def persist(conn, delivery, text):
++    from gateway import owner_attention as attention
++    if not isinstance(text,str) or not 0 < len(text) <= 16000:
++        raise ValueError('Bounded attention text required')
++    with kb.write_txn(conn):
++        items = []
++        for supplied in delivery['items']:
++            item = attention._validate(conn, supplied['sub'], supplied['event_id'])
++            if item['requester'] != delivery['requester'] or attention.destination(item) != delivery['destination']:
++                raise PermissionError('Attention destination changed')
++            items.append({**item, 'source':_source(conn,item)})
++        if not items or len(items) > 100:
++            raise ValueError('Bounded current attention required')
++        conn.execute('CREATE TABLE IF NOT EXISTS owner_attention_app (attention_id TEXT PRIMARY KEY,owner TEXT NOT NULL,payload TEXT NOT NULL)')
++        payload=dict(attentionId=delivery['destination'], deliveryId=delivery['delivery_id'],
++                     owner=delivery['requester'], updatedAt=delivery['created_at']*1000, items=items, summary=text)
++        raw=work.encode(payload)
++        if len(raw.encode()) > 262144:
++            raise ValueError('Attention record too large')
++        old=conn.execute('SELECT owner FROM owner_attention_app WHERE attention_id=?',(delivery['destination'],)).fetchone()
++        if old and old[0] != payload['owner']:
++            raise PermissionError('Attention owner changed')
++        conn.execute('INSERT INTO owner_attention_app VALUES(?,?,?) ON CONFLICT(attention_id) DO UPDATE SET payload=excluded.payload',
++                     (delivery['destination'],payload['owner'],raw))
++    return {'message_id':'app-attention:'+delivery['destination'], 'accepted_locally':True}
++
++
++def read(owner):
++    """Owner derived by protected app backend. Enrollment/source rechecked here."""
++    from gateway import owner_attention as attention
++    authority=work.enrollment(owner)
++    with closing(work._connect(work.database(authority['board']))) as conn:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='owner_attention_app'").fetchone():
++            return []
++        rows=conn.execute('SELECT payload FROM owner_attention_app WHERE owner=? ORDER BY attention_id LIMIT 100',(owner,)).fetchall()
++        result=[]
++        for row in rows:
++            p=json.loads(row[0]);active=[];sources=[]
++            try:
++                for item in p['items']:
++                    source=_source(conn,item)
++                    if source != item['source'] or item['requester'] != owner:
++                        raise PermissionError('Attention source changed')
++                    sources.append(source)
++                    try: active.append(attention._validate(conn,item['sub'],item['event_id']))
++                    except ValueError: pass  # resolved/superseded, not revoked authority
++            except PermissionError:
++                continue
++            summary=p['summary'] if len(active)==len(p['items']) else attention._text(active) if active else 'This blocker has cleared; the work is no longer waiting on this request.'
++            result.append(dict(attentionId=p['attentionId'],deliveryId=p['deliveryId'],owner=owner,
++                               updatedAt=p['updatedAt'],sources=sources,summary=summary,resolved=not active))
++        if work.enrollment(owner) != authority:
++            raise PermissionError('Owner enrollment changed during read')
++        return result
++
++
++def source_binding(conn, sub, requester):
++    return _source(conn, dict(sub=sub, requester=requester, task_id=sub["task_id"]))
+--- a/hermes_cli/board_owner_manage.py
++++ b/hermes_cli/board_owner_manage.py
+@@ -14,7 +14,7 @@
+ from pathlib import Path
+ 
+ _expected = ContextVar('owner_board_expected_state', default=None)
+-ACTIONS = ('work', 'prepare', 'archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
++ACTIONS = ('work', 'block', 'prepare', 'archive', 'restore', 'start_triage', 'resume_triage', 'unblock', 'unlink_dependency', 'recover_review', 'repair_review_reference')
+ 
+ 
+ # Set only after the controller verifies a signed gateway request.
+@@ -171,7 +171,7 @@
+     member = require_owner()
+     if member is not None and _member_context.get() is None:
+         raise PermissionError('Member mutations require the signed controller request')
+-    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence', 'plan', 'instruction'}
++    allowed = {'action', 'task_id', 'reason', 'expected_state', 'dry_run', 'board', 'parent_id', 'evidence', 'plan', 'instruction', 'kind'}
+     if not isinstance(args, dict) or set(args) - allowed:
+         raise ValueError('Unsupported board operation fields')
+     from gateway.gus_admin_cli import admission
+@@ -184,12 +184,12 @@
+     reason = args.get('reason', '')
+     if not re.fullmatch(r't_[A-Za-z0-9_]+', task_id) or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+         raise ValueError('Exact task id and a concise disposition/resolution reason required')
+-    if action != 'work' and not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
++    if action not in ('work', 'block') and not re.fullmatch(r'[a-f0-9]{64}', str(args.get('expected_state', ''))):
+         raise ValueError('Use expected_state from the latest kanban_show board_administration.native fields')
+     dry = args.get('dry_run', False)
+     if type(dry) is not bool:
+         raise ValueError('dry_run must be boolean')
+-    if dry and action not in ('work', 'prepare', 'start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
++    if dry and action not in ('work', 'block', 'prepare', 'start_triage', 'resume_triage', 'recover_review', 'repair_review_reference'):
+         raise ValueError('Dry run is supported for triage and review operations; other operations are reversible')
+     board = member_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+     actor = member['principal'] if member is not None else 'default'
+@@ -211,6 +211,20 @@
+                     receipt = work(conn, task_id, args.get('instruction') or reason,
+                                    actor=actor, member=member, board=board,
+                                    plan=args.get('plan'), dry_run=dry)
++                return dict(ok=True, action=action, task_id=task_id, board=board,
++                            native=describe(conn, task_id), **receipt)
++            finally:
++                _expected.reset(token)
++    if action == 'block':
++        from hermes_cli.owner_board_hold import hold
++        with kb.connect_closing(board=board) as conn:
++            fresh = describe(conn, task_id)
++            if args.get('expected_state') is not None and args['expected_state'] != fresh['expected_state']:
++                raise ValueError('Board state changed; repeat the current hold request')
++            token = _expected.set({**args, 'expected_state': fresh['expected_state']})
++            try:
++                with admission(Namespace(kanban_action='block', board=board)):
++                    receipt = hold(conn, task_id, reason=reason, kind=args.get('kind'), dry_run=dry)
+                 return dict(ok=True, action=action, task_id=task_id, board=board,
+                             native=describe(conn, task_id), **receipt)
+             finally:
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2822,6 +2822,13 @@
+     # each claimable ready task. One dispatcher per profile is sufficient;
+     # running more than one on the same kanban.db will race for claims.
+     "kanban": {
++        # Passive exact-source owner asks, with no worker/model wake. Each task
++        # also requires its authenticated owner work/hold or private contract.
++        "owner_attention": {
++            "enabled": False,
++            "default_timezone": "",  # explicit service timezone or per-owner map
++            "timezones": {},
++        },
+         # Auto-subscribe the originating gateway/TUI session to task
+         # completion + block events when ``kanban_create`` is called from
+         # inside a session that has a persistent delivery channel. The
+--- /dev/null
++++ b/hermes_cli/owner_board_hold.py
+@@ -0,0 +1,101 @@
++"""Authenticated owner board holds, separate from worker failure accounting."""
++import json
++from hermes_cli import kanban_db as kb
++from hermes_cli import board_owner_manage as control
++
++KINDS = frozenset({'needs_input', 'capability', 'transient'})
++
++
++def _latest_stop(conn, task_id):
++    row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind IN "
++        "('blocked','block_loop_detected','triaged','escalated','dependency_wait','archived','restored','changes_requested') "
++        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return None
++    try:
++        payload = json.loads(row['payload'])
++        return payload if isinstance(payload, dict) else None
++    except (ValueError, TypeError):
++        return None
++
++
++def _review_binding(conn, task_id):
++    task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
++    # Holding a queue changes only these two fields. Everything that selected
++    # the original reviewer and review evidence remains exactly bound.
++    for key in ('status', 'block_kind'):
++        task.pop(key, None)
++    goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++    handoff = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    return control._hash({'task': task, 'goal': dict(goal) if goal else None,
++                          'handoff': dict(handoff) if handoff else None})
++
++
++def resume_queued_review(conn, task_id):
++    """An unchanged owner-paused queue needs no fabricated reviewer findings.
++
++    This is not recovery of a worker's failed review: only a hold placed while
++    that same independent review was already queued can match this receipt.
++    The caller retains normal work-order budgeting, dependencies and admission.
++    """
++    bound = control._expected.get()
++    if not bound or bound.get('action') != 'work' or bound.get('task_id') != task_id:
++        return False
++    member = control.require_owner()
++    if member is not None:
++        control._validate_member_connection(conn, member)
++    task = kb.get_task(conn, task_id)
++    stop = _latest_stop(conn, task_id)
++    if not task or task.status != 'blocked' or not stop or stop.get('owner_board_hold') is not True:
++        return False
++    if not stop.get('resume_queued_review') or stop.get('source_status') != 'review':
++        return False
++    if stop.get('review_binding') != _review_binding(conn, task_id):
++        raise ValueError('The held review changed; inspect its current reviewer and evidence before resuming')
++    control.validate_bound_target(conn, task_id, 'work')
++    return True
++
++
++def hold(conn, task_id, *, reason, kind, dry_run=False):
++    member = control.require_owner()
++    bound = control._expected.get()
++    if not bound or bound.get('action') != 'block' or bound.get('task_id') != task_id:
++        raise PermissionError('A bound authenticated owner hold request is required')
++    if kind not in KINDS:
++        raise ValueError('block requires kind=needs_input, capability or transient; use actual prerequisite links for dependency waits')
++    if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000 or type(dry_run) is not bool:
++        raise ValueError('A concise concrete wait and what resolves it are required')
++    if member is not None:
++        control._validate_member_connection(conn, member)
++    actor = member['principal'] if member else 'default'
++    with kb.write_txn(conn):
++        control.validate_bound_target(conn, task_id, 'block')
++        if control.require_owner() != member:
++            raise PermissionError('Owner identity changed')
++        task = kb.get_task(conn, task_id)
++        if task.status not in {'triage', 'todo', 'ready', 'review', 'blocked'}:
++            raise ValueError('Only idle unfinished cards may be held; restore completed/archived work separately')
++        goal = conn.execute('SELECT phase,owner_profile FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
++        source = 'review' if task.status == 'review' or (goal and goal['phase'] == 'review') else kb._resume_status_from_events(conn, task_id)
++        prior = _latest_stop(conn, task_id)
++        binding = _review_binding(conn, task_id) if source == 'review' else None
++        queued_review = bool(task.status == 'review' or (task.status == 'blocked' and prior
++            and prior.get('owner_board_hold') is True and prior.get('resume_queued_review') is True
++            and prior.get('review_binding') == binding))
++        payload = {'reason': reason.strip(), 'kind': kind, 'source_status': source,
++                   'previous_status': task.status, 'actor': actor, 'owner_profile': (goal['owner_profile'] if goal else None) or actor,
++                   'owner_board_hold': True, 'approval_granted': False,
++                   'requester': member['principal'] if member else 'chris',
++                   'owner_attention_requested': kind in {'needs_input', 'capability'},
++                   'failure_history_preserved': True, 'action_restrictions_preserved': True,
++                   'resume_queued_review': queued_review, 'review_binding': binding}
++        if not dry_run:
++            conn.execute("UPDATE tasks SET status='blocked',block_kind=? WHERE id=?", (kind, task_id))
++            kb._append_event(conn, task_id, 'blocked', payload)
++        return {'changed': not dry_run, 'dry_run': dry_run, 'status': task.status if dry_run else 'blocked',
++                'proposed_status': 'blocked', 'block_kind': kind, 'reason': reason.strip(),
++                'source_status': source, 'worker_started': False, 'failure_history_preserved': True,
++                'action_restrictions_preserved': True, 'approval_granted': False,
++                'next_action': 'Keep ownership of this card. Resolve or follow up on the recorded wait: '
++                    + reason.strip() + '. When it is resolved or the owner provides a changed instruction, '
++                    'use action=work on this same card; retain its assigned worker/reviewer, real dependencies and external-action restrictions.'}
+--- a/hermes_cli/owner_board_recovery.py
++++ b/hermes_cli/owner_board_recovery.py
+@@ -250,11 +250,11 @@
+             or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000
+             or type(dry_run) is not bool):
+         raise ValueError('An installed reviewer and bounded current work instruction are required')
+-    # Discovery can take tens of seconds; never hold the board writer lock
+-    # across profile/skill/tool admission. The later short transaction compares
+-    # the bound snapshot and exact maker evidence before committing anything.
++    # This is an authenticated owner assignment, not worker admission. The
++    # replacement cannot prove native ownership until this assignment commits.
++    # Normal dispatch must admit it freshly before claim or execution.
+     if conn.in_transaction:
+-        raise ValueError('Reviewer admission must run outside a board write transaction')
++        raise ValueError('Reviewer reassignment requires its own short board transaction')
+     bound = control._expected.get()
+     member = control.require_owner()
+     if (not bound or bound.get('action') != 'work' or bound.get('task_id') != task_id
+@@ -289,32 +289,16 @@
+                 'failure_history_preserved': True,
+                 'next_action': 'The installed reviewer is already queued for the existing maker output.'}
+     handoff = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+-    projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
+-    try:
+-        admission = kb._build_worker_admission(projected, reviewer, board=board)
+-    except kb.WorkerAdmissionError as exc:
+-        if isinstance(exc.__cause__, oc.OwnerCellGuardError):
+-            raise ValueError('Reviewer readiness: ' + ' '.join(str(exc.__cause__).split())[:500]) from exc
+-        raise
+     with kb.write_txn(conn):
+         if control.require_owner() != member or prep._connection_board(conn, member) != board:
+-            raise PermissionError('Owner or board changed during reviewer admission')
++            raise PermissionError('Owner or board changed during reviewer reassignment')
+         control.validate_bound_target(conn, task_id, 'work')
+         # Roster enrollment can change independently of the task transaction.
+         task = prep._task(conn, task_id)
+         prep._idle(conn, {**task, 'status': 'ready'})
+         prep._eligible(conn, task, reviewer, member)
+-        projected = dataclasses.replace(kb.get_task(conn, task_id), assignee=reviewer)
+-        actual_db = next(row[2] for row in conn.execute('PRAGMA database_list') if row[1] == 'main')
+-        if (admission.contract.get('version') != 'hermes.worker-admission/v1'
+-                or admission.contract.get('status') == 'rejected'
+-                or admission.contract.get('task') != task_id
+-                or admission.contract.get('profile') != reviewer
+-                or admission.contract.get('board_database') != kb._database_identity_contract(actual_db)
+-                or hashlib.sha256(admission.encoded_contract.encode()).hexdigest() != admission.digest
+-                or not kb._admission_still_current(projected, admission)
+-                or _independent_review_binding(conn, task_id) != binding):
+-            raise ValueError('Fresh exact accepted reviewer admission and unchanged maker evidence are required')
++        if _independent_review_binding(conn, task_id) != binding:
++            raise ValueError('Review reassignment requires unchanged maker evidence')
+         if not dry_run:
+             conn.execute('UPDATE tasks SET assignee=? WHERE id=?', (reviewer, task_id))
+             payload = json.loads(handoff['payload'])
+@@ -328,5 +312,5 @@
+                 'reviewer': reviewer, 'previous_reviewer': binding['reviewer'],
+                 'producer_run_id': binding['producer_run_id'],
+                 'failure_history_preserved': True, 'action_restrictions_preserved': True,
+-                'worker_started': False, 'verdict_recorded': False,
+-                'next_action': 'Normal independent-review dispatch using the same maker evidence and existing task budget.'}
++                'worker_started': False, 'verdict_recorded': False, 'worker_admission': 'pending_dispatch',
++                'next_action': 'The newly assigned reviewer must pass normal fresh dispatch admission before claim or execution, using the same maker evidence and existing task budget.'}
+--- a/hermes_cli/owner_work_start.py
++++ b/hermes_cli/owner_work_start.py
+@@ -92,6 +92,9 @@
+ 
+ 
+ def _review(conn, task_id, goal, actor, instruction, dry_run):
++    from hermes_cli.owner_board_hold import resume_queued_review
++    if resume_queued_review(conn, task_id):
++        return
+     from hermes_cli.owner_board_recovery import recover_review, recover_native_review, goal_snapshot_sha
+     if goal is None:
+         return recover_native_review(conn, task_id, actor=actor, reason=instruction, dry_run=dry_run)
+@@ -142,8 +145,8 @@
+                 'worker_started': False, 'failure_history_preserved': True,
+                 'next_action': 'The existing reviewer is already queued; preserve its independent review.'}
+     prep._idle(conn, task)
+-    if not task.get('assignee') or not str(task.get('body') or '').strip():
+-        raise ValueError('This task needs a worker and its actual requested work before it can start')
++    if not str(task.get('body') or '').strip():
++        raise ValueError('This task needs its actual requested work before it can start')
+     is_review = bool(goal and goal.get('phase') == 'review')
+     is_review = is_review or kb._resume_status_from_events(conn, task_id) == 'review'
+     if goal is None and not is_review:
+@@ -154,17 +157,32 @@
+             is_review = bool(handoff and json.loads(handoff['payload']).get('reviewer') == task['assignee'])
+         except (ValueError, TypeError, AttributeError):
+             pass
+-    if not is_review:
+-        prep._eligible(conn, task, task['assignee'], member)
+     normalized = readiness = None
++    replacement_worker = None
+     if plan is not None:
+         if is_review:
+             raise ValueError('A review continuation retains its bound reviewer; prepare maker work separately')
+-        normalized = prep._normalise(plan, task)
+-        prep._eligible(conn, task, normalized['assignee'], member)
+-        readiness = prep._readiness(conn, task, normalized, member)
+-        if readiness['issues']:
+-            raise ValueError('Prepared worker is missing resources: ' + json.dumps(readiness['issues'], sort_keys=True))
++        if isinstance(plan, dict) and set(plan) == {'assignee'}:
++            from hermes_cli.profiles import normalize_profile_name
++            if not isinstance(plan['assignee'], str) or not plan['assignee'].strip():
++                raise ValueError('Choose an installed non-root worker profile')
++            replacement_worker = normalize_profile_name(plan['assignee'])
++            prep._eligible(conn, task, replacement_worker, member)
++            existing_plan = prep.current(conn, task_id)
++            if existing_plan is not None:
++                normalized = {key: existing_plan[key] for key in ('brief','acceptance','requirements','assignee','skills','budget')}
++                normalized['assignee'] = replacement_worker
++        else:
++            normalized = prep._normalise(plan, task)
++            prep._eligible(conn, task, normalized['assignee'], member)
++        if normalized is not None:
++            readiness = prep._readiness(conn, task, normalized, member)
++            if readiness['issues']:
++                raise ValueError('Prepared worker is missing resources: ' + json.dumps(readiness['issues'], sort_keys=True))
++    elif not is_review:
++        if not task.get('assignee'):
++            raise ValueError('This task needs an existing worker; use plan={assignee: installed-worker} to assign it')
++        prep._eligible(conn, task, task['assignee'], member)
+     previous = current(conn, task_id)
+     prior_preparation = prep.current(conn, task_id)
+     preparation_changed = normalized is not None and (prior_preparation is None or any(
+@@ -182,6 +200,11 @@
+             budget.update(execution_budget=normalized['budget'], preparation_digest=prep._hash(normalized))
+             conn.execute('UPDATE tasks SET assignee=?,skills=?,worker_budget_json=? WHERE id=?',
+                          (normalized['assignee'], json.dumps(normalized['skills']), json.dumps(budget, sort_keys=True), task_id))
++        if replacement_worker is not None and normalized is None and replacement_worker != task.get('assignee') and not dry_run:
++            conn.execute('UPDATE tasks SET assignee=? WHERE id=?', (replacement_worker, task_id))
++            kb._append_event(conn, task_id, 'assigned', {'assignee': replacement_worker,
++                'previous_assignee': task.get('assignee'), 'actor': actor,
++                'reason': instruction, 'source': 'owner_work_requested'})
+         selected_plan = normalized or ({key: prior_preparation[key] for key in ('brief','acceptance','requirements','assignee','skills','budget')} if prior_preparation else None)
+         # Same instruction is the same input; a later stopped run does not make
+         # another credit-consuming attempt available just by repeating it.
+--- /dev/null
++++ b/tests/gateway/test_owner_attention.py
+@@ -0,0 +1,220 @@
++"""No network/model calls: real temp board and recording transport boundary."""
++import asyncio
++from datetime import datetime
++from types import SimpleNamespace
++from zoneinfo import ZoneInfo
++
++import pytest
++from hermes_cli import kanban_db as kb
++from gateway import owner_attention as attention
++
++CONFIG={'kanban':{'owner_attention':{'enabled':True,'default_timezone':'America/Toronto'}}}
++NOW=int(datetime(2026,10,5,10,tzinfo=ZoneInfo('America/Toronto')).timestamp())
++
++@pytest.fixture
++def board(tmp_path):
++    conn=kb.connect(tmp_path/'kanban.db')
++    yield conn
++    conn.close()
++
++
++def hold(conn, *, chat='owner-chat', requester='chris', explicit=True, work_order=False, kind='needs_input'):
++    tid=kb.create_task(conn,title='Login for existing task',assignee='riley',initial_status='blocked',session_id=f'agent:main:telegram:dm:{chat}')
++    conn.execute('UPDATE tasks SET block_kind=?,current_run_id=NULL WHERE id=?',(kind,tid))
++    conn.commit()
++    if work_order:
++        kb._append_event(conn,tid,'owner_work_requested',{'actor':'default' if requester=='chris' else requester,'version':1})
++    kb._append_event(conn,tid,'blocked',{'kind':kind,'reason':'Please reconnect the authorized account.','owner_board_hold':explicit,'owner_attention_requested':explicit,'requester':requester})
++    kb.add_notify_sub(conn,task_id=tid,platform='telegram',chat_id=chat,notifier_profile='default',delivery_mode='notify+wake',chat_type='dm')
++    return tid
++
++
++def subs(conn):return kb.list_notify_subs(conn,include_internal_metadata=True)
++def collect(conn,when=NOW):return attention.collect(conn,subs(conn),CONFIG,now=when)
++
++@pytest.fixture
++def sender(monkeypatch):
++    sent=[]
++    async def send(adapter,chat,metadata,**kwargs):
++        sent.append((chat,kwargs['text']))
++        return SimpleNamespace(success=True,message_id=str(len(sent)))
++    monkeypatch.setattr(attention,'send_once',send)
++    import gateway.mirror
++    monkeypatch.setattr(gateway.mirror,'find_owner_dm_session',lambda *a,**k:None)
++    return sent,SimpleNamespace(_bot=object())
++
++
++def test_grouped_daily_no_model_wake_and_preserves_board(board,sender):
++    a=hold(board);b=hold(board)
++    snapshot=[tuple(r) for r in board.execute('SELECT * FROM tasks')]
++    due=collect(board);assert len(due)==1 and len(due[0]['items'])==2
++    sent,adapter=sender
++    assert asyncio.run(attention.deliver(board,due[0],adapter,CONFIG,now=NOW))
++    assert len(sent)==1 and a in sent[0][1] and b in sent[0][1]
++    assert collect(board,NOW+86399)==[]
++    assert len(collect(board,NOW+86400))==1
++    assert snapshot==[tuple(r) for r in board.execute('SELECT * FROM tasks')]
++    row=board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",(a,)).fetchone()
++    import json
++    assert attention.owns_event(board,subs(board)[0],SimpleNamespace(kind='blocked',id=row['id'],payload=json.loads(row['payload'])),CONFIG)
++
++
++def test_no_legacy_optin_and_disabled_service(board):
++    hold(board,explicit=False)
++    assert collect(board)==[]
++    hold(board)
++    assert attention.collect(board,subs(board),{},now=NOW)==[]
++    assert attention.collect(board,subs(board),{'kanban':{'owner_attention':{'enabled':False}}},now=NOW)==[]
++
++
++def test_future_native_worker_block_after_trusted_work_request(board):
++    hold(board,explicit=False,work_order=True)
++    assert len(collect(board))==1
++
++
++def test_quiet_hours_and_unknown_timezone_fail_closed(board):
++    hold(board)
++    night=NOW+12*3600
++    assert collect(board,night)==[]
++    assert attention.collect(board,subs(board),{'kanban':{'owner_attention':{'enabled':True}}},now=NOW)==[]
++
++
++@pytest.mark.parametrize('change',['resolved','revoked','rerouted','new_reason','new_status','active','member_without_contract'])
++def test_revalidate_before_send_rejects_stale_or_foreign(board,sender,change):
++    tid=hold(board);due=collect(board)[0]
++    if change=='resolved':board.execute("UPDATE tasks SET status='ready' WHERE id=?",(tid,))
++    elif change=='revoked':board.execute('DELETE FROM kanban_notify_subs WHERE task_id=?',(tid,))
++    elif change=='rerouted':board.execute("UPDATE kanban_notify_subs SET chat_id='other' WHERE task_id=?",(tid,))
++    elif change=='active':board.execute("UPDATE tasks SET claim_lock='busy' WHERE id=?",(tid,))
++    elif change=='new_status':kb._append_event(board,tid,'triaged',{'reason':'Different current stop'})
++    elif change=='new_reason':kb._append_event(board,tid,'blocked',{'kind':'needs_input','owner_board_hold':True,'owner_attention_requested':True,'requester':'chris','reason':'A different decision is needed'})
++    elif change=='member_without_contract':
++        import json
++        row=board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",(tid,)).fetchone();p=json.loads(row['payload']);p['requester']='connor';board.execute('UPDATE task_events SET payload=? WHERE id=?',(json.dumps(p),row['id']))
++    board.commit()
++    sent,adapter=sender
++    assert not asyncio.run(attention.deliver(board,due,adapter,CONFIG,now=NOW))
++    assert sent==[]
++
++
++def test_uncertain_receipt_no_same_day_retry_but_distinct_next_day_reminder(board,sender,monkeypatch):
++    tid=hold(board);due=collect(board)[0];sent,adapter=sender
++    async def timeout(*a,**k):sent.append('attempt');raise TimeoutError()
++    monkeypatch.setattr(attention,'send_once',timeout)
++    assert not asyncio.run(attention.deliver(board,due,adapter,CONFIG,now=NOW))
++    assert collect(board,NOW+86399)==[] and sent==['attempt']
++    next_day=collect(board,NOW+86400)
++    assert len(next_day)==1 and next_day[0]['delivery_id']!=due['delivery_id']
++    assert board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='owner_attention_delivery_held'",(tid,)).fetchone()
++
++
++def test_sources_never_consolidate_across_conversations(board):
++    hold(board,chat='one');hold(board,chat='two')
++    assert len(collect(board))==2
++
++
++def test_inherited_sub_cannot_receive_owners_blocker(board):
++    tid=hold(board)
++    kb.add_notify_sub(board,task_id=tid,platform='telegram',chat_id='other',notifier_profile='default',delivery_metadata={'_kanban_inherited_subscription':True,'_kanban_subscription_origin_task_id':'parent'})
++    due=collect(board)
++    assert len(due)==1 and due[0]['sub']['chat_id']=='owner-chat'
++
++from tests.gateway.test_member_owner_delegation import enrolled, request, INTENT
++from gateway import owner_delegation as work
++
++
++def test_new_member_native_contract_optin_and_fresh_enrollment_revoke(enrolled):
++    import json
++    root,catalog,_env=enrolled
++    with request('newmember'):
++        created=json.loads(work.create(INTENT))
++    with kb.connect(work.database(catalog['newmember']['board'])) as conn:
++        assert kb.block_task(conn,created['task_id'],reason='Please reconnect your account before this can continue.',kind='needs_input')
++        due=collect(conn)
++        assert len(due)==1 and due[0]['requester']=='newmember'
++        assert due[0]['sub']['platform']=='api_server'
++        assert due[0]['sub']['user_id']=='newmember'
++        catalog.pop('newmember')
++        assert collect(conn)==[]
++
++
++def test_passive_notice_is_mirrored_to_same_conversation(board,sender,monkeypatch):
++    import gateway.mirror
++    mirrored=[]
++    monkeypatch.setattr(gateway.mirror,'find_owner_dm_session',lambda p,c,t:'original-session')
++    monkeypatch.setattr(gateway.mirror,'mirror_proactive_message',lambda *a,**k:mirrored.append((a,k)))
++    hold(board)
++    sent,adapter=sender
++    assert asyncio.run(attention.deliver(board,collect(board)[0],adapter,CONFIG,now=NOW))
++    assert len(mirrored)==1 and mirrored[0][0][1]=='owner-chat'
++    assert mirrored[0][1]['session_id']=='original-session'
++
++
++def test_two_unseen_block_events_do_not_reach_legacy_model_wake(board):
++    import json
++    tid=hold(board)
++    kb._append_event(board,tid,'blocked',{'kind':'needs_input','reason':'Latest question','owner_board_hold':True,'owner_attention_requested':True,'requester':'chris'})
++    events=[SimpleNamespace(kind=r['kind'],id=r['id'],payload=json.loads(r['payload'])) for r in board.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? AND kind='blocked'",(tid,))]
++    assert len(events)==2
++    assert all(attention.owns_event(board,subs(board)[0],ev,CONFIG) for ev in events)
++    assert collect(board)[0]['items'][0]['reason']=='Latest question'
++
++
++def test_capability_preflight_requires_work_optin_and_skips_transient(board):
++    tid=hold(board,explicit=False,work_order=True,kind='capability')
++    kb._append_event(board,tid,'capability_preflight_blocked',{'kind':'capability','reason':'Requested login is unavailable'})
++    assert len(collect(board))==1
++    board.execute("UPDATE tasks SET block_kind='transient' WHERE id=?",(tid,));board.commit()
++    kb._append_event(board,tid,'capability_preflight_blocked',{'kind':'transient','reason':'Startup probe timed out'})
++    assert collect(board)==[]
++
++
++def test_real_timestamp_session_uses_original_canonical_source_metadata(board):
++    tid=hold(board)
++    board.execute("UPDATE tasks SET session_id='20260802_104816_357e6852' WHERE id=?",(tid,));board.commit()
++    kb.add_notify_sub(board,task_id=tid,platform='telegram',chat_id='owner-chat',notifier_profile='default',delivery_metadata={'session_key':'agent:main:telegram:dm:owner-chat'})
++    # The native origin marker is stamped on this unrelated explicit sub too,
++    # but its source key still names the original chat and must not authorize it.
++    kb.add_notify_sub(board,task_id=tid,platform='telegram',chat_id='foreign-chat',notifier_profile='default',delivery_metadata={'session_key':'agent:main:telegram:dm:owner-chat'})
++    due=collect(board)
++    assert len(due)==1 and due[0]['sub']['chat_id']=='owner-chat'
++
++
++def test_native_member_app_attention_is_separate_passive_receipt(enrolled):
++    import json
++    from gateway import owner_attention_app
++    root,catalog,_env=enrolled
++    with request('newmember'):
++        created=json.loads(work.create(INTENT))
++    with kb.connect(work.database(catalog['newmember']['board'])) as conn:
++        assert kb.block_task(conn,created['task_id'],reason='Please reconnect your account.',kind='needs_input')
++        due=collect(conn)[0]
++        assert asyncio.run(attention.deliver(conn,due,None,CONFIG,now=NOW))
++        rows=owner_attention_app.read('newmember')
++        assert len(rows)==1 and not rows[0]['resolved']
++        assert rows[0]['sources'][0]['sessionId']=='fixture-session'
++        assert rows[0]['sources'][0]['runId']=='fixture-run'
++        assert 'reconnect' in rows[0]['summary']
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='owner_app_replies'").fetchone() is None
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?",(created['task_id'],));conn.commit()
++        assert owner_attention_app.read('newmember')[0]['resolved']
++
++
++def test_night_app_ask_is_immediate_but_telegram_push_waits(enrolled, board):
++    import json
++    from gateway import owner_attention_app
++    night=int(datetime(2026,10,5,21,tzinfo=ZoneInfo('America/Toronto')).timestamp())
++    hold(board)
++    assert collect(board,night)==[]
++    root,catalog,_env=enrolled
++    with request('newmember'):
++        created=json.loads(work.create(INTENT))
++    with kb.connect(work.database(catalog['newmember']['board'])) as conn:
++        assert kb.block_task(conn,created['task_id'],reason='Please reconnect your account.',kind='needs_input')
++        due=collect(conn,night)
++        assert len(due)==1
++        assert asyncio.run(attention.deliver(conn,due[0],None,CONFIG,now=night))
++        assert not owner_attention_app.read('newmember')[0]['resolved']
++        assert collect(conn,night+60)==[]  # daily cadence is unchanged
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?",(created['task_id'],));conn.commit()
++        assert owner_attention_app.read('newmember')[0]['resolved']
+--- /dev/null
++++ b/tests/gateway/test_owner_attention_app.py
+@@ -0,0 +1,59 @@
++"""Real isolated member board and receipt persistence; no provider calls."""
++import json
++import sys
++from pathlib import Path
++sys.path.insert(0,str(Path(__file__).resolve().parent))
++import pytest
++from test_member_owner_delegation import enrolled,request,INTENT
++from test_owner_attention import CONFIG,NOW,collect
++from gateway import owner_attention as attention
++from gateway import owner_attention_app as app
++from gateway import owner_delegation as work
++from hermes_cli import kanban_db as kb
++
++
++def created():
++    with request('newmember'):
++        return json.loads(work.create(INTENT))['task_id']
++
++
++def test_private_receipt_daily_replacement_resolution_and_revocation(enrolled):
++    root,catalog,_=enrolled
++    task=created()
++    with kb.connect(work.database('newmember-home')) as conn:
++        assert kb.block_task(conn,task,reason='Reconnect the existing account.',kind='needs_input')
++        delivery=collect(conn)[0]
++        receipt=app.persist(conn,delivery,attention._text(delivery['items']))
++        assert receipt['accepted_locally']
++        first=app.read('newmember');assert len(first)==1 and not first[0]['resolved']
++        assert first[0]['sources'][0]['kind']=='native'
++        daily={**delivery,'delivery_id':'d'*64,'created_at':NOW+86400}
++        app.persist(conn,daily,'Still waiting for that same account.')
++        second=app.read('newmember');assert len(second)==1
++        assert second[0]['attentionId']==first[0]['attentionId']
++        assert second[0]['summary']=='Still waiting for that same account.'
++        conn.execute("UPDATE tasks SET status='ready',block_kind=NULL WHERE id=?",(task,));conn.commit()
++        assert app.read('newmember')[0]['resolved']
++        assert app.read('connor')==[]
++        catalog.pop('newmember')
++        with pytest.raises(PermissionError):app.read('newmember')
++
++
++def test_changed_source_cannot_be_reused_or_rerouted(enrolled):
++    task=created()
++    with kb.connect(work.database('newmember-home')) as conn:
++        kb.block_task(conn,task,reason='Existing access unavailable.',kind='needs_input')
++        delivery=collect(conn)[0];app.persist(conn,delivery,'Reconnect the account.')
++        conn.execute("UPDATE kanban_notify_subs SET chat_id='foreign' WHERE task_id=?",(task,));conn.commit()
++        assert app.read('newmember')==[]
++        with pytest.raises(PermissionError):app.persist(conn,delivery,'Wrong place')
++
++
++def test_not_completion_or_fake_handoff(enrolled):
++    task=created()
++    with kb.connect(work.database('newmember-home')) as conn:
++        kb.block_task(conn,task,reason='Decision needed.',kind='needs_input')
++        delivery=collect(conn)[0]
++        conn.execute('DELETE FROM task_return_intents WHERE task_id=?',(task,));conn.commit()
++        with pytest.raises((PermissionError,ValueError)):app.persist(conn,delivery,'No native source')
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='completed'",(task,)).fetchone()
+--- a/tests/hermes_cli/test_native_review_handoff_repair.py
++++ b/tests/hermes_cli/test_native_review_handoff_repair.py
+@@ -103,29 +103,6 @@
+     assert snapshot(queued)==before
+ 
+ 
+-@pytest.mark.parametrize('damage',['profile','foreign_admission','revoked_member'])
+-def test_admission_rechecks_exact_evidence_profile_board_and_member(queued,monkeypatch,damage):
+-    token=None;revoked=False
+-    if damage=='revoked_member':
+-        grant,token=member_scope(queued,monkeypatch)
+-        from gateway import owner_delegation
+-        monkeypatch.setattr(owner_delegation,'agents',lambda principal:[{'id':'grace-id'}])
+-        monkeypatch.setattr(owner_delegation,'agent',lambda *a:{'runtime':'grace'})
+-    def changed(*a,**kw):
+-        admitted=queued['build'](*a,**kw)
+-        if damage=='profile':(queued['profile_home']/'config.yaml').write_text('model: changed\n')
+-        elif damage=='foreign_admission':admitted.contract['board_database']={'path':'another-board'}
+-        elif damage=='revoked_member':monkeypatch.setattr(control,'refresh_member_grant',lambda value: (_ for _ in ()).throw(PermissionError('revoked')))
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',changed)
+-    before=snapshot(queued)
+-    try:
+-        with pytest.raises((ValueError,PermissionError)):request(queued)
+-        assert snapshot(queued)==before
+-    finally:
+-        if token is not None:control._member_context.reset(token)
+-
+-
+ def test_member_repair_requires_exact_board_and_active_own_roster(queued,monkeypatch):
+     grant,token=member_scope(queued,monkeypatch)
+     from gateway import owner_delegation
+@@ -149,41 +126,81 @@
+     assert snapshot(queued)==before
+ 
+ 
+-def test_admission_runs_without_transaction_and_other_board_writes_can_finish(queued,monkeypatch):
+-    from hermes_cli import owner_board_recovery as recovery
+-    active={}
+-    original=recovery.reroute_native_review
+-    def track(conn,*a,**kw):
+-        active['conn']=conn
+-        return original(conn,*a,**kw)
+-    monkeypatch.setattr(recovery,'reroute_native_review',track)
+-    def competing_write(*a,**kw):
+-        assert not active['conn'].in_transaction
+-        admitted=queued['build'](*a,**kw)
+-        queued['conn'].execute('PRAGMA busy_timeout=0')
+-        queued['conn'].execute('UPDATE tasks SET priority=priority+1 WHERE id!=?',(queued['task'],))
+-        queued['conn'].commit()
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
+-    assert request(queued)['changed']
+-
+-
+-@pytest.mark.parametrize('changed',['maker_evidence','task_state','new_comment'])
+-def test_short_commit_rejects_state_changes_during_unlocked_admission(queued,monkeypatch,changed):
+-    after_external=[]
+-    def competing_write(*a,**kw):
+-        admitted=queued['build'](*a,**kw)
+-        conn=queued['conn'];conn.execute('PRAGMA busy_timeout=0')
+-        if changed=='maker_evidence':
+-            conn.execute('UPDATE task_runs SET summary=? WHERE id=?',('New maker evidence',queued['maker']))
+-        elif changed=='task_state':
+-            conn.execute('UPDATE tasks SET title=? WHERE id=?',('New task scope',queued['task']))
+-        else:
+-            kb.add_comment(conn,queued['task'],'riley','New information arrived during admission.')
+-        conn.commit();after_external.append(snapshot(queued))
+-        return admitted
+-    monkeypatch.setattr(kb,'_build_worker_admission',competing_write)
+-    with pytest.raises(ValueError,match='state changed|unchanged maker evidence'):
++def test_owner_assignment_does_not_attempt_worker_admission_before_ownership(queued,monkeypatch):
++    def forbidden(*a,**kw):
++        raise AssertionError('Worker admission must happen after the owner assignment commits')
++    monkeypatch.setattr(kb,'_build_worker_admission',forbidden)
++    assert request(queued,dry_run=True)['changed'] is False
++    result=request(queued)
++    assert result['changed'] and result['worker_admission']=='pending_dispatch'
++
++
++@pytest.mark.parametrize('changed',['maker_evidence','task_state','new_comment','profile_removed'])
++def test_short_commit_rejects_changed_state_and_rechecks_installed_profile(queued,monkeypatch,changed):
++    from contextlib import contextmanager
++    after_external=[]; fired=False
++    original=kb.write_txn
++    @contextmanager
++    def competing_write(conn,*a,**kw):
++        nonlocal fired
++        if not fired and conn is not queued['conn']:
++            fired=True
++            external=queued['conn'];external.execute('PRAGMA busy_timeout=0')
++            if changed=='maker_evidence':
++                external.execute('UPDATE task_runs SET summary=? WHERE id=?',('New maker evidence',queued['maker']))
++            elif changed=='task_state':
++                external.execute('UPDATE tasks SET title=? WHERE id=?',('New task scope',queued['task']))
++            elif changed=='new_comment':
++                kb.add_comment(external,queued['task'],'riley','New information arrived before reassignment.')
++            else:
++                # Simulate profile removal through the real eligibility lookup.
++                from hermes_cli import profiles
++                monkeypatch.setattr(profiles,'profile_exists',lambda n:False)
++            external.commit();after_external.append(snapshot(queued))
++        with original(conn,*a,**kw):yield
++    monkeypatch.setattr(kb,'write_txn',competing_write)
++    with pytest.raises(ValueError,match='state changed|unchanged maker evidence|installed non-root'):
+         request(queued)
+     assert after_external and snapshot(queued)==after_external[0]
+     assert kb.get_task(queued['conn'],queued['task']).assignee=='margot'
++
++
++def test_real_native_worker_ownership_denies_projection_then_accepts_owner_assignment(queued,monkeypatch):
++    from gateway import gus_worker_authority as authority
++    home=queued['profile_home'];root=home.parent.parent
++    registry=root.parent/'roles.yaml'
++    registry.write_text(json.dumps({'profile_roster':{'canonical':['grace'],
++        'department_owners':[], 'department_makers':[], 'review_and_bounded_support':['grace']}}))
++    env={'HERMES_PROFILE':'grace','HERMES_SESSION_SOURCE':'kanban',
++         'HERMES_KANBAN_BOARD':queued['board'],'HERMES_KANBAN_TASK':queued['task'],
++         'HERMES_KANBAN_DB':str(kb.kanban_db_path(board=queued['board']))}
++    kwargs=dict(home=home,root=root,registry=registry,env=env)
++    # This is the actual admission-subprocess policy, with real installed
++    # profile/registry protection and native task ownership, not a fake grant.
++    with pytest.raises(PermissionError,match='does not own native assignment'):
++        authority.current(**kwargs)
++    before=snapshot(queued)
++    assert request(queued)['changed']
++    assert authority.current(**kwargs)=={'profile':'grace','board':queued['board'],'task':queued['task']}
++    assert snapshot(queued)['task_runs']==before['task_runs']
++    assert kb.get_task(queued['conn'],queued['task']).current_run_id is None
++    # Ownership recognition is not an admission receipt or permission to skip
++    # the normal dispatcher checks. A fresh rejected admission prevents claim.
++    seen=[]
++    def reject_after_ownership(task,profile,**kw):
++        assert authority.current(**kwargs)['profile']==profile=='grace'
++        assert task.assignee=='grace' and task.status=='review'
++        seen.append(task.id)
++        rejection=queued['build'](task,profile,**kw)
++        rejection.contract['status']='rejected'
++        raise kb.WorkerAdmissionError(rejection)
++    def forbidden_spawn(task,workspace,*,admission_contract=None,**kw):
++        raise AssertionError('Rejected admission must not reach execution')
++    monkeypatch.setattr(kb,'_build_worker_admission',reject_after_ownership)
++    monkeypatch.setattr(kb,'_memory_pressure_level',lambda:'normal')
++    monkeypatch.setattr(kb,'review_dispatch_enabled',lambda:True)
++    result=kb.dispatch_once(queued['conn'],board=queued['board'],max_spawn=1,
++                            spawn_fn=forbidden_spawn,reconcile_orphans=False)
++    assert seen==[queued['task']] and queued['task'] in result.capability_blocked, vars(result)
++    assert snapshot(queued)['task_runs']==before['task_runs']
++    assert kb.get_task(queued['conn'],queued['task']).current_run_id is None
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_board_hold.py
+@@ -0,0 +1,227 @@
++"""Owner-only idle holds on real temporary boards; no workers or providers."""
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++from hermes_cli import board_owner_manage as control, kanban_db as kb
++from hermes_cli import owner_work_start as start, owner_work_preparation as prep
++from tests.hermes_cli.test_simple_owner_work import board, task, request, snap
++from tests.hermes_cli.test_owner_work_preparation import plan
++
++
++def hold(tid, **kwargs):
++    return control.execute(dict(action='block', task_id=tid,
++        reason='Waiting for the owner to provide the source file; follow up on that input.',
++        kind='needs_input', **kwargs))
++
++
++@pytest.mark.parametrize('status', ['triage','todo','ready','blocked'])
++def test_hold_preserves_everything_except_status_and_kind(board, tmp_path, status):
++    tid=task(board); child=kb.create_task(board,title='Dependent',body='Consume the prerequisite',assignee='maker',parents=[tid])
++    f=tmp_path/'working-file.txt';f.write_text('Preserved original output')
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET status=?,consecutive_failures=3,block_recurrences=2,workspace_path=? WHERE id=?',
++            (status,str(tmp_path),tid))
++    before=dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++    old_events=[dict(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?',(tid,))]
++    assert hold(tid,dry_run=True)['proposed_status']=='blocked'
++    assert dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())==before
++    receipt=hold(tid)
++    after=dict(board.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone())
++    assert after=={**before,'status':'blocked','block_kind':'needs_input'}
++    assert receipt['worker_started'] is False and receipt['approval_granted'] is False
++    assert 'source file' in receipt['next_action']
++    events=[dict(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?',(tid,))]
++    assert events[:-1]==old_events
++    payload=json.loads(events[-1]['payload'])
++    assert payload['owner_board_hold'] and payload['owner_attention_requested']
++    assert payload['actor']=='default' and payload['requester']=='chris'
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++    kb.recompute_ready(board)
++    assert kb.get_task(board,tid).status=='blocked'
++    assert kb.get_task(board,child).status=='todo'
++    assert f.read_text()=='Preserved original output'
++
++
++@pytest.mark.parametrize('kind', ['needs_input','capability','transient'])
++def test_simple_work_resumes_hold_without_granting_external_actions(board, kind):
++    tid=task(board)
++    control.execute({'action':'block','task_id':tid,'kind':kind,'reason':'Wait for the recorded missing file.'})
++    payload=json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",(tid,)).fetchone()[0])
++    assert payload['owner_attention_requested']==(kind!='transient')
++    result=request(tid,'Use the newly provided local source; do not send or publish.')
++    assert result['status']=='ready'
++    assert result.get('approval_granted', False) is False
++    assert result['work_order']['preserved_stop']['reason']=='Wait for the recorded missing file.'
++    assert kb.get_task(board,tid).block_kind==kind
++    assert 'Do not send or publish' in kb.get_task(board,tid).body
++    assert start.allows_claim(board,kb.get_task(board,tid))
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++
++
++@pytest.mark.parametrize('kind', ['dependency','',None,'arbitrary'])
++def test_invalid_hold_kind_cannot_create_fake_dependency_or_mutate(board,kind):
++    tid=task(board);before=snap(board,tid)
++    with pytest.raises(ValueError,match='block requires'):
++        control.execute({'action':'block','task_id':tid,'kind':kind,'reason':'Wait'})
++    assert snap(board,tid)==before
++
++
++def test_stale_snapshot_and_active_work_are_preserved(board):
++    tid=task(board);snapshot=control.describe(board,tid)['expected_state']
++    kb.add_comment(board,tid,'owner','New instruction')
++    with pytest.raises(ValueError,match='state changed'):
++        hold(tid,expected_state=snapshot)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET worker_pid=123 WHERE id=?',(tid,))
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='active work'):
++        hold(tid)
++    assert snap(board,tid)==before
++
++
++@pytest.mark.parametrize('key,value',[('HERMES_PROFILE','other'),('HERMES_KANBAN_TASK','t_other'),('HERMES_SESSION_SOURCE','cron')])
++def test_unbound_profile_worker_or_cron_cannot_hold(board,monkeypatch,key,value):
++    tid=task(board);before=snap(board,tid)
++    monkeypatch.setenv(key,value)
++    with pytest.raises(PermissionError): hold(tid)
++    assert snap(board,tid)==before
++
++
++@pytest.mark.parametrize('reviewed',[False,True])
++def test_owner_paused_queued_review_returns_to_same_reviewer_without_fake_findings(board,tmp_path,monkeypatch,reviewed):
++    from hermes_cli import owner_cell as oc
++    from tests.hermes_cli.test_owner_cell_qa_regressions import contract
++    monkeypatch.setattr(oc,'_installed_profile',lambda value:value)
++    extra={'owner_cell_contract':contract(owner_profile='maker',runtime_profile='maker')} if reviewed else {}
++    tid=kb.create_task(board,title='Review local output',body='Original complete request. Do not publish.',assignee='maker',**extra)
++    artifact=tmp_path/'review.txt';artifact.write_text('Reviewable original evidence')
++    digest=hashlib.sha256(artifact.read_bytes()).hexdigest()
++    reviewer='grace' if reviewed else 'second'
++    assert kb.request_review(board,tid,summary='Review saved artifact',reviewer=reviewer,
++        metadata={'owner_cell_artifact':{'ref':str(artifact),'digest':digest}})
++    goal_before=[dict(r) for r in board.execute('SELECT * FROM owner_cell_goals WHERE task_id=?',(tid,))]
++    runs_before=[dict(r) for r in board.execute('SELECT * FROM task_runs WHERE task_id=?',(tid,))]
++    assert hold(tid)['source_status']=='review'
++    assert kb._resume_status_from_events(board,tid)=='review'
++    result=request(tid,'The requested input is present; continue the already queued independent review.')
++    assert result['status']=='review' and result['work_order']['phase']=='review'
++    assert kb.get_task(board,tid).assignee==reviewer
++    assert [dict(r) for r in board.execute('SELECT * FROM owner_cell_goals WHERE task_id=?',(tid,))]==goal_before
++    assert [dict(r) for r in board.execute('SELECT * FROM task_runs WHERE task_id=?',(tid,))]==runs_before
++
++
++@pytest.mark.parametrize('old',[None,'default','missing-old'])
++@pytest.mark.parametrize('full',[False,True])
++def test_work_validates_new_worker_before_absent_or_invalid_old_worker(board,old,full):
++    tid=task(board)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET assignee=? WHERE id=?',(old,tid))
++    value=plan(assignee='second') if full else {'assignee':'second'}
++    result=request(tid,'Complete the existing local work with the selected worker.',plan=value)
++    assert result['status']=='ready' and kb.get_task(board,tid).assignee=='second'
++    assert 'Do not send or publish' in kb.get_task(board,tid).body
++    if not full:
++        assert prep.current(board,tid) is None
++        assert 'execution_budget' not in json.loads(kb.get_task(board,tid).worker_budget_json)
++    assert board.execute('SELECT COUNT(*) FROM task_runs').fetchone()[0]==0
++
++
++@pytest.mark.parametrize('worker',['default','missing',''])
++def test_bad_replacement_worker_is_denied_atomically(board,worker):
++    tid=task(board);before=snap(board,tid)
++    with pytest.raises(ValueError): request(tid,plan={'assignee':worker})
++    assert snap(board,tid)==before
++
++
++def test_assignee_only_preserves_existing_plan_and_budget(board):
++    tid=task(board)
++    request(tid,plan=plan())
++    before=prep.current(board,tid)
++    result=request(tid,'Use the second eligible worker for this same prepared scope.',plan={'assignee':'second'})
++    after=prep.current(board,tid)
++    assert result['status']=='ready' and after['assignee']=='second'
++    for key in ['brief','acceptance','requirements','skills','budget']:
++        assert after[key]==before[key]
++
++
++def test_reassignment_cannot_change_bound_route_or_fill_missing_body(board):
++    tid=task(board)
++    with kb.write_txn(board): board.execute("UPDATE tasks SET runtime_profile='maker' WHERE id=?",(tid,))
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='bound maker'): request(tid,plan={'assignee':'second'})
++    assert snap(board,tid)==before
++    with kb.write_txn(board): board.execute("UPDATE tasks SET runtime_profile=NULL,body='' WHERE id=?",(tid,))
++    with pytest.raises(ValueError,match='actual requested work'): request(tid,plan={'assignee':'second'})
++
++
++def test_authenticated_member_hold_is_bound_to_own_board_and_requester(tmp_path,monkeypatch):
++    from gateway import josh_board_authority
++    home=tmp_path/'home';home.mkdir(mode=0o700)
++    monkeypatch.setenv('HERMES_HOME',str(home));monkeypatch.setattr(Path,'home',lambda:tmp_path)
++    monkeypatch.setattr(control,'ROOT',home)
++    for name in ('HERMES_KANBAN_DB','HERMES_KANBAN_HOME','HERMES_KANBAN_BOARD','HERMES_PROFILE','HERMES_KANBAN_TASK','HERMES_SESSION_SOURCE'):
++        monkeypatch.delenv(name,raising=False)
++    grant={'principal':'new-member','profile':'new-member','board':'member-space','fingerprint':'a'*64}
++    monkeypatch.setattr(control,'refresh_member_grant',lambda value:dict(grant))
++    with kb.connect_closing(board='member-space') as own:
++        tid=kb.create_task(own,title='Own wait',assignee='maker',triage=True)
++    with kb.connect_closing(board='other-space') as other:
++        other_id=kb.create_task(other,title='OTHER_PRIVATE_SENTINEL',assignee='maker',triage=True)
++    from gateway import board_control_transport as transport, session_context
++    monkeypatch.setattr(transport,'ROOT',home)
++    transport.key_path().parent.mkdir(parents=True,mode=0o700)
++    transport.key_path().write_bytes(b'k'*32);transport.key_path().chmod(0o600)
++    transport.initialize_ledger(transport.ledger_path())
++    monkeypatch.setattr(session_context,'get_bound_session_env',lambda key,*a:'session-1' if key=='HERMES_SESSION_ID' else '')
++    direct=josh_board_authority._execution.set(('new-member','new-member'))
++    try:
++        envelope=transport.issue({'action':'block','task_id':tid,'board':'member-space',
++            'kind':'needs_input','reason':'Waiting for the requested source file.'},grant,'session-1')
++        verified_payload,verified_grant=transport.verify(envelope)
++    finally:
++        josh_board_authority._execution.reset(direct)
++    token=control._member_context.set(verified_grant)
++    try:
++        result=control.execute(verified_payload)
++        assert result['board']=='member-space' and result['status']=='blocked'
++        with kb.connect_closing(board='member-space') as own:
++            payload=json.loads(own.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'",(tid,)).fetchone()[0])
++            assert payload['requester']==payload['actor']=='new-member'
++        with pytest.raises(PermissionError,match='outside authenticated member'):
++            hold(other_id,board='other-space')
++        with pytest.raises(ValueError,match='Unknown task'):
++            hold(other_id)
++        with kb.connect_closing(board='other-space') as other:
++            assert kb.get_task(other,other_id).status=='triage'
++        grant['fingerprint']='revoked'
++        with pytest.raises(PermissionError,match='enrollment changed'):
++            hold(tid)
++    finally:
++        control._member_context.reset(token)
++    token=josh_board_authority._execution.set(('new-member','new-member'))
++    try:
++        with pytest.raises(PermissionError,match='signed controller'):
++            hold(tid)
++    finally:
++        josh_board_authority._execution.reset(token)
++
++
++def test_new_hold_does_not_override_prior_worker_review_failure(board,tmp_path,monkeypatch):
++    from hermes_cli import owner_cell as oc
++    from tests.hermes_cli.test_owner_cell_qa_regressions import contract
++    monkeypatch.setattr(oc,'_installed_profile',lambda value:value)
++    tid=kb.create_task(board,title='Independent review',body='Original local task.',assignee='maker',
++        owner_cell_contract=contract(owner_profile='maker',runtime_profile='maker'))
++    artifact=tmp_path/'review-original.txt';artifact.write_text('Original artifact')
++    assert kb.request_review(board,tid,summary='Review saved original',reviewer='grace',
++        metadata={'owner_cell_artifact':{'ref':str(artifact),'digest':hashlib.sha256(artifact.read_bytes()).hexdigest()}})
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?",(tid,))
++        kb._append_event(board,tid,'blocked',{'reason':'Reviewer needs original missing input','source_status':'review'})
++    hold(tid)
++    before=snap(board,tid)
++    with pytest.raises(ValueError,match='reviewer findings|recorded stop and findings'):
++        request(tid,'Continue the existing review after the owner wait.')
++    assert snap(board,tid)==before
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -660,7 +660,7 @@
+     return {"native": native, "waiting_on": waiting, "latest_stop_event_id": stop["id"] if stop else None,
+             "latest_comment_id": latest_comment, "resume_snapshot_sha256": snapshot,
+             "command_templates": routes,
+-            "guidance": "For an authorized request to work on or resume this card, use kanban_manage(action='work', task_id=..., reason='the current instruction'). The controller resolves the current state and recovery bookkeeping. No copied hashes, special approval wording, or exhaustive plan is needed for ordinary work. Use the existing worker and normal tools; an optional plan is only for a genuinely changed brief, worker, requirements or budget. Preserve the original request, real dependencies, private boundaries, action restrictions and review findings. The receipt distinguishes started/queued work from a specific remaining wait. Verify the actual worker and result. Do not repeatedly restart an unchanged failed worker run. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy. Other precise cleanup actions remain available: archive obsolete work reversibly, restore paused, remove a specifically obsolete dependency, recover a held review or repair its exact artifact reference."}
++            "guidance": "For an authorized request to work on or resume this card, use kanban_manage(action='work', task_id=..., reason='the current instruction'). The controller resolves the current state and recovery bookkeeping. No copied hashes, special approval wording, or exhaustive plan is needed for ordinary work. Use the existing worker and normal tools; an optional plan is only for a genuinely changed brief, worker, requirements or budget. Preserve the original request, real dependencies, private boundaries, action restrictions and review findings. The receipt distinguishes started/queued work from a specific remaining wait. Verify the actual worker and result. Do not repeatedly restart an unchanged failed worker run. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy. For a genuine wait, use kanban_manage(action='block', task_id=..., kind='needs_input'|'capability'|'transient', reason='what is missing and the next step'); this works from triage and starts no worker. Other precise cleanup actions remain available: archive obsolete work reversibly, restore paused, remove a specifically obsolete dependency, recover a held review or repair its exact artifact reference."}
+ 
+ 
+ def _check_board_owner_mode():
+@@ -3085,15 +3085,16 @@
+ 
+ KANBAN_MANAGE_SCHEMA = {
+     "name": "kanban_manage",
+-    "description": "Manage existing work. Prefer action=work with task_id and a short current instruction in reason to pick up authorized work using its assigned worker and normal tools. State and recovery evidence are resolved internally; no exact approval phrase or detailed preparation is required. An optional plan updates a changed brief/tools/budget. Other actions support reversible cleanup, precise dependency repair and review recovery. Preserve real waits, privacy, action restrictions, budgets and review findings. Do not repeatedly restart unchanged failed worker runs. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy.",
++    "description": "Manage existing work. Prefer action=work with task_id and a short current instruction in reason to pick up authorized work using its assigned worker and normal tools. State and recovery evidence are resolved internally; no exact approval phrase or detailed preparation is required. An optional plan updates a changed brief/tools/budget. Use action=block with kind=needs_input, capability or transient and a concrete reason to put an idle unfinished card, including triage, on hold without starting work. No snapshot is required; the controller resolves it. This records a wait and does not grant external permissions. Other actions support reversible cleanup, precise dependency repair and review recovery. Preserve real waits, privacy, action restrictions, budgets and review findings. Do not repeatedly restart unchanged failed worker runs. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy.",
+     "parameters": {"type": "object", "properties": {
+         "task_id": {"type": "string"},
+         "board": _board_schema_prop(),
+-        "action": {"type": "string", "enum": ["work", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
+-        "expected_state": {"type": "string", "description": "Not needed for work. Other actions require expected_state from the latest kanban_show native fields; reread after a state change."},
++        "action": {"type": "string", "enum": ["work", "block", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
++        "expected_state": {"type": "string", "description": "Not needed for work or block. Other actions require expected_state from the latest kanban_show native fields; reread after a state change."},
+         "reason": {"type": "string", "description": "For work: preserve the user's actual instruction in plain language; do not invent a one-shot tool limit or stop-after-first-error condition. A one-run recovery limit still permits authorized alternatives within that run. Otherwise the verified correction or retirement reason. Existing external-action restrictions remain in force."},
++        "kind": {"type": "string", "enum": ["needs_input", "capability", "transient"], "description": "Required for block: record a real missing input/decision, missing capability, or temporary failure. Include what resolves it in reason. Real prerequisite links remain unchanged."},
+         "parent_id": {"type": "string", "description": "For unlink_dependency only, the specifically obsolete prerequisite."},
+-        "plan": {"type": "object", "description": "Optional for work, required for prepare. Use only when the existing brief, worker, tools or budget need updating. Ordinary work uses the current task and profile defaults. For an idle ordinary native review, work accepts only {assignee: installed-reviewer} to repair its reviewer while retaining maker evidence; it does not change bound owner-cell/private routes.", "properties": {
++        "plan": {"type": "object", "description": "Optional for work, required for prepare. Use only when the existing brief, worker, tools or budget need updating. Ordinary work uses the current task and profile defaults. For idle ordinary maker work, {assignee: installed-worker} changes only the eligible worker while preserving its existing brief, requirements and budget. For an idle ordinary native review, work accepts only {assignee: installed-reviewer} to repair its reviewer while retaining maker evidence; it does not change bound owner-cell/private routes.", "properties": {
+             "brief": {"type": "string", "maxLength": 6000},
+             "acceptance": {"type": "array", "items": {"type": "string"}},
+             "assignee": {"type": "string", "description": "Optional eligible existing worker. On an idle ordinary native review, work accepts an assignee-only plan to repair the reviewer. Bound private/owner-cell routes cannot be swapped."},
