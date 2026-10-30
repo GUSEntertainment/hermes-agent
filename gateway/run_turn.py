@@ -1895,10 +1895,15 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             await asyncio.sleep(0.05)
 
     @staticmethod
-    async def _await_stream_task(stream_task) -> None:
-        """Give the stream consumer task 5s to flush, then cancel it."""
+    async def _await_stream_task(stream_task, stream_consumer=None) -> None:
+        """Allow the adapter's bounded final-delivery window before cancelling."""
+        timeout = getattr(getattr(stream_consumer, "adapter", None),
+                          "FINAL_DELIVERY_TIMEOUT_SECONDS", 5.0)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 5.0
+        timeout = min(90.0, max(5.0, float(timeout)))
         try:
-            await asyncio.wait_for(stream_task, timeout=5.0)
+            await asyncio.wait_for(stream_task, timeout=timeout)
         except (TimeoutError, asyncio.CancelledError):
             stream_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -2335,7 +2340,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
             try:
-                await self._await_stream_task(stream_task)
+                await self._await_stream_task(stream_task, turn_ctx.stream_consumer_holder[0])
             except Exception as e:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
@@ -2587,7 +2592,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 with suppress(asyncio.CancelledError):
                     await stream_task
             else:
-                await self._await_stream_task(stream_task)
+                await self._await_stream_task(stream_task, turn_ctx.stream_consumer_holder[0])
 
         # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
         _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]

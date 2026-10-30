@@ -215,6 +215,10 @@ class GatewayRuntimeInitMixin:
         self.pairing_stores: Dict[str, PairingStore] = {}
         # One HookRegistry per served profile home, resolved from the active scope at emit time.
         self.hooks = ProfileHookRegistries()
+        # Resolve at runner construction, not module import (embedding hosts can
+        # select a different home after importing the gateway).
+        from hermes_constants import get_hermes_home
+        self._VOICE_MODE_PATH = get_hermes_home() / "gateway_voice_mode.json"
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
         # Per-(bot, guild, text channel, user) transcript dedup: voice/STT can emit one utterance twice.

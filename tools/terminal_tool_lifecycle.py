@@ -25,7 +25,7 @@ logger = logging.getLogger("tools.terminal_tool")
 
 def _create_configured_env(
     config: dict[str, Any], env_type: str, *, image: str, cwd: str, timeout: int,
-    task_id: str, host_cwd: Optional[str],
+    task_id: str, host_cwd: Optional[str], local_config: Optional[dict[str, Any]] = None,
 ):
     """``_create_environment`` with the ssh/local/container kwargs shaped from *config*
     (shared by the terminal tool, the file tools and the lazy :func:`ensure_task_env` bring-up)."""
@@ -37,7 +37,8 @@ def _create_configured_env(
         container_config=(
             _container_config_from_config(config) if _is_container_backend(env_type) else None
         ),
-        local_config=_local_config_from_config(config) if env_type == "local" else None,
+        local_config=(local_config if local_config is not None else
+                      _local_config_from_config(config) if env_type == "local" else None),
         task_id=task_id, host_cwd=host_cwd,
     )
 

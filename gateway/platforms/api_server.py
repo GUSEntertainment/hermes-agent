@@ -4437,11 +4437,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
                         user_message=_correction_message,
-                        persist_user_message=user_message if _correction_note else None,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                         **author_kwargs,
                     )
+                    if _correction_note:
+                        conversation_kwargs["persist_user_message"] = user_message
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
                     approval_token = None

@@ -481,6 +481,9 @@ google = [
   "httplib2==0.32.0",
   "pyasn1==0.6.4",
 ]
+# Margot: member result delivery converts Markdown deliverables to PDF
+# (gateway/member_document.py). Same pin the v0.21.5-margot venv carried.
+margot-documents = ["reportlab==5.0.1"]
 youtube = [
   # Required by skills/media/youtube-content and
   # optional-skills/productivity/memento-flashcards (youtube_quiz.py).

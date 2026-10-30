@@ -706,7 +706,7 @@ class TestRunEvents:
                 mock_agent, agent_ready, _ = _make_slow_agent()
                 mock_create.return_value = mock_agent
                 run_id = (await (await cli.post("/v1/runs", json={"input": "hello"})).json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
                 first = await cli.get(f"/v1/runs/{run_id}/events")
                 second = await cli.get(f"/v1/runs/{run_id}/events")
                 assert first.status == second.status == 200
@@ -1082,7 +1082,7 @@ class TestSteerRun:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
-                assert run_started.wait(timeout=3.0)
+                assert await asyncio.to_thread(run_started.wait, 3.0)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -1203,7 +1203,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -1370,7 +1370,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await asyncio.to_thread(started.wait, 3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200

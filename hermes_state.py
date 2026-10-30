@@ -620,7 +620,10 @@ class SessionDB(
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
     def __init__(self, db_path: Path | None = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
+        # Match the registry's file identity for direct and shared handles alike.
+        # In particular, macOS /tmp and /private/tmp must not give parent and
+        # delegated-child stores different profile-home identities.
+        self.db_path = Path(db_path or _default_db_path()).resolve()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
         self._trigram_config_enabled = _trigram_search_enabled()

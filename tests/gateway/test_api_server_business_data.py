@@ -60,10 +60,17 @@ async def _business_app(adapter: APIServerAdapter, profile: str):
     return app
 
 
+
+def _board_conn(slug):
+    """v0.22.5 refuses to create a board by bare connect; create it first."""
+    if slug != kanban_db.DEFAULT_BOARD and not kanban_db.board_metadata_path(slug).exists():
+        kanban_db.create_board(slug)
+    return kanban_db.connect(board=slug)
+
 @pytest.fixture()
 def isolated_board_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    conn = kanban_db.connect(board="business-test")
+    conn = _board_conn("business-test")
     try:
         allowed = kanban_db.create_task(
             conn,
@@ -286,7 +293,7 @@ async def test_room_status_grant_does_not_inherit_business_data_scope(isolated_b
 @pytest.mark.asyncio
 async def test_business_board_filters_before_pagination(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    conn = kanban_db.connect(board="business-pagination")
+    conn = _board_conn("business-pagination")
     try:
         with conn:
             for idx in range(1005):
@@ -350,7 +357,7 @@ async def test_business_board_response_size_is_hard_bounded(monkeypatch, isolate
 @pytest.mark.asyncio
 async def test_current_home_board_requires_explicit_business_filters(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     try:
         rows = [
             ("t_allowed", "Founder business card", "Allowed only by exact route tenant and founders realm.", "telegram:-1004492739101:11", "founders"),
@@ -415,7 +422,7 @@ async def test_business_board_uses_explicit_read_only_root_without_unpinning_kan
     synthetic_home = tmp_path / "synthetic-profile"
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(actual_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     try:
         with conn:
             conn.execute(
@@ -428,7 +435,7 @@ async def test_business_board_uses_explicit_read_only_root_without_unpinning_kan
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(synthetic_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     try:
         with conn:
             conn.execute(
@@ -475,7 +482,7 @@ async def test_business_board_uses_explicit_read_only_root_without_unpinning_kan
 async def test_business_board_root_must_be_explicitly_approved(tmp_path, monkeypatch):
     actual_home = tmp_path / "actual"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(actual_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     conn.close()
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "synthetic-profile"))
 
@@ -496,7 +503,7 @@ async def test_business_board_root_must_be_explicitly_approved(tmp_path, monkeyp
 async def test_explicit_business_board_root_requires_nonempty_config_allowlist(tmp_path, monkeypatch, allowlist):
     actual_home = tmp_path / "actual"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(actual_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     conn.close()
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "synthetic-profile"))
 
@@ -523,7 +530,7 @@ async def test_business_board_root_ignores_environment_root_control(tmp_path, mo
     synthetic_home = tmp_path / "synthetic-profile"
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(actual_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     try:
         with conn:
             conn.execute(
@@ -536,7 +543,7 @@ async def test_business_board_root_ignores_environment_root_control(tmp_path, mo
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(synthetic_home))
-    conn = kanban_db.connect(board="chris-home")
+    conn = _board_conn("chris-home")
     conn.close()
     monkeypatch.setenv("HERMES_BUSINESS_DATA_BOARD_ROOT", str(actual_home / "kanban" / "boards"))
 

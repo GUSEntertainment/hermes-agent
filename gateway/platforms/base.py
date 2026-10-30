@@ -809,7 +809,7 @@ def _profile_cache_roots() -> list[Path]:
 def _profile_dirs() -> list[Path]:
     """Every ``<root>/profiles/<name>`` directory, read at check time."""
     try:
-        return [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
+        return [p for p in (get_default_hermes_root() / "profiles").iterdir() if p.is_dir()]
     except OSError:
         return []
 
@@ -820,12 +820,12 @@ def _credential_home_roots() -> list[Path]:
     and every ``<root>/profiles/*``. Enumerated at check time like ``_profile_cache_roots`` on
     the allow side — a denylist frozen at import covers only the launch profile, so a
     ``MEDIA:<root>/profiles/<other>/.env`` emitted in any profile's turn would upload it."""
-    return list(dict.fromkeys((get_hermes_home(), _HERMES_ROOT, *_profile_dirs())))
+    return list(dict.fromkeys((get_hermes_home(), get_default_hermes_root(), *_profile_dirs())))
 
 
 def _kanban_root() -> Path:
     """Kanban is root-shared across profiles by design (``kanban_db.kanban_home``)."""
-    return Path(os.environ.get("HERMES_KANBAN_HOME", "").strip() or _HERMES_ROOT).expanduser()
+    return Path(os.environ.get("HERMES_KANBAN_HOME", "").strip() or get_default_hermes_root()).expanduser()
 
 
 def _kanban_board_dirs() -> list[Path]:
