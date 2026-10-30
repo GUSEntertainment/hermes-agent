@@ -296,6 +296,9 @@ stdenv.mkDerivation (finalAttrs: {
 
     with open(sys.argv[1]) as handle:
         description = json.load(handle)
+    # The guard is a required packaged command, not an optional raw imsg alias.
+    if "hermes-imsg" not in description["commands"]:
+        raise RuntimeError("missing hermes-imsg guard console entrypoint")
     env = [arg for key, value in sorted(description["env"].items())
            for arg in ("--set", key, value)]
     for command in description["commands"].values():

@@ -443,12 +443,22 @@ def enforce_command_board_budget(
 
 def assert_disposable_db_path(path: str | Path) -> Path:
     """Fail closed before a test/canary writes a canonical board database."""
-    candidate = Path(path).expanduser().resolve(strict=False)
+    candidate = Path(os.path.abspath(Path(path).expanduser()))
     canonical = {Path.home() / ".hermes" / "kanban.db"}
     pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if pinned:
-        canonical.add(Path(pinned).expanduser())
-    if candidate in {item.resolve(strict=False) for item in canonical} or "/kanban/boards/" in str(candidate):
+        canonical.add(Path(os.path.abspath(Path(pinned).expanduser())))
+    # Reject known canonical paths lexically before resolving: even a metadata
+    # probe of the real board is outside a disposable test's authority.
+    if candidate in canonical or "/kanban/boards/" in str(candidate):
+        raise OwnerCellGuardError("canonical board selected; disposable DB is required")
+    candidate = candidate.resolve(strict=False)
+    resolved_canonical = {
+        item.parent.resolve(strict=False) / item.name for item in canonical
+    }
+    if pinned:
+        resolved_canonical.add(Path(pinned).expanduser().resolve(strict=False))
+    if candidate in resolved_canonical or "/kanban/boards/" in str(candidate):
         raise OwnerCellGuardError("canonical board selected; disposable DB is required")
     return candidate
 

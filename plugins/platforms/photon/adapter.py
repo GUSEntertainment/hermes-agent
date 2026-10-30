@@ -1611,10 +1611,9 @@ class PhotonAdapter(BasePlatformAdapter):
             if logical_message_id:
                 rich_body["logicalMessageId"] = logical_message_id
             rich_result = await self._post_send("/send-richlink", rich_body, sent_text=sent_text)
-            if rich_result.success:
-                return rich_result
-            logger.warning("[photon] rich-link send failed, falling back to plain text: %s", rich_result.error)
-            markdown = False
+            # A failed acknowledgement may still mean the rich link was sent.
+            # Never create a second plain-text transport for the same intent.
+            return rich_result
         send_markdown = markdown and _markdown_enabled()
         # The format key stays even when the text is stripped: the sidecar owns the builder choice,
         # and an older sidecar without chooseSendFormat must keep rendering natively.
@@ -1813,7 +1812,7 @@ async def _standalone_send(
             # 2. Each attachment as a separate /send-attachment call; media_files is
             #    List[Tuple[path, is_voice]] (filter_media_delivery_paths).
             for media_path, is_voice in media_files or []:
-                safe_path = BasePlatformAdapter.validate_media_delivery_path(str(media_path))
+                safe_path = PhotonAdapter.validate_media_delivery_path(str(media_path))
                 if not safe_path:
                     logger.warning("[photon] standalone send skipping unsafe path")
                     continue
