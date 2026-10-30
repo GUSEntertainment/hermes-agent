@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing
 
@@ -105,7 +105,25 @@ class RunIdempotencyStore:
             if column not in columns:
                 add_column_if_missing(self._conn, "run_idempotency", column, f"{column} {ddl}")
         self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
+            "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)"
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_hash TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_ts REAL NOT NULL DEFAULT 0,
+                event_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(scope, run_id, event_hash)
+            )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS run_events_scope_run_cursor "
+            "ON run_events(scope, run_id, id)"
+        )
         self._conn.commit()
         self._lock = threading.Lock()
         self._tighten_permissions()
@@ -183,6 +201,15 @@ class RunIdempotencyStore:
             except Exception:
                 terminal = False
             if terminal:
+                stale_run_row = self._conn.execute(
+                    "SELECT run_id FROM run_idempotency WHERE scope=? AND idempotency_key=?",
+                    (stale_scope, stale_key),
+                ).fetchone()
+                if stale_run_row is not None:
+                    self._conn.execute(
+                        "DELETE FROM run_events WHERE scope=? AND run_id=?",
+                        (stale_scope, stale_run_row[0]),
+                    )
                 self._conn.execute(
                     "DELETE FROM run_idempotency WHERE scope=? AND idempotency_key=?", (stale_scope, stale_key))
 
@@ -217,7 +244,145 @@ class RunIdempotencyStore:
                 "SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?", (scope, run_id)).fetchone()
         return row is not None
 
-    def update_status(self, run_id: str, status: dict[str, Any]) -> None:
+    def run_owner_record(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Return the durable owner scope and status for a retained run id.
+
+        ``run_id`` has a unique index in the idempotency table. This method is
+        intentionally keyed only by server-generated run id and reads authority
+        from the retained reservation; it never trusts callback/client metadata
+        to decide owner scope.
+        """
+        if not run_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT scope, status_json FROM run_idempotency WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            status = json.loads(row[1])
+        except Exception:
+            status = {}
+        if not isinstance(status, dict):
+            status = {}
+        return {"scope": row[0], "status": status}
+
+
+    def append_event(
+        self,
+        scope: str,
+        run_id: str,
+        event: Dict[str, Any],
+    ) -> Optional[int]:
+        """Persist one redacted run lifecycle event inside its owner scope.
+
+        Returns the durable cursor for the inserted or already-present event.
+        The event is accepted only when ``(scope, run_id)`` already belongs to
+        an idempotent run reservation, so replay inherits the same profile/key
+        or room-grant ownership model as status polling. Duplicate callbacks
+        are collapsed by a stable hash of the canonical event JSON.
+        """
+        if not scope or not run_id or not isinstance(event, dict):
+            return None
+        encoded = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        event_hash = hmac.new(
+            scope.encode("utf-8", "surrogatepass"),
+            f"{run_id}\0{encoded}".encode("utf-8", "surrogatepass"),
+            "sha256",
+        ).hexdigest()
+        event_type = str(event.get("event") or "")[:128]
+        try:
+            event_ts = float(event.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            event_ts = 0.0
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                owned = self._conn.execute(
+                    "SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?",
+                    (scope, run_id),
+                ).fetchone()
+                if owned is None:
+                    self._conn.rollback()
+                    return None
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO run_events(
+                           scope,run_id,event_hash,event_type,event_ts,event_json,created_at
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (scope, run_id, event_hash, event_type, event_ts, encoded, now),
+                )
+                row = self._conn.execute(
+                    "SELECT id FROM run_events WHERE scope=? AND run_id=? AND event_hash=?",
+                    (scope, run_id, event_hash),
+                ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return int(row[0]) if row is not None else None
+
+    def list_events(
+        self,
+        scope: str,
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: int = 100,
+        retention_until: float = 0,
+    ) -> List[Dict[str, Any]]:
+        """Replay durable lifecycle events for an owned run after ``after_cursor``.
+
+        Returns an empty list for unknown or cross-scope runs; callers that need
+        a public 404 should check ``owns_run`` first, mirroring run status.
+        """
+        if not scope or not run_id:
+            return []
+        try:
+            cursor = max(0, int(after_cursor or 0))
+        except (TypeError, ValueError):
+            cursor = 0
+        try:
+            bounded_limit = max(1, min(int(limit or 100), 500))
+        except (TypeError, ValueError):
+            bounded_limit = 100
+        retention_until = max(0.0, float(retention_until or 0))
+        with self._lock:
+            if retention_until:
+                self._conn.execute(
+                    """UPDATE run_idempotency
+                          SET retention_until=MAX(retention_until, ?)
+                        WHERE scope=? AND run_id=?""",
+                    (retention_until, scope, run_id),
+                )
+                self._conn.commit()
+            owned = self._conn.execute(
+                "SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            ).fetchone()
+            if owned is None:
+                return []
+            rows = self._conn.execute(
+                """SELECT id, event_json FROM run_events
+                      WHERE scope=? AND run_id=? AND id>?
+                      ORDER BY id ASC LIMIT ?""",
+                (scope, run_id, cursor, bounded_limit),
+            ).fetchall()
+        events: List[Dict[str, Any]] = []
+        for row_id, raw in rows:
+            try:
+                event = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event["cursor"] = int(row_id)
+            events.append(event)
+        return events
+
+    def update_status(self, run_id: str, status: Dict[str, Any]) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",

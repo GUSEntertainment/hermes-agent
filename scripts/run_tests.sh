@@ -77,6 +77,50 @@ else
   fi
 fi
 
+# ── Suite-scoped state boundary (before collection/import) ─────────────────
+# Fixtures are too late: pytest imports conftest and test modules during
+# collection. Allocate one random marker-owned HERMES_HOME here and inject it
+# into the runner plus every descendant. Never honor a caller's live/custom
+# HERMES_HOME as the suite root.
+INHERITED_HERMES_HOME="${HERMES_HOME:-}"
+DEFAULT_LIVE_HERMES_HOME="$HOME/.hermes"
+ISOLATION_HELPER="$SCRIPT_DIR/test_suite_isolation.py"
+CREATE_ARGS=(create --base "${TMPDIR:-/tmp}" --forbid "$DEFAULT_LIVE_HERMES_HOME")
+if [ -n "$INHERITED_HERMES_HOME" ]; then
+  CREATE_ARGS+=(--forbid "$INHERITED_HERMES_HOME")
+fi
+IFS=$'\t' read -r SUITE_HERMES_HOME SUITE_OWNER_TOKEN < <(
+  "$PYTHON" "$ISOLATION_HELPER" "${CREATE_ARGS[@]}"
+)
+if [ -z "$SUITE_HERMES_HOME" ] || [ -z "$SUITE_OWNER_TOKEN" ]; then
+  echo "error: failed to allocate marker-owned suite HERMES_HOME" >&2
+  exit 1
+fi
+
+cleanup_suite_home() {
+  local rc=$?
+  local cleanup_args=(cleanup "$SUITE_HERMES_HOME" --token-fd 3 --forbid "$DEFAULT_LIVE_HERMES_HOME")
+  if [ -n "$INHERITED_HERMES_HOME" ]; then
+    cleanup_args+=(--forbid "$INHERITED_HERMES_HOME")
+  fi
+  # Cleanup authority stays in this parent shell.  It is neither exported to
+  # test descendants nor exposed in the helper's argv; fd 3 exists only for
+  # this cleanup invocation.  The suite marker contains only its digest.
+  if ! "$PYTHON" "$ISOLATION_HELPER" "${cleanup_args[@]}" 3<<<"$SUITE_OWNER_TOKEN"; then
+    echo "error: refusing unsafe suite-home cleanup; preserved $SUITE_HERMES_HOME" >&2
+    rc=1
+  fi
+  trap - EXIT
+  exit "$rc"
+}
+trap cleanup_suite_home EXIT
+# Bash does not consistently run an EXIT trap when an unhandled signal arrives
+# while it is waiting for a foreground child.  Convert catchable termination
+# signals to ordinary exits so the authenticated cleanup path always runs.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH="$INHERITED_PYTHONPATH"
@@ -84,6 +128,10 @@ EXTRA_PYTEST_PLUGINS=""
 if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   EXTRA_PYTHONPATH="${EXTRA_PYTHONPATH:+$EXTRA_PYTHONPATH:}$HOME/.hermes"
   EXTRA_PYTEST_PLUGINS="pytest_live_guard"
+fi
+TEST_PYTHONPATH="$SCRIPT_DIR/test_site"
+if [ -n "$EXTRA_PYTHONPATH" ]; then
+  TEST_PYTHONPATH="$TEST_PYTHONPATH:$EXTRA_PYTHONPATH"
 fi
 
 
@@ -179,6 +227,7 @@ done
 # No credential var can leak — you'd have to explicitly add it here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (suite HERMES_HOME=$SUITE_HERMES_HOME; service control blocked)"
 
 cd "$REPO_ROOT"
 
@@ -191,9 +240,23 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+TEST_NAMESPACE_HELPER=""
+if [ "$(uname -s)" = "Linux" ]; then
+  if command -v unshare >/dev/null 2>&1 \
+      && unshare --user --map-root-user --mount true 2>/dev/null; then
+    TEST_NAMESPACE_HELPER="$SCRIPT_DIR/run_tests_namespace.sh"
+  elif [ -d /run/service ] || [ -d /run/s6/basedir ]; then
+    echo "error: hosted service control is visible but a private test namespace cannot be created" >&2
+    echo "       refusing to collect tests against the live control plane" >&2
+    exit 1
+  fi
+fi
+set +e
+env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  USER="${USER:-$(id -un)}" \
+  LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \
@@ -201,9 +264,17 @@ exec env -i \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONUTF8=1 \
+  HERMES_HOME="$SUITE_HERMES_HOME" \
+  HERMES_TEST_ISOLATION="$SUITE_HERMES_HOME" \
+  HERMES_TEST_NO_SERVICE_CONTROL=1 \
+  PYTEST_ADDOPTS="--ignore=.venv --ignore=venv${PYTEST_ADDOPTS:+ $PYTEST_ADDOPTS}" \
+  ${TEST_NAMESPACE_HELPER:+HERMES_TEST_NAMESPACE_HELPER="$TEST_NAMESPACE_HELPER"} \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
   ${HERMES_RUN_E2E:+HERMES_RUN_E2E="$HERMES_RUN_E2E"} \
-  ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
+  PYTHONPATH="$TEST_PYTHONPATH" \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+RUNNER_RC=$?
+set -e
+exit "$RUNNER_RC"

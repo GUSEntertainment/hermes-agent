@@ -36,7 +36,7 @@ from gateway.session import (
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
-from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+from gateway.turn_lease import DEFAULT_LEASE_WAIT, STARTUP_RESTORE_REPLAY_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -198,6 +198,242 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
 
 
+    async def _hmwa_resolve_session(self, event, source):
+        """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
+        topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
+        the event."""
+        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
+        # cross-topic Reply doesn't fragment the conversation.
+        event_metadata = getattr(event, "metadata", None) or {}
+        expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
+        # Plain lobby recovery here even with ``dm_topic_auto_transfer`` on: the opt-in topic transfer
+        # already ran at adapter ingress (``apply_root_dm_topic_transfer`` -> runner hook
+        # ``_transfer_telegram_root_dm``), before session keying.
+        recovered = (await asyncio.to_thread(self._recover_telegram_lobby_thread_id, source)
+                     if not expected_session_key else None)
+        if recovered is not None:
+            logger.info(
+                "telegram topic recovery: chat=%s user=%s %r -> %s",
+                source.chat_id, source.user_id, source.thread_id, recovered,
+            )
+            source = dataclasses.replace(source, thread_id=recovered)
+            with suppress(Exception):
+                event.source = source
+
+        if expected_session_key:
+            derived_session_key = self._session_key_for_source(source)
+            if derived_session_key != expected_session_key:
+                logger.warning(
+                    "Dropping internally routed event after route recovery: expected session=%s derived=%s",
+                    expected_session_key, derived_session_key,
+                )
+                return
+
+        strict_session = bool(event_metadata.get("gateway_session_strict"))
+        pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
+        if strict_session:
+            session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
+            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+                logger.warning(
+                    "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
+                    pinned_session_id or "missing", expected_session_key or "missing",
+                )
+                return
+        else:
+            # Internal wakes observe reset policy without counting as user activity, or periodic
+            # notifications keep the routing key alive across every daily/idle boundary.
+            session_entry = await self.async_session_store.get_or_create_session(
+                source, touch_activity=not bool(getattr(event, "internal", False)),
+            )
+        session_key = session_entry.session_key
+        claim = getattr(event, "_claimed_owner", None)
+        if claim is not None:
+            from gateway.session_authorities import active_authority
+            authority, (owner, generation) = active_authority(self), claim
+            # /new and /reset latch a Stop for the claimed generation before they move the route;
+            # /resume, /branch and compression don't, so those turns run where the route points.
+            stopped = generation in (authority.pending_stops.get(owner), authority.delivered_stops.get(owner))
+            if stopped and session_entry.session_id not in await asyncio.to_thread(
+                    authority.db.get_compression_chain, owner):  # preflight's continuation walk
+                # It settles interrupted, as that Stop would have, and never runs on the fresh one.
+                logger.warning("Dropping a stopped claimed turn: its route moved from %s to %s before it ran",
+                               owner, session_entry.session_id)
+                from gateway.session_results import execution_result
+                captured = execution_result.get()
+                if captured is not None:
+                    captured['result'] = {'final_response': '', 'messages': [], 'interrupted': True}
+                return
+        if not strict_session and pinned_session_id:
+            resolved_entry = await self._resolve_async_delegation_session(session_entry, pinned_session_id, event_metadata.get("gateway_proven_session_id") or "", event_metadata.get("gateway_completion_ids") or ())
+            if resolved_entry is None:
+                return
+            session_entry = resolved_entry
+        self._cache_session_source(session_key, source)
+        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+            session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+        if not strict_session and not bool(getattr(event, "internal", False)):
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                from gateway.session_rotation import build_pickup_brief_messages, rotation_enabled, should_rotate_session
+                from gateway.run import _load_gateway_config
+                cfg = _load_gateway_config()
+                history = await self.async_session_store.load_transcript(session_entry.session_id) if rotation_enabled(cfg) else []
+                decision = should_rotate_session(
+                    source=source, session_key=session_key, history=history,
+                    last_prompt_tokens=session_entry.last_prompt_tokens,
+                    estimated_tokens=estimate_messages_tokens_rough(history), config=cfg,
+                )
+                if decision.rotate:
+                    old_id = session_entry.session_id
+                    rotated = await self.async_session_store.reset_session_with_transcript(
+                        session_key, lambda new_id: build_pickup_brief_messages(
+                            old_session_id=old_id, new_session_id=new_id, decision=decision, source=source,
+                        ),
+                    )
+                    if rotated is not None:
+                        session_entry = rotated
+                        self._clear_conversation_scope(session_key, reason="session_rotation")
+                        self._evict_cached_agent(session_key)
+                        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+                            await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry, reason="session-rotation")
+            except Exception:
+                logger.warning("Fresh-session rotation check failed closed", exc_info=True)
+        from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
+        if not await resolve_heartbeat_owner(self, event, session_entry):
+            return
+        return source, session_entry, session_key
+
+
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
+        """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
+        the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
+        a resend notice). Released in _handle_message's finally, granted per (routing key, run
+        generation) so a stale unwind can't release a newer turn's."""
+        from gateway.run import _float_env
+        _lease_registry = getattr(self, "_turn_leases", None)
+        if _lease_registry is None:
+            return
+        _lease_wait = _float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT)
+        if getattr(event, "_hermes_startup_restore_replay", False):
+            _lease_wait = max(_lease_wait, _float_env(
+                "HERMES_RESTORE_REPLAY_LEASE_TIMEOUT", STARTUP_RESTORE_REPLAY_LEASE_WAIT,
+            ))
+        try:
+            _lease_token = await _lease_registry.acquire(
+                session_entry.session_id, owner_key=_quick_key, generation=run_generation,
+                timeout=_lease_wait,
+            )
+        except TurnLeaseTimeoutError:
+            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
+            self._clear_session_env(_session_env_tokens)
+            raise
+        if _lease_token is not None:
+            self._session_state(_quick_key).turn.lease_tokens[run_generation] = _lease_token
+
+
+    async def _hmwa_hygiene_notify(self, source, meta, message, what, *, progress_notice=False):
+        """Best-effort user notice on the hygiene thread; failure is logged, never raised.
+
+        [GUS] Only progress notices (turn-hold deferral) are gated on
+        ``compression.progress_notices`` (live behavior); failure/timeout warnings
+        follow ``display.suppress_warning_notifications`` via ``emit_warning``."""
+        try:
+            _adapter = self._delivery_adapter_for(source)
+            if progress_notice:
+                from gateway.run import _gateway_compression_progress_notices_enabled
+                if not _gateway_compression_progress_notices_enabled():
+                    return
+            if _adapter and source.chat_id:
+                await _adapter.emit_warning(source.chat_id, message, metadata=meta,
+                                            logical_platform=source.platform)
+        except Exception as _werr:
+            logger.warning("Failed to deliver %s to user: %s", what, _werr)
+
+
+    async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
+        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
+        notify the user, and re-raise; returns the compressed transcript only when the worker
+        was already committing.
+
+        Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
+        only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
+        compression start survive as cloned tail) KEEPS admission: the turn proceeds uncompressed
+        now and the summary is adopted at the worker's fenced commit — always cancelling burned
+        every attempt for thinking summary models. Without the fence a late commit could clobber
+        newer turns, so cancel."""
+        from gateway.run import (
+            _HYGIENE_TURNHOLD_RETRY_SECONDS, _record_hygiene_cooldown, _reset_hygiene_failure_streak
+        )
+        fence = attempt.commit_fence
+        _hyg_keep_admission = bool(getattr(fence, "commit_watermark_fenced", False)) and not fence.is_cancelled
+        if _hyg_keep_admission:
+            self._hmwa_hygiene_defer_cleanup(attempt, "session hygiene turn-hold")
+            # NO retry-after here (it would also block the agent-side preflight compressor); spacing
+            # comes from the durable compression lock. The done-callback records the flat retry-after
+            # ONLY if the worker ends without committing anything.
+            _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+
+            def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
+                try:
+                    _exc = _fut.exception()
+                except (asyncio.CancelledError, Exception):
+                    _committed = False
+                else:
+                    _committed = _exc is None and (
+                        bool(getattr(_agent, "_last_compaction_in_place", False))
+                        or getattr(_agent, "session_id", _sid) != _sid
+                    )
+                if _committed:
+                    logger.info(
+                        "Session hygiene compression for session %s finished after the "
+                        "turn-hold was released — summary adopted at the watermark-fenced "
+                        "commit boundary (#97963)", _sid,
+                    )
+                    try:
+                        _reset_hygiene_failure_streak(_gw, _skey)
+                    except Exception as _rs_err:
+                        logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                else:
+                    # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
+                    # sustained traffic doesn't spawn and abandon a compressor every turn.
+                    _record_hygiene_cooldown(
+                        _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                        "hygiene compression deferred: turn-hold budget expired and the "
+                        "detached attempt did not commit",
+                    )
+
+            attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
+            _log_suffix = (
+                " — the watermark-fenced worker keeps its commit admission and the summary "
+                "will be adopted when it finishes"
+            )
+        else:
+            _adopted = await self._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene turn-hold")
+            if _adopted is not None:
+                return _adopted
+            # Short flat retry-after, else every turn re-spawns, holds and cancels a compressor.
+            _record_hygiene_cooldown(
+                self, session_entry.session_id, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                "hygiene compression deferred: turn-hold budget expired while the "
+                "summary was still streaming",
+            )
+            _log_suffix = ""
+        self._hmwa_hygiene_stamp(
+            attempt.agent, "session hygiene compression turn-hold",
+            "AGENT_COMPRESSION_TURNHOLD", "hygiene compression turn-hold activity stamp failed",
+        )
+        logger.info(
+            "Session hygiene compression for session %s exceeded turn-hold budget (%.1fs); "
+            "proceeding without compression this turn%s",
+            session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
+        )
+        await self._hmwa_hygiene_notify(
+            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            progress_notice=True,
+        )
+        raise
+
+
 
     async def _hmwa_stop_typing_for_turn(self, event, source):
         """Stop the typing indicator (never raises). Slack AI status is scoped to a thread/
@@ -210,20 +446,330 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             elif _typing_adapter and callable(getattr(_kind, "stop_typing", None)):
                 await _typing_adapter.stop_typing(source.chat_id)
 
+    async def _hmwa_shape_agent_response(
+        self, agent_result, source, history, session_entry, session_key,
+        _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
+        persist_user_display_kind: Optional[str] = None,
+        reply_expected: Optional[bool] = None,
+    ):
+        """Turn the raw agent result into the outbound text: sentinel/silence handling, response
+        logging, resume-pending clear, empty-response normalization, and identity-guarded
+        post-compression session_id propagation. Returns
+        ``(response, _intentional_silence, agent_messages)``."""
+        from gateway.run import (
+            _is_gateway_hidden_reasoning_incomplete_turn, _normalize_empty_agent_response,
+            _sanitize_gateway_final_response, _should_clear_resume_pending_after_turn,
+        )
+        response = agent_result.get("final_response") or ""
+        # Hidden-reasoning-only retry exhaustion: the loop's sentinel text doubles as final_response
+        # and would be delivered verbatim (peer agents would ingest it as a completed turn).
+        if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+            response = ""
+        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
+        # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
+        # silent; any other human one must not.
+        from gateway.response_filters import is_machinery_display_kind, silence_allowed
+        from gateway.run_turn import _unexpected_silence_reply
+        _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
+        # Margot owner policy honors intentional silence without a warning.
+
+        # "(empty)" = the model produced no visible content after exhausting all retries. One
+        # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
+        # reads the same words on every surface.
+        if response == "(empty)" and not _intentional_silence:
+            from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
+
+            _model = str(agent_result.get("model") or "").strip() or t("gateway.errors.empty_response_model_label")
+            response = t("gateway.shared.warn_passthrough", error=EMPTY_RESPONSE_EXPLANATION.format(model=_model))
+        agent_messages = agent_result.get("messages", [])
+        logger.info(
+            "response ready: platform=%s chat=%s session=%s time=%.1fs api_calls=%d response=%d chars",
+            _platform_name, source.chat_id or "unknown", session_key or "unknown",
+            time.time() - _msg_start_time, agent_result.get("api_calls", 0), len(response),
+        )
+
+        # Successful turn: clear the consecutive-restart stuck-loop counter and resume_pending (set
+        # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
+        if session_key and _should_clear_resume_pending_after_turn(agent_result):
+            await self._clear_restart_failure_count(session_key)
+            try:
+                await self.async_session_store.clear_resume_pending(session_key)
+            except Exception as _e:
+                logger.debug("clear_resume_pending failed for %s: %s", session_key, _e, exc_info=True)
+
+        # Normalize empty responses: surface errors, partial failures, and work-without-text.
+        # Fix for #18765.
+        if not _intentional_silence:
+            response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            response = _sanitize_gateway_final_response(source.platform, response)
+
+        # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
+        # if the binding still points at the session this run was launched against.
+        if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+            if session_entry.session_id == _run_start_session_id:
+                session_entry.session_id = agent_result["session_id"]
+                # The held turn lease follows the rotation (persistence writes to the NEW id).
+                self._rebind_turn_lease(_quick_key, run_generation, session_entry.session_id)
+                await self.async_session_store._save()
+                await self.async_session_store._record_gateway_session_peer(
+                    session_entry.session_id, session_key, source,
+                )
+                await asyncio.to_thread(
+                    self._sync_telegram_topic_binding, source, session_entry, reason="agent-result-compression",
+                )
+            else:
+                logger.info(
+                    "Skipping agent-result session split sync for %s because the session binding "
+                    "moved from %s to %s before compression finished",
+                    session_key or "?", _run_start_session_id, session_entry.session_id,
+                )
+        return response, _intentional_silence, agent_messages
+
+
+    async def _hmwa_deliver_turn_response(
+        self, event, source, session_entry, session_key, run_generation,
+        agent_result, agent_messages, response, _footer_line, _intentional_silence,
+    ):
+        """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
+        Returns the text for the adapter to send, or ``None`` when already delivered."""
+        if diagnostic_wake_muted(event):
+            return None
+        # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
+        if _intentional_silence:
+            logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            response = ""
+
+        adapter = self._delivery_adapter_for(source)
+        # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
+        _streaming_tts_done = adapter is not None and bool(
+            getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
+        )
+        if not _streaming_tts_done and self._should_send_voice_reply(
+            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+        ):
+            _voice_deferred = False
+            if not agent_result.get("already_sent") and adapter is not None and getattr(
+                type(adapter), "register_post_delivery_callback", None
+            ) is not None:
+                try:
+                    async def _deferred_voice_reply():
+                        task = asyncio.create_task(self._send_voice_reply(event, response))
+                        background = getattr(self, "_background_tasks", None)
+                        if isinstance(background, set):
+                            background.add(task)
+                            task.add_done_callback(background.discard)
+                    adapter.register_post_delivery_callback(
+                        session_key, _deferred_voice_reply, generation=run_generation,
+                    )
+                    _voice_deferred = True
+                except Exception as exc:
+                    logger.debug("deferred voice registration failed: %s", exc)
+            if not _voice_deferred:
+                await self._send_voice_reply(event, response)
+
+        # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
+        # skip when the agent failed: the error text is new content streaming didn't show.
+        if agent_result.get("already_sent") and not agent_result.get("failed"):
+            # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
+            # would upload every file a second time.
+            if response and adapter and not agent_result.get("media_already_delivered"):
+                await self._deliver_media_from_response(response, event, adapter)
+            # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
+            if _footer_line and adapter:
+                try:
+                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                except Exception as _e:
+                    logger.debug("trailing footer send failed: %s", _e)
+            # Return None so the body isn't sent twice; stash the delivered text on the event for the
+            # /loop and /goal hooks that read the return value.
+            with suppress(Exception):
+                event._streamed_final_response = str(response or "")
+            return None
+
+        return response
+
+
+    async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
+        """Everything between session resolution and the agent run: session open, task-local env,
+        context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
+        ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
+        running (history unreadable, a local turn's refused ``@`` references); ``None`` drops the turn
+        (inbound text rejected)."""
+        from gateway.run import _load_gateway_config
+        from gateway.direct_document_custody import bind_event as bind_document_event
+        bind_document_event(event)
+        from plugins.platforms.photon.secure_intake.composition import bind as bind_secure_intake
+        bind_secure_intake(event)
+        from tools.approval_yolo import restore_gateway_yolo
+        _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
+        restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
+        context = build_session_context(source, self.config, session_entry)
+        # Session context variables for tools (task-local, concurrency-safe)
+        _session_env_tokens = self._set_session_env(context)
+        # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
+        from gateway.response_filters import display_kind_for_event
+        persist_user_display_kind = display_kind_for_event(event)
+        _redact_pii = False  # privacy.redact_pii, re-read per message
+        with suppress(Exception):
+            _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+
+        # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
+        # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
+        # A LOCAL session (CLI one-shot, ACP, cron run-now, TUI attach) is the operator's own machine:
+        # the messaging block ("Source: Local", connected platforms, cron delivery targets) was never
+        # part of the classic in-process prompt, and the TUI gateway still builds that prompt in-process.
+        # Rendering it here would make every surface hop of one durable session a system-prompt
+        # (and prompt-cache) break.
+        # Synthetic goal/heartbeat/resume turns carry no prompt inputs of their own, so they reuse the
+        # pins exactly like internal events do (and still pass authorization, unlike internal ones).
+        _reuse_pins = event.internal or getattr(event, "inherit_channel_pin", False)
+        if source.platform != Platform.LOCAL and _reuse_pins and session_key:
+            await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
+        context_prompt = "" if source.platform == Platform.LOCAL else \
+            self._pinned_session_context_prompt(context, _redact_pii, session_key, internal=_reuse_pins)
+
+        # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
+        # (appending to the ephemeral system prompt forced a full agent rebuild).
+        turn_sidecar_notes: list[str] = []
+        if _was_auto_reset:
+            await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
+
+        # Keep human text separate from skills, sender metadata, and other model context.
+        # With no text (e.g. voice-only), retain the existing enriched-message title fallback.
+        title_user_message = event.text or None
+
+        # Auto-load bound skill(s) only on NEW sessions; ongoing ones carry the content in history.
+        _auto = getattr(event, "auto_skill", None)
+        if _is_new_session and _auto:
+            self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
+
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
+
+        # A turn becomes durable recovery work only after it owns the per-session lease; marking
+        # earlier would falsely recover a message that never began processing.
+        await self._mark_durable_active_turn(event, session_entry.session_key)
+
+        # An unreadable store is not an empty conversation: stop before the agent invents continuity
+        # from []. Restore task-local context here (before the broad cleanup finally).
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            history = await self._hmwa_run_session_hygiene(
+                event, source, session_entry, session_key, history, _quick_key, run_generation,
+            )
+        except TranscriptReadError:
+            self._clear_session_env(_session_env_tokens)
+            from gateway.session_results import record_unexecuted_failure
+            return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
+
+        await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
+
+        # Voice channel state rides the user message ONLY when changed (in the system prompt it
+        # forced a rebuild + prompt-cache re-key per message).
+        _vc_note = self._voice_channel_sidecar_note(event, source, session_key)
+        if _vc_note:
+            turn_sidecar_notes.append(_vc_note)
+
+        # Auto-analyze user images so the model gets a description plus the local path.
+        message_text = await self._prepare_profile_scoped_inbound_message_text(
+            event=event, source=source, history=history, session_key=session_key,
+        )
+        if message_text is None:
+            # A refused local turn answers with its refusal (session_context_refs.turn_references).
+            return getattr(event, "_gateway_turn_refusal", None), _session_env_tokens
+
+        message_text, persist_user_message, persist_user_timestamp = (
+            self._hmwa_apply_message_timestamp(event, message_text)
+        )
+
+        from gbrain_corrections.native_runtime import gateway_note
+        _correction_note = await asyncio.to_thread(gateway_note, event)
+        if _correction_note:
+            turn_sidecar_notes.append(_correction_note)
+        # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
+        # cannot leak them into the next turn.
+        if turn_sidecar_notes and session_key:
+            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
+
+        # Bind this run generation to the adapter so deferred post-delivery callbacks are released
+        # by the run that registered them.
+        self._bind_adapter_run_generation(self._delivery_adapter_for(source), session_key, run_generation)
+        # Delivery IDs are only unique in their transport namespace. Keyless turns
+        # need their own identity, even when another process writes to this session.
+        import uuid
+        namespace = [source.platform.value, source.profile, source.scope_id,
+                     source.chat_id, source.thread_id, str(event.message_id)]
+        owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
+                 if event.message_id else str(uuid.uuid4()))
+        return self._PreparedTurn(
+            history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
+            persist_user_display_kind, session_entry.session_id, owner,
+            title_user_message=title_user_message,
+        ), _session_env_tokens
+
 
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        from gateway.run import _gateway_platform_value, _load_gateway_config
+        is_margot_os_topic = (
+            _gateway_platform_value(getattr(source, "platform", None)) == "telegram"
+            and str(getattr(source, "chat_id", "")) == "-1004479003480"
+            and bool(getattr(source, "thread_id", None))
+        )
+        _msg_preview = "<department-topic content redacted>" if is_margot_os_topic else (event.text or "")[:80].replace("\n", " ")
+        _reply_txt = "<department-topic reply redacted>" if is_margot_os_topic else (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", (event.text or "")[:80].replace("\n", " "),
-            getattr(event, "reply_to_message_id", None),
-            (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
+            source.chat_id or "unknown", _msg_preview,
+            getattr(event, "reply_to_message_id", None), _reply_txt,
         )
 
+        # [GUS v0.21.5 port] Department-topic gate runs BEFORE session resolution
+        # (live ordering): a Margot OS topic message never creates/touches a session
+        # entry or runs topic recovery unless it may default-execute.
+        # External route metadata is never authority: resolve the pinned topic policy.
+        if is_margot_os_topic:
+            from gateway.department_topic_router import resolve_department_topic
+            routing_cfg = _load_gateway_config()
+            requested = (isinstance(routing_cfg, dict) and isinstance(routing_cfg.get("department_topic_routing"), dict)
+                         and routing_cfg["department_topic_routing"].get("enabled") is True)
+            message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None) or "0"
+            try:
+                decision = resolve_department_topic(chat_id=source.chat_id, thread_id=source.thread_id, message_id=message_id)
+                resolution = decision.status
+            except Exception:
+                logger.warning("Margot OS topic preflight failed closed", exc_info=True)
+                resolution = "policy_error"
+            if not requested and resolution != "command":
+                return "The accountable department routing gate is not active, so I did not default-execute this topic request."
+            if requested:
+                try:
+                    from gateway.department_topic_router import dispatch_department_topic, dispatch_to_safe_delegate, load_department_topic_activation
+                    activation = load_department_topic_activation(routing_cfg)
+                    assert activation is not None
+                    if resolution == "policy_error":
+                        return "The department routing policy is unavailable, so I did not default-execute this topic request."
+                    outcome = await asyncio.to_thread(
+                        dispatch_department_topic, chat_id=source.chat_id, thread_id=source.thread_id,
+                        message_id=message_id, message_text=event.text or "",
+                        create_task=lambda envelope: dispatch_to_safe_delegate(envelope, board=activation.board),
+                    )
+                    replies = {
+                        "delegated": "I’ve routed this to the accountable department workflow and will return the verified result here.",
+                        "duplicate": "This topic update is already in the accountable department workflow; I’ll return the verified result here.",
+                        "unverified_topic": "This candidate topic is not verified for live routing yet, so I did not default-execute the request.",
+                        "unknown_topic": "This topic is not mapped to a specialist workflow, so I did not default-execute the request.",
+                    }
+                    if outcome.status in replies:
+                        return replies[outcome.status]
+                except Exception:
+                    logger.exception("Department-topic handoff failed closed")
+                    return "I couldn’t validate or create the accountable department handoff, so I did not default-execute this topic request."
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
@@ -446,12 +992,12 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
     async def _run_background_task(
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
-        media_types: Optional[list[str]] = None,
+        media_types: Optional[list[str]] = None, document_event=None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
         with self._profile_scope_for_source(source):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt, source, task_id, event_message_id, media_urls, media_types, document_event,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -482,7 +1028,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
     async def _run_background_task_inner(
         self, prompt: str, source: SessionSource, task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[list[str]] = None,
-        media_types: Optional[list[str]] = None,
+        media_types: Optional[list[str]] = None, document_event=None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from gateway.run import (
@@ -490,6 +1036,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _platform_config_key,
         )
         from run_agent import AIAgent
+        from gateway.background_document_custody import require_origin, supported, validate_delivery
+        if document_event is not None or supported(source):
+            require_origin(document_event, source)
+            if not self._is_user_authorized_for_source(source):
+                raise PermissionError("Background source authorization revoked")
         media_urls = media_urls or []
         media_types = media_types or []
         adapter = self._delivery_adapter_for(source)
@@ -502,6 +1053,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
                 return
 
@@ -570,20 +1122,24 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = t("gateway.background.complete_header", preview=preview)
+            header = (f'Background task result\nPrompt: "{preview}"\n\n' if document_event is not None
+                      else t("gateway.background.complete_header", preview=preview))
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             elif not images and not media_files:
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
                 )
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
+                    await validate_delivery(self, document_event, source, _thread_metadata)
                     await adapter.send_image(
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
@@ -593,7 +1149,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
-                with suppress(Exception):
+                try:
+                    await validate_delivery(self, document_event, source, _thread_metadata)
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                         await adapter.send_voice(
                             chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
@@ -605,7 +1162,16 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        if key == "file_path" and (document_event is not None or supported(source)):
+                            from gateway.direct_document_custody import send_selected
+                            await send_selected(adapter, document_event.event, media_path, _thread_metadata,
+                                                expected_authority=json.loads(document_event.authority_json))
+                        else:
+                            await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                except PermissionError:
+                    logger.warning("Background document withheld after authorization failure")
+                except Exception:
+                    pass
 
         except Exception:
             logger.exception("Background task %s failed", task_id)
@@ -1791,7 +2357,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     "Queued follow-up for session %s: replacing a human-turn silence marker.",
                     session_key or "?",
                 )
-                first_response = _unexpected_silence_reply()
+                first_response = ""  # Chris: never post the silence warning
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")

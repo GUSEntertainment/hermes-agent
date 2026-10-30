@@ -307,6 +307,79 @@ def test_concurrent_commands_record_their_own_observed_cwd(monkeypatch, tmp_path
     assert terminal_tool.get_session_cwd("task-b") == str(cwd_b)
 
 
+def test_confined_background_replaces_parent_environment(monkeypatch, tmp_path):
+    """A sandbox launch must pass its scrubbed env as a complete replacement."""
+
+    class FakeEnv:
+        env = {"PARENT_SECRET_CANARY": "must-not-leak"}
+
+    class FakeRegistry:
+        def __init__(self):
+            self.calls = []
+            self.pending_watchers = []
+
+        def spawn_local(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(id="proc_confined", pid=1234)
+
+    import tools.process_registry as process_registry_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    confined_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(workspace / ".hermes-terminal-home"),
+        "TMPDIR": str(workspace / ".hermes-tmp"),
+    }
+    registry = FakeRegistry()
+    task_id = "private-worker"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(terminal_tool, "resolve_workspace", lambda **_kwargs: workspace)
+    monkeypatch.setattr(
+        terminal_tool,
+        "prepare_sandbox_launch",
+        lambda *_args: SimpleNamespace(
+            args=["sandbox", "--", "sleep 1"],
+            cwd=str(workspace),
+            env=confined_env,
+            profile="test",
+        ),
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(process_registry_mod, "process_registry", registry)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="sleep 1",
+            task_id=task_id,
+            background=True,
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert registry.calls == [{
+        "command": "sandbox -- 'sleep 1'",
+        "cwd": str(workspace),
+        "task_id": task_id,
+        "owner_task_id": task_id,
+        "session_key": task_id,
+        "env_vars": confined_env,
+        "replace_env": True,
+        "use_pty": False,
+    }]
+
+
+
 def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     def _boom():
         raise FileNotFoundError()

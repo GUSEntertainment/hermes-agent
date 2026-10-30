@@ -1126,10 +1126,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         return argv
 
     @staticmethod
-    def _spawn_env(env_vars: dict) -> dict:
+    def _spawn_env(env_vars: dict, replace_env: bool = False) -> dict:
         """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
         from agent.session_client_env import toolchain_environ
-        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+        env = dict(env_vars or {}) if replace_env else _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
@@ -1149,7 +1149,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             self._running[session.id] = session
         self._write_checkpoint()
 
-    def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
+    def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict, replace_env: bool = False) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
         Raises ImportError when no PTY backend is installed and re-raises any spawn
         failure; ``spawn_local`` falls back to pipe mode in both cases."""
@@ -1158,7 +1158,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
         pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
-        pty_env = self._spawn_env(env_vars)
+        pty_env = self._spawn_env(env_vars, replace_env=replace_env)
         if session.systemd_unit:
             pty_env = systemd_user_bus_env(pty_env)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
@@ -1175,7 +1175,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, replace_env: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
@@ -1194,7 +1194,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         log = worker_output_log(session.id)
         if use_pty and log is None:
             try:
-                return self._spawn_local_pty(session, safe_command, env_vars)
+                return self._spawn_local_pty(session, safe_command, env_vars, replace_env=replace_env)
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
@@ -1212,7 +1212,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
         spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
                                       unit_suffix, "Local")
-        spawn_env = self._spawn_env(env_vars)
+        spawn_env = self._spawn_env(env_vars, replace_env=replace_env)
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)
         # start_new_session is REQUIRED with systemd-run --scope too: the scope does not

@@ -273,8 +273,9 @@ class SSHEnvironment(BaseEnvironment):
                               f"Remote file cleanup on {self.host}")
 
     def _before_execute(self) -> None:
+        """Sync files to remote via FileSyncManager (rate-limited internally)."""
         if self._sync_manager is not None:
-            self._sync_manager.sync()  # rate-limited internally
+            self._sync_manager.sync()
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

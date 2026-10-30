@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 
@@ -583,6 +584,23 @@ class SessionSchemaMixin:
         Fails closed: holders or a lost admission race leave the breadcrumb set."""
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders and self._defer_stale_fts_for_holders(cursor, foreign_holders):
+            return False
+        # A stale index on a large live database must not monopolize its writer.
+        # Keep canonical persistence and LIKE search available until maintenance.
+        try:
+            rebuild_limit = int(getattr(self, "_FTS_LIVE_MERGE_MAX_DB_BYTES", 0))
+            db_size = Path(self.db_path).stat().st_size
+        except OSError as exc:
+            logger.error("Could not stat stale state.db before FTS recovery (%s); keeping FTS detached.", exc)
+            self._drop_all_fts_triggers(cursor)
+            return False
+        if rebuild_limit > 0 and db_size > rebuild_limit:
+            self._drop_all_fts_triggers(cursor)
+            logger.error(
+                "Deferring stale FTS rebuild for large state DB (%d bytes; limit=%d). "
+                "Canonical persistence stays enabled and search uses LIKE until an explicit maintenance repair.",
+                db_size, rebuild_limit,
+            )
             return False
         with fts_rebuild_admission(self.db_path, timeout_seconds=timeout_seconds) as admitted:
             if not admitted:
@@ -1323,13 +1341,27 @@ class SessionSchemaMixin:
         See #93200.
         See #105790.
         """
-        with fts_rebuild_admission(self.db_path) as admitted:
-            if admitted:
-                rebuild_fn()
-                return
+        # Apply the same live-size limit as stale-index recovery. Startup
+        # trigger repair used to bypass it and hold the writer for hours.
+        rebuild_limit = int(getattr(self, "_FTS_LIVE_MERGE_MAX_DB_BYTES", 0))
+        try:
+            size_limited = rebuild_limit > 0 and Path(self.db_path).stat().st_size > rebuild_limit
+        except OSError:
+            size_limited = True
+        if not size_limited:
+            with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
+                if admitted:
+                    rebuild_fn()
+                    return
         logger.warning(
-            "Deferred startup FTS rebuild: another process holds the "
-            "rebuild authority for this state.db; detaching FTS sync until the stale-index recovery path rebuilds it."
+            "Deferred startup FTS rebuild (%s); keeping message persistence "
+            "available and detaching stale FTS until explicit maintenance.",
+            "live database size limit" if size_limited else "rebuild authority busy",
+        )
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (FTS_STALE_KEY,),
         )
         cursor.execute(_STALE_KEY_UPSERT_SQL, (FTS_STALE_KEY,))
         self._drop_all_fts_triggers(cursor)

@@ -212,6 +212,13 @@ def print_fast_version_info(*, check_updates: bool = True) -> None:
         install_method = detect_install_method(Path(project_root_str()))
     except Exception:
         install_method = read_install_method()
+    if install_method == "git" and not os.path.exists(os.path.join(project_root_str(), ".git")):
+        # A legacy data-home stamp can describe a different source checkout.
+        # Keep the displayed install type aligned with this packaged build.
+        from hermes_cli.build_info import get_build_sha
+
+        if get_build_sha():
+            install_method = "packaged release"
     if install_method:
         print(f"Install method: {install_method}")
     print(f"Python: {sys.version.split()[0]}")

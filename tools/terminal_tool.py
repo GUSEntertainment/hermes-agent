@@ -20,6 +20,7 @@ import/patch target): ``terminal_tool_config`` (TERMINAL_* reads, ``_quiet``),
 """
 
 import json
+import shlex
 import logging
 import os
 import sys
@@ -32,6 +33,12 @@ from typing import Optional, Dict, Any, List
 logger = logging.getLogger(__name__)
 
 
+def _terminal_getenv(name: str, default: Any = None) -> Any:
+    from gateway.host_tool_authority import terminal_environment
+    scoped = terminal_environment()
+    return (os.environ if scoped is None else scoped).get(name, default)
+
+
 def _redact_terminal_error_text(value: Any) -> str:
     """Force-redact text before serializing a terminal error envelope."""
     from agent.redact import redact_sensitive_text
@@ -40,6 +47,10 @@ def _redact_terminal_error_text(value: Any) -> str:
 
 
 from tools.registry import tool_error
+from tools.shell_heredoc import strip_inert_heredoc_bodies
+from tools.workspace_confinement import (
+    WorkspaceConfinementError, prepare_sandbox_launch, resolve_workspace,
+)
 from tools.terminal_tool_lifecycle import (
     _cleanup_inactive_envs, _create_configured_env,
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
@@ -259,6 +270,14 @@ _session_cwd_lock = threading.Lock()
 _container_aliases: dict[str, str] = {}
 _container_alias_lock = threading.Lock()
 
+def _caller_session_key(session_key: Optional[str]) -> str:
+    from gateway.host_tool_authority import terminal_cache_key
+    caller = terminal_cache_key()
+    raw = str(session_key or "default")
+    scoped = json.dumps([caller, raw]) if caller is not None else raw
+    return _qualify_task_key(scoped)
+
+
 
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
@@ -267,7 +286,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     qualified (:func:`_qualify_task_key`); the read/clear side qualifies identically."""
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = _qualify_task_key(str(session_key or "default"))
+    key = _caller_session_key(session_key)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -276,14 +295,15 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     """Recorded cwd for *session_key*, or None. No fallback chain on purpose:
     callers decide what an absent record means. None/empty keys read ``"default"``."""
+    key = _caller_session_key(session_key)
     with _session_cwd_lock:
-        return _session_cwd.get(_qualify_task_key(str(session_key or "default")))
+        return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
-        _session_cwd.pop(_qualify_task_key(session_key), None)
+        _session_cwd.pop(_caller_session_key(session_key), None)
 
 
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
@@ -338,7 +358,7 @@ def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
     Keyed like ``_session_cwd`` — routed-profile qualified (:func:`_qualify_task_key`) — so two
     profiles registering the same task id never read each other's image/cwd (#123989).
     """
-    _task_env_overrides[_qualify_task_key(task_id)] = overrides
+    _task_env_overrides[_caller_session_key(task_id)] = overrides
 
     new_cwd = overrides.get("cwd")
     if isinstance(new_cwd, str) and new_cwd.strip():
@@ -348,7 +368,8 @@ def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
         # a CWD-only override (which collapses to "default") still finds it.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            cache_key = _cached_environment_key(container_id, task_id)
+            env = _active_environments.get(cache_key) if cache_key is not None else None
         if env is not None and getattr(env, "cwd", None) is not None:
             sanitized = _sanitize_cwd_for_live_env(env, new_cwd)
             if sanitized is not None:
@@ -357,8 +378,11 @@ def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
 
 def clear_task_env_overrides(task_id: str):
     """Drop a task's overrides, cwd record and container alias (rollout cleanup)."""
-    _task_env_overrides.pop(_qualify_task_key(task_id), None)
+    _task_env_overrides.pop(_caller_session_key(task_id), None)
     clear_session_cwd(task_id)
+    from gateway.host_tool_authority import scope
+    if scope() is not None:
+        return
     with _container_alias_lock:
         _container_aliases.pop(task_id, None)
 
@@ -368,6 +392,9 @@ def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) 
     delegate_task spawn). A missing parent id aliases to ``"default"``."""
     if not child_task_id:
         return
+    from gateway.host_tool_authority import scope
+    if scope() is not None:
+        return  # Caller-scoped backends never consume ambient aliases.
     with _container_alias_lock:
         _container_aliases[child_task_id] = str(parent_task_id or "default")
 
@@ -392,7 +419,7 @@ def _has_isolation_overrides(task_id: Optional[str]) -> bool:
     """True when *task_id* registered image/env_type overrides — the single
     "isolated RL/benchmark rollout" predicate shared by key resolution and
     container creation so the two can't drift."""
-    overrides = _task_env_overrides.get(_qualify_task_key(task_id)) if task_id else None
+    overrides = _task_env_overrides.get(_caller_session_key(task_id)) if task_id else None
     return bool(overrides and any(_is_isolation_override_key(str(key)) for key in overrides))
 
 
@@ -490,6 +517,20 @@ def _qualify_task_key(key: str) -> str:
     return f"{scope}:{key}" if scope else key
 
 
+def _private_worker_environment():
+    """Fresh process-bound private admission, never an interactive/env override."""
+    from gateway.member_worker_policy import authenticated_private_policy
+    if authenticated_private_policy() is None:
+        return None
+    from agent.private_worker_mode import get_authenticated_worker_contract
+    from tools.workspace_confinement import resolve_workspace
+    contract = get_authenticated_worker_contract()
+    root = resolve_workspace()
+    if root is None or contract.get("workspace_confinement") is not True:
+        raise PermissionError("Private worker workspace unavailable")
+    return contract["admission_nonce"], str(root)
+
+
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """Map a tool-call ``task_id`` to the ``_active_environments`` key. Order matters —
     earlier branches are authoritative where they apply:
@@ -511,6 +552,13 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
        else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
+    from gateway.host_tool_authority import terminal_cache_key
+    caller_key = terminal_cache_key()
+    if caller_key is not None:
+        return caller_key
+    private = _private_worker_environment()
+    if private is not None:
+        return "private-worker:" + private[0]
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -569,7 +617,7 @@ def _workspace_container_key(base: str, task_id: Optional[str]) -> str:
     if task_id.startswith(f"{base}:ws:"):
         return task_id
     for key in dict.fromkeys((task_id, _resolve_container_alias(task_id))):
-        overrides = _task_env_overrides.get(_qualify_task_key(key))
+        overrides = _task_env_overrides.get(_caller_session_key(key))
         if not overrides or overrides.get("cwd_source") != "session":
             continue
         digest = overrides.get("workspace_key")
@@ -592,8 +640,11 @@ def resolve_task_overrides(task_id: Optional[str]) -> dict[str, Any]:
     the terminal and file layers can't drift apart.
     """
     raw = task_id or "default"
+    from gateway.host_tool_authority import scope
+    if scope() is not None:
+        return _task_env_overrides.get(_caller_session_key(raw), {})
     return (
-        _task_env_overrides.get(_qualify_task_key(raw))
+        _task_env_overrides.get(_caller_session_key(raw))
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
@@ -625,10 +676,20 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     yet an env may already be cached under the originating task_id; honor it
     instead of spawning a duplicate. Refreshes ``_last_activity`` on a hit.
     """
-    for key in (effective_task_id, task_id):
-        if key and key in _active_environments:
-            _last_activity[key] = time.time()
-            return _active_environments[key]
+    key = _cached_environment_key(effective_task_id, task_id)
+    if key is not None:
+        _last_activity[key] = time.time()
+        return _active_environments[key]
+    return None
+
+
+def _cached_environment_key(effective_task_id: str, task_id: Optional[str]) -> Optional[str]:
+    """Never reuse an unrelated raw task cache key in an authenticated scope."""
+    if effective_task_id in _active_environments:
+        return effective_task_id
+    from gateway.host_tool_authority import scope
+    if scope() is None and task_id and task_id in _active_environments:
+        return task_id
     return None
 
 
@@ -694,8 +755,9 @@ def _ensure_terminal_env_bridged() -> None:
     terminal_tool reads ALL terminal settings from os.environ (TERMINAL_*). See #61115, #65696.
     """
     from tools.terminal_scope import get_terminal_scope
+    from gateway.host_tool_authority import remote_required
 
-    if get_terminal_scope() is not None:
+    if remote_required() or get_terminal_scope() is not None:
         return
     # Never write a secondary profile's terminal.* into process-global env.
     from hermes_constants import get_hermes_home_override
@@ -742,7 +804,8 @@ def _resolve_config_cwd(env_type: str, mount_docker_cwd: bool) -> tuple:
     are discarded in favor of the backend default.
     """
     default_cwd = _backend_default_cwd(env_type)
-    cwd = _tenv("TERMINAL_CWD", default_cwd)
+    private = _private_worker_environment()
+    cwd = private[1] if private is not None else _tenv("TERMINAL_CWD", default_cwd)
     from hermes_cli.config import _is_ssh_remote_tilde_cwd
     # The backend's own default is an in-sandbox path: its ``~`` is the sandbox home, not ours.
     if cwd and cwd != default_cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
@@ -783,7 +846,8 @@ def _get_env_config() -> dict[str, Any]:
     """Resolve the terminal configuration dict from TERMINAL_* env vars."""
     from hermes_cli.config_defaults import DEFAULT_SANDBOX_IMAGE as default_image
     _ensure_terminal_env_bridged()
-    env_type = _tenv("TERMINAL_ENV", "local")
+    private = _private_worker_environment()
+    env_type = "local" if private is not None else _tenv("TERMINAL_ENV", "local")
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
 
     # Container/docker-only payloads are parsed only when such a backend is
@@ -832,7 +896,8 @@ def _get_env_config() -> dict[str, Any]:
         "ssh_persistent": _tenv_bool(
             "TERMINAL_SSH_PERSISTENT", _tenv("TERMINAL_PERSISTENT_SHELL", "true"),
         ),
-        "local_persistent": _tenv_bool("TERMINAL_LOCAL_PERSISTENT", "true"),
+        "ssh_sync_files": _tenv_bool("TERMINAL_SSH_SYNC_FILES", "true"),
+        "local_persistent": False if private is not None else _tenv_bool("TERMINAL_LOCAL_PERSISTENT", "true"),
         # Container resources (MB); ignored for local/ssh.
         "container_cpu": container_cpu,
         "container_memory": container_memory,
@@ -1126,6 +1191,7 @@ class _ExecPlan:
     cwd: str
     host_cwd: Optional[str]
     effective_timeout: int
+    confinement_launch: Any = None
     # Set when a foreground call asked for more than FOREGROUND_MAX_TIMEOUT and was promoted to a
     # tracked background process instead of being refused (the requested seconds, for the note).
     promoted_from_foreground_timeout: Optional[int] = None
@@ -1200,6 +1266,18 @@ def _plan_execution(
                 cwd, env_type, remapped,
             )
         cwd = remapped
+    confinement_launch = None
+    try:
+        confinement_workspace = resolve_workspace(task_id=task_id or "default")
+        if confinement_workspace is not None:
+            if env_type != "local":
+                raise WorkspaceConfinementError(
+                    "workspace-confined terminal requires the local OS sandbox backend"
+                )
+            confinement_launch = prepare_sandbox_launch(command, confinement_workspace)
+            cwd = str(confinement_workspace)
+    except WorkspaceConfinementError as exc:
+        raise _Rejected(_error_json(str(exc), status="blocked"))
     # Reject non-positive timeouts before deadline math: ``timeout or
     # default`` would silently turn 0 into the default, and a negative
     # value is truthy and would fire an immediate "-Ns" timeout.
@@ -1229,6 +1307,7 @@ def _plan_execution(
     return _ExecPlan(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
         image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
+        confinement_launch=confinement_launch,
         promoted_from_foreground_timeout=promoted, auto_background_command=auto_bg,
     )
 
@@ -1285,6 +1364,12 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
             new_env = _create_configured_env(
                 plan.config, env_type, image=plan.image, cwd=plan.cwd,
                 timeout=plan.effective_timeout, task_id=eff, host_cwd=plan.host_cwd,
+                local_config=(
+                    {"persistent": False, "env": plan.confinement_launch.env, "replace_env": True}
+                    if plan.confinement_launch is not None else
+                    {"persistent": plan.config.get("local_persistent", False)}
+                    if env_type == "local" else None
+                ),
             )
         except ImportError as e:
             raise _Rejected(_error_json(
@@ -1336,11 +1421,14 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
-            result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
-            )
+            execute_kwargs = dict(timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                                  **_yield_kwargs(command, env_type=env_type, cwd=command_cwd,
+                                                  effective_task_id=eff, task_id=task_id, session_key=session_key))
+            execution_command = command
+            if plan.confinement_launch is not None:
+                execution_command = shlex.join(plan.confinement_launch.args)
+                execute_kwargs.update(env=plan.confinement_launch.env, replace_env=True)
+            result = env.execute(execution_command, **execute_kwargs)
             break
         except Exception as e:
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
@@ -1484,6 +1572,8 @@ def terminal_tool(
             command, background = auto_bg, True
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
+        if plan.confinement_launch is not None:
+            workdir = None
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker
         # threads, so fall back to the raw task_id (the top-level agent's
@@ -1544,6 +1634,7 @@ def terminal_tool(
                 heartbeat_seconds=heartbeat,
                 persist_on_release=persist_on_release,
                 auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
+                confinement_launch=plan.confinement_launch,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)

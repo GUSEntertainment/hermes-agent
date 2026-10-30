@@ -69,13 +69,36 @@ _HOUSEKEEPING_MAX_WORKERS = 4
 _USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "session_switch", "new_session")
 # Bounds one stall-notify send so a wedged transport can't block the watcher; on timeout the next tick retries.
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+_DEFAULT_STREAM_FINAL_WAIT_SECONDS = 5.0
+_MAX_STREAM_FINAL_WAIT_SECONDS = 90.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _stream_final_wait_timeout(consumer: Any) -> float:
+    """Return a platform-requested, globally bounded stream final wait.
+
+    Most adapters retain the historic five-second cleanup. Telegram opts into
+    a longer window because a valid Bot API RetryAfter commonly exceeds five
+    seconds; cancelling the consumer earlier guarantees the authoritative
+    final edit/send never gets its permitted retry.
+    """
+    adapter = getattr(consumer, "adapter", None)
+    raw = getattr(adapter, "FINAL_DELIVERY_TIMEOUT_SECONDS", None)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return _DEFAULT_STREAM_FINAL_WAIT_SECONDS
+    return min(
+        _MAX_STREAM_FINAL_WAIT_SECONDS,
+        max(_DEFAULT_STREAM_FINAL_WAIT_SECONDS, float(raw)),
+    )
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
+    # 2026-09-26 (Chris): a successful model fallover is an internal event;
+    # the user gets the answer, not the plumbing.
+    r"|model\s+fallback:"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
     r"|configured\s+compression\s+model\s+.+\s+failed"
@@ -720,6 +743,12 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+def _quiet_chat_surface(platform) -> bool:
+    """Personal messaging surfaces where only the agent's own replies belong."""
+    name = str(getattr(platform, "value", platform) or "").strip().lower()
+    return name in {"photon", "telegram", "sms", "whatsapp", "imessage"}
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
@@ -731,6 +760,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    # 2026-09-26 (Chris): on personal chat surfaces the agent is the only
+    # voice. Internal status chatter (fallbacks, retries, compression, aux
+    # models) stays in logs. Only provider *errors* still surface, as a
+    # plain-language reply, because those mean no answer is coming.
+    if _quiet_chat_surface(platform):
+        if _looks_like_gateway_provider_error(text):
+            return _gateway_provider_error_reply(text)
+        return None
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
@@ -2186,6 +2223,7 @@ from gateway.session import (
 from gateway.delivery import DeliveryRouter
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.session_state import SessionState, legacy_dict_property, legacy_lease_token_property
+from gateway.turn_lease import STARTUP_RESTORE_REPLAY_LEASE_WAIT
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -2925,7 +2963,16 @@ def _get_channel_override(
     if not platform_config or not platform_config.channel_overrides:
         return None
     overrides = platform_config.channel_overrides
-    for key in _channel_override_lookup_keys(chat_id, thread_id=thread_id, parent_id=parent_id):
+    if platform == Platform.TELEGRAM:
+        # Telegram topic IDs are scoped to a chat. Never use a bare thread ID,
+        # and prefer the exact topic before inheriting the parent chat.
+        topic_key = f"{chat_id}:{thread_id}" if thread_id else None
+        lookup_keys = [key for key in (topic_key, str(chat_id) if chat_id else None) if key]
+    else:
+        lookup_keys = _channel_override_lookup_keys(
+            chat_id, thread_id=thread_id, parent_id=parent_id
+        )
+    for key in lookup_keys:
         ov = overrides.get(key)
         if ov is not None:
             return ov
@@ -4159,15 +4206,489 @@ class GatewayRunner(
                 agent._last_flushed_db_idx = 0
         agent._api_call_count = 0
 
+    def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
+        """Fire on_session_end extraction before soft-evicting a live agent.
+
+        Soft eviction (``_release_evicted_agent_soft``) deliberately keeps the
+        session resumable and does NOT fire ``on_session_end`` — that hook is
+        reserved for the true session boundary, tear-down done by
+        ``_session_expiry_watcher`` when the session finally expires.
+
+        But the watcher tears down whatever agent it finds in ``_agent_cache``
+        at expiry time.  If cache pressure (the LRU cap) soft-evicts a
+        finalizable session's agent BEFORE it expires, the watcher later finds
+        no cached agent and ``on_session_end`` is silently skipped — memory
+        providers never see the transcript (#11205, LRU-cap variant).
+
+        We hold the live, fully-scoped agent right now, so commit its
+        end-of-session memory extraction here using the agent's own memory
+        manager (correct per-user/chat scoping, no reconstruction).  This uses
+        ``commit_memory_session`` — extraction WITHOUT provider teardown — so
+        the eviction stays soft and a resumed turn keeps working.
+
+        Only fires for sessions the expiry watcher will eventually finalize
+        (finite reset policy).  For ``mode == "none"`` sessions the watcher
+        never runs, so there is no missed-boundary to compensate for and we
+        skip the commit (the agent is simply released).  Best-effort: any
+        failure is swallowed so eviction still proceeds.
+        """
+        if agent is None or not hasattr(agent, "commit_memory_session"):
+            return
+        if getattr(agent, "_memory_manager", None) is None:
+            return  # no external memory provider — nothing to commit
+        try:
+            _store = getattr(self, "session_store", None)
+            if _store is None:
+                return
+            _store._ensure_loaded()
+            entry = _store._entries.get(key)
+            if entry is None:
+                return
+            # Only compensate when the watcher would otherwise expect to find
+            # this agent at expiry (finite policy, not yet expired). Expired
+            # sessions are torn down by the watcher directly; mode="none"
+            # sessions are never finalized.
+            if not _store.is_session_finalizable(entry):
+                return
+            if _store._is_session_expired(entry):
+                return
+            messages = getattr(agent, "_session_messages", None)
+            agent.commit_memory_session(messages if isinstance(messages, list) else None)
+            logger.debug(
+                "Committed on_session_end extraction before soft-evicting "
+                "finalizable session=%s (cache pressure, pre-expiry)", key,
+            )
+        except Exception as _e:
+            logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
+
+    def _commit_then_release_soft(self, agent: Any, key: str) -> None:
+        """Commit end-of-session memory (if warranted), then soft-release.
+
+        Runs on the daemon eviction thread so the memory-provider call and the
+        client teardown never block the caller's held cache lock. Order matters:
+        commit uses the live agent's memory manager before ``release_clients``
+        drops the message buffer.
+        """
+        self._commit_memory_before_soft_evict(agent, key)
+        self._release_evicted_agent_soft(agent)
+
+    def _release_evicted_agent_soft(self, agent: Any) -> None:
+        """Soft cleanup for cache-evicted agents — preserves session tool state.
+
+        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
+        Distinct from _cleanup_agent_resources (full teardown) because a
+        cache-evicted session may resume at any time — its terminal
+        sandbox, browser daemon, and tracked bg processes must outlive
+        the Python AIAgent instance so the next agent built for the
+        same task_id inherits them.
+        """
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, "release_clients"):
+                agent.release_clients()
+            else:
+                # Older agent instance (shouldn't happen in practice) —
+                # fall back to the legacy full-close path.
+                self._cleanup_agent_resources(agent)
+        except Exception:
+            pass
+        # Free conversation history memory — can be tens of MB with tool
+        # outputs (file reads, terminal output, search results) on heavy
+        # 100+-tool-call sessions. release_clients() deliberately preserves
+        # session tool state for resume, but the message list is rebuilt from
+        # persisted session JSON on the next turn, so dropping it here is safe.
+        if hasattr(agent, "_session_messages"):
+            agent._session_messages = []
+        # _db_flush_scan_prefix is a shallow copy of the flushed transcript
+        # (run_agent.py, stamped on every successful flush) — it shares every
+        # message dict, so leaving it pins the multi-MB content strings the
+        # eviction exists to free. Pressure-evictable agents have flushed by
+        # definition, so this attribute is always populated on exactly the
+        # agents the memory valve targets.
+        if hasattr(agent, "_db_flush_scan_prefix"):
+            agent._db_flush_scan_prefix = None
+
+    def _agent_cache_bounds(self):
+        """Operator-configured agent-cache bounds, resolved once per process.
+
+        Resolved lazily rather than in ``__init__`` so it also works for the
+        ``__new__``-constructed runners used by tests and by the slash-command
+        mixin.
+        """
+        bounds = getattr(self, "_agent_cache_bounds_cache", None)
+        if bounds is None:
+            from gateway.agent_cache_pressure import resolve_agent_cache_bounds
+
+            try:
+                bounds = resolve_agent_cache_bounds(_load_gateway_config())
+            except Exception as _e:
+                logger.debug("Agent cache bounds config read failed: %s", _e)
+                # Resolve from an empty config rather than bare
+                # AgentCacheBounds(): the dataclass default has
+                # memory_high_mb=None (pressure pass OFF), but an *absent*
+                # config section means "auto" — a transient config read
+                # failure must not permanently disable the OOM valve this
+                # feature exists to provide.
+                bounds = resolve_agent_cache_bounds({})
+            self._agent_cache_bounds_cache = bounds
+        return bounds
+
+    def _agent_cache_cap(self) -> int:
+        """Effective LRU cap — the configured override, else the default."""
+        configured = self._agent_cache_bounds().max_size
+        return configured if configured else _AGENT_CACHE_MAX_SIZE
+
+    def _agent_cache_idle_ttl(self) -> float:
+        """Effective idle TTL in seconds — configured override, else default."""
+        configured = self._agent_cache_bounds().idle_ttl_secs
+        return configured if configured else _AGENT_CACHE_IDLE_TTL_SECS
+
+    def _sweep_agent_cache_under_pressure(self) -> int:
+        """Shed cached transcripts once the gateway's own heap nears its budget.
+
+        The LRU cap counts entries and the idle sweep counts seconds; neither
+        knows that one cached agent pins a full ``_session_messages``
+        transcript — tens of MB on a session with 100+ tool calls.  A gateway
+        serving many chats therefore holds every warm transcript indefinitely:
+        agents that took a turn within the TTL are never idle-swept, and the
+        sweep additionally defers finalizable sessions until they expire.  RSS
+        climbs until the cgroup throttles and SIGTERM can no longer flush
+        inside systemd's stop timeout (#80764).
+
+        This is the missing valve.  Above the configured anonymous-RSS budget
+        it evicts LRU agents through the same soft path the cap enforcer uses,
+        so the transcript is dropped and rebuilt from the persisted session on
+        the next turn.  Three things are never touched: agents mid-turn (their
+        clients and sandboxes are in use), the most recently used sessions
+        (whose prompt cache is worth the most), and any session whose live
+        transcript has not finished reaching disk.
+
+        Returns the number of entries evicted (0 when memory is fine).
+        """
+        from gateway.agent_cache_pressure import (
+            plan_pressure_evictions,
+            read_anon_rss_mb,
+            transcript_persistence_caught_up,
+        )
+
+        bounds = self._agent_cache_bounds()
+        if not bounds.memory_high_mb:
+            return 0
+        _cache = getattr(self, "_agent_cache", None)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if not _cache or _lock is None:
+            # Nothing cached — whatever is using the heap, it isn't us, and
+            # warning about it every tick would point at the wrong subsystem.
+            return 0
+
+        rss_mb = read_anon_rss_mb()
+        if rss_mb is None or rss_mb < bounds.memory_high_mb:
+            return 0
+
+        running_ids = {
+            id(a)
+            for _, a in self._running_agent_items()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
+
+        def _is_evictable(key: str, agent: Any) -> bool:
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                return False
+            if id(agent) in running_ids:
+                return False
+            return transcript_persistence_caught_up(agent)
+
+        with _lock:
+            ordered = [
+                (key, entry[0] if isinstance(entry, tuple) and entry else entry)
+                for key, entry in _cache.items()
+            ]
+            plan = plan_pressure_evictions(
+                ordered,
+                is_evictable=_is_evictable,
+                max_evictions=bounds.max_evictions_per_pass,
+                protect_recent=bounds.protect_recent,
+            )
+            for key, _ in plan:
+                _cache.pop(key, None)
+
+        if not plan:
+            _mid_turn = sum(1 for _, a in ordered if a is not None and id(a) in running_ids)
+            _unflushed = sum(
+                1
+                for _, a in ordered
+                if a is not None
+                and a is not _AGENT_PENDING_SENTINEL
+                and id(a) not in running_ids
+                and not transcript_persistence_caught_up(a)
+            )
+            logger.warning(
+                "Agent cache pressure: anon RSS %dMB over budget %dMB but no "
+                "evictable session (%d cached, %d mid-turn, %d blocked on "
+                "un-flushed persistence)%s",
+                rss_mb, bounds.memory_high_mb, len(ordered), _mid_turn, _unflushed,
+                (
+                    " — transcripts are not reaching the session DB "
+                    "(session persistence disabled or failing?); the memory "
+                    "valve cannot shed sessions until they persist."
+                    if _unflushed and not _mid_turn
+                    else " — memory will keep climbing until those turns finish."
+                ),
+            )
+            return 0
+
+        evicted_count = len(plan)
+        logger.warning(
+            "Agent cache pressure: anon RSS %dMB over budget %dMB — evicting "
+            "%d LRU session(s): %s",
+            rss_mb, bounds.memory_high_mb, evicted_count,
+            ", ".join(key for key, _ in plan),
+        )
+        try:
+            threading.Thread(
+                target=self._release_pressure_batch,
+                args=(plan,),
+                daemon=True,
+                name="agent-cache-pressure",
+            ).start()
+        except Exception:
+            self._release_pressure_batch(plan)
+        # NOTE: _release_pressure_batch drains `plan` in place (so the trim
+        # runs with no lingering agent references) — len(plan) is 0 by the
+        # time the daemon thread finishes, hence the pre-captured count.
+        return evicted_count
+
+    def _release_pressure_batch(self, plan: List[tuple]) -> None:
+        """Release a pressure-evicted batch, then return the heap to the OS.
+
+        Sequential on one daemon thread rather than a thread per agent: the
+        batch is already capped, and the point of the pass is to reclaim
+        memory, not to race N teardowns. The trailing ``malloc_trim`` is what
+        turns "Python dropped the transcript" into "RSS actually fell" —
+        without it glibc keeps the freed arenas and the cgroup never notices.
+
+        The plan is drained (``pop`` + ``del``) rather than iterated so that
+        no local reference pins the evicted agents when ``gc.collect`` +
+        ``malloc_trim`` run — otherwise the trim frees almost nothing in this
+        pass, the next tick re-reads a still-high RSS, and the valve
+        over-evicts an extra batch of warm prompt caches every cycle.
+        """
+        while plan:
+            key, agent = plan.pop(0)  # FIFO — evict LRU-first order preserved
+            try:
+                self._commit_then_release_soft(agent, key)
+            except Exception as _e:
+                logger.debug("Pressure release failed for %s: %s", key, _e)
+            del agent
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(force=True, reason="agent_cache_pressure")
+        except Exception:
+            pass
+
+    def _enforce_agent_cache_cap(self) -> None:
+        """Evict oldest cached agents when cache exceeds the LRU cap.
+
+        Must be called with _agent_cache_lock held.  Resource cleanup
+        (memory provider shutdown, tool resource close) is scheduled
+        on a daemon thread so the caller doesn't block on slow teardown
+        while holding the cache lock.
+
+        Agents currently in _running_agents are SKIPPED — their clients,
+        terminal sandboxes, background processes, and child subagents
+        are all in active use by the running turn.  Evicting them would
+        tear down those resources mid-turn and crash the request.  If
+        every candidate in the LRU order is active, we simply leave the
+        cache over the cap; it will be re-checked on the next insert.
+        """
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache is None:
+            return
+        # OrderedDict.popitem(last=False) pops oldest; plain dict lacks the
+        # arg so skip enforcement if a test fixture swapped the cache type.
+        if not hasattr(_cache, "move_to_end"):
+            return
+
+        # Snapshot of agent instances that are actively mid-turn.  Use id()
+        # so the lookup is O(1) and doesn't depend on AIAgent.__eq__ (which
+        # MagicMock overrides in tests).
+        running_ids = {
+            id(a)
+            for _, a in self._running_agent_items()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
+
+        # Walk LRU → MRU and evict excess-LRU entries that aren't mid-turn.
+        # We only consider entries in the first (size - cap) LRU positions
+        # as eviction candidates.  If one of those slots is held by an
+        # active agent, we SKIP it without compensating by evicting a
+        # newer entry — that would penalise a freshly-inserted session
+        # (which has no cache history to retain) while protecting an
+        # already-cached long-running one.  The cache may therefore stay
+        # temporarily over cap; it will re-check on the next insert,
+        # after active turns have finished.
+        cap = self._agent_cache_cap()
+        excess = max(0, len(_cache) - cap)
+        evict_plan: List[tuple] = []  # [(key, agent), ...]
+        if excess > 0:
+            ordered_keys = list(_cache.keys())
+            for key in ordered_keys[:excess]:
+                entry = _cache.get(key)
+                agent = entry[0] if isinstance(entry, tuple) and entry else None
+                if agent is not None and id(agent) in running_ids:
+                    continue  # active mid-turn; don't evict, don't substitute
+                evict_plan.append((key, agent))
+
+        for key, _ in evict_plan:
+            _cache.pop(key, None)
+
+        remaining_over_cap = len(_cache) - cap
+        if remaining_over_cap > 0:
+            logger.warning(
+                "Agent cache over cap (%d > %d); %d excess slot(s) held by "
+                "mid-turn agents — will re-check on next insert.",
+                len(_cache), cap, remaining_over_cap,
+            )
+
+        for key, agent in evict_plan:
+            logger.info(
+                "Agent cache at cap; evicting LRU session=%s (cache_size=%d)",
+                key, len(_cache),
+            )
+            if agent is not None:
+                # Commit end-of-session memory extraction, then soft-release,
+                # both on the daemon thread so the (possibly network-bound)
+                # provider call never blocks the held cache lock. The commit
+                # only fires for finalizable-not-yet-expired sessions whose
+                # agent would otherwise vanish before the expiry watcher can
+                # fire on_session_end (#11205, LRU-cap variant).
+                threading.Thread(
+                    target=self._commit_then_release_soft,
+                    args=(agent, key),
+                    daemon=True,
+                    name=f"agent-cache-evict-{key[:24]}",
+                ).start()
+
+    def _sweep_idle_cached_agents(self) -> int:
+        """Evict cached agents whose AIAgent has been idle past the idle TTL.
+
+        Safe to call from the session expiry watcher without holding the
+        cache lock — acquires it internally.  Returns the number of entries
+        evicted.  Resource cleanup is scheduled on daemon threads.
+
+        Agents currently in _running_agents are SKIPPED for the same reason
+        as _enforce_agent_cache_cap: tearing down an active turn's clients
+        mid-flight would crash the request.
+        """
+        _cache = getattr(self, "_agent_cache", None)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _cache is None or _lock is None:
+            return 0
+        now = time.time()
+        idle_ttl = self._agent_cache_idle_ttl()
+        to_evict: List[tuple] = []
+        running_ids = {
+            id(a)
+            for _, a in self._running_agent_items()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
+        with _lock:
+            for key, entry in list(_cache.items()):
+                agent = entry[0] if isinstance(entry, tuple) and entry else None
+                if agent is None:
+                    continue
+                if id(agent) in running_ids:
+                    continue  # mid-turn — don't tear it down
+                last_activity = getattr(agent, "_last_activity_ts", None)
+                if last_activity is None:
+                    continue
+                if (now - last_activity) > idle_ttl:
+                    # Check whether the session has actually expired in the
+                    # session store.  If it hasn't (e.g. daily-reset mode
+                    # where the reset fires hours after the user's last
+                    # message), keep the agent in cache so the session-store
+                    # expiry watcher can still find it and call
+                    # on_session_end() with the live transcript.  Skipping
+                    # eviction here means the agent stays alive until the
+                    # session genuinely expires, at which point the watcher
+                    # (gateway/run.py _session_expiry_watcher) tears it down
+                    # properly.  (#11205 follow-up)
+                    #
+                    # BUT only defer when the watcher will EVER finalize this
+                    # session.  For a mode == "none" session the watcher never
+                    # fires (is_session_finalizable() is False), so deferring
+                    # would pin the agent in cache for the gateway's entire
+                    # lifetime — the exact leak this idle sweep exists to
+                    # relieve.  Those sessions fall through to soft eviction
+                    # WITHOUT on_session_end, and that is correct: a mode=="none"
+                    # session never reaches a session-end boundary, so there is
+                    # no missed on_session_end to compensate for.  (The finite
+                    # case — a session evicted under LRU-cap pressure before it
+                    # expires — is instead covered by _commit_memory_before_soft_
+                    # evict on the cap path, which fires on_session_end via the
+                    # live agent's memory manager before releasing it.)
+                    session_entry = None
+                    _store = getattr(self, "session_store", None)
+                    try:
+                        if _store is not None:
+                            _store._ensure_loaded()
+                            session_entry = _store._entries.get(key)
+                    except Exception:
+                        session_entry = None
+                    if (
+                        session_entry is not None
+                        and _store is not None
+                        and _store.is_session_finalizable(session_entry)
+                        and not _store._is_session_expired(session_entry)
+                    ):
+                        continue  # keep agent — finite session hasn't expired
+                    to_evict.append((key, agent))
+            for key, _ in to_evict:
+                _cache.pop(key, None)
+        for key, agent in to_evict:
+            logger.info(
+                "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",
+                key, now - getattr(agent, "_last_activity_ts", now),
+            )
+            threading.Thread(
+                target=self._release_evicted_agent_soft,
+                args=(agent,),
+                daemon=True,
+                name=f"agent-cache-idle-{key[:24]}",
+            ).start()
+        return len(to_evict)
+
+    # ------------------------------------------------------------------
+    # Proxy mode: forward messages to a remote Hermes API server
+    # ------------------------------------------------------------------
+
+
+
+
+    # ------------------------------------------------------------------
+
+
     def _profile_name_for_source(
         self, source: SessionSource, adapter_profile: Optional[str] = None,
     ) -> Optional[str]:
-        """Resolve the profile name for an inbound source via configured routes (most specific wins).
-        ``None`` = default/active profile (or, for a secondary adapter, its own profile — the caller
-        stamps it). Gated on ``multiplex_profiles``, since the scoped run only activates under
-        multiplexing; otherwise keys would be profile-namespaced while the agent ran in ``agent:main``.
-        ``adapter_profile`` is the profile owning the receiving bot; only routes declaring it as
-        ``bot_profile`` apply (#104933)."""
+        """Resolve the profile name for an inbound source via configured routes.
+
+        Returns ``None`` when multiplexing is off, no routes are configured, or
+        no route matches. Callers (``build_source``,
+        ``_resolve_profile_home_for_source``) treat ``None`` as "use the
+        default/active profile". When ``gateway.profile_routes`` is configured,
+        the most specific matching route wins (guild < channel < thread). See
+        :mod:`gateway.profile_routing` for matching rules.
+
+        Gated on ``gateway.multiplex_profiles``: routing stamps
+        ``source.profile``, which selects the session-key namespace and batch
+        keys — but the profile-scoped agent run only activates under
+        multiplexing. Without this gate, a configured route with multiplexing
+        off would namespace batch/session keys by profile while the agent
+        still runs in ``agent:main``, splitting the two out of agreement.
+        """
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
@@ -4268,7 +4789,6 @@ class GatewayRunner(
         _native_slack_task_cards: Any = None
         needs_progress_queue: Any = None
         _generic_status_phrase: Any = None
-
     @dataclasses.dataclass
     class _RunAgentWorker:
         """Executor future + inactivity-watchdog handles for one ``_run_agent_inner`` turn."""
@@ -4281,6 +4801,10 @@ class GatewayRunner(
         timeout_fired: Any = None
         cleanup_lock: Any = None
         is_current: Any = None
+
+
+
+
 
 
 def _run_planned_stop_watcher(
@@ -5241,3 +5765,74 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from typing import Awaitable  # noqa: F401,E402
+from typing import Union  # noqa: F401,E402
+import faulthandler  # noqa: F401,E402
+import functools  # noqa: F401,E402
+import inspect  # noqa: F401,E402
+from dotenv import load_dotenv  # noqa: F401,E402
+import queue  # noqa: F401,E402
+from datetime import timedelta  # noqa: F401,E402
+from datetime import timezone  # noqa: F401,E402
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT': ('gateway.restart', 'DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT'),
+    'DEFAULT_HEARTBEAT_INTERVAL_S': ('gateway.shutdown_watchdog', 'DEFAULT_HEARTBEAT_INTERVAL_S'),
+    'DEFAULT_LEASE_WAIT': ('gateway.turn_lease', 'DEFAULT_LEASE_WAIT'),
+    'DEFAULT_LOOP_WATCHDOG_INTERVAL_S': ('gateway.shutdown_watchdog', 'DEFAULT_LOOP_WATCHDOG_INTERVAL_S'),
+    'DEFAULT_LOOP_WATCHDOG_MAX_STRIKES': ('gateway.shutdown_watchdog', 'DEFAULT_LOOP_WATCHDOG_MAX_STRIKES'),
+    'DEFAULT_LOOP_WATCHDOG_TIMEOUT_S': ('gateway.shutdown_watchdog', 'DEFAULT_LOOP_WATCHDOG_TIMEOUT_S'),
+    'EphemeralReply': ('gateway.platforms.base', 'EphemeralReply'),
+    'GATEWAY_FATAL_CONFIG_EXIT_CODE': ('gateway.restart', 'GATEWAY_FATAL_CONFIG_EXIT_CODE'),
+    'GATEWAY_SERVICE_RESTART_EXIT_CODE': ('gateway.restart', 'GATEWAY_SERVICE_RESTART_EXIT_CODE'),
+    'SessionEntry': ('gateway.session', 'SessionEntry'),
+    'TranscriptReadError': ('gateway.session_transcript', 'TranscriptReadError'),
+    'TurnContext': ('gateway.turn_context', 'TurnContext'),
+    'TurnLeaseTimeoutError': ('gateway.turn_lease', 'TurnLeaseTimeoutError'),
+    'TurnRunner': ('gateway.run_turn_runner', 'TurnRunner'),
+    'arm_shutdown_watchdog': ('gateway.shutdown_watchdog', 'arm_shutdown_watchdog'),
+    'atomic_json_write': ('utils', 'atomic_json_write'),
+    'base_url_hostname': ('utils', 'base_url_hostname'),
+    'build_auto_tts_output_path': ('gateway.platforms.base', 'build_auto_tts_output_path'),
+    'build_channel_continuity_note': ('gateway.session', 'build_channel_continuity_note'),
+    'build_session_context': ('gateway.session', 'build_session_context'),
+    'build_session_context_prompt': ('gateway.session', 'build_session_context_prompt'),
+    'consume_detached_task_result': ('agent.async_utils', 'consume_detached_task_result'),
+    'is_global_startup_conflict': ('gateway.restart', 'is_global_startup_conflict'),
+    'is_shared_multi_user_session': ('gateway.session', 'is_shared_multi_user_session'),
+    'is_truthy_value': ('utils', 'is_truthy_value'),
+    'looks_like_telegram_private_chat_id': ('gateway.delivery', 'looks_like_telegram_private_chat_id'),
+    'loop_heartbeat_forever': ('gateway.shutdown_watchdog', 'loop_heartbeat_forever'),
+    'merge_pending_message_event': ('gateway.platforms.base', 'merge_pending_message_event'),
+    'neutralize_untrusted_inline_text': ('gateway.session', 'neutralize_untrusted_inline_text'),
+    'parse_cron_drain_timeout': ('gateway.restart', 'parse_cron_drain_timeout'),
+    'parse_restart_after_turn_timeout': ('gateway.restart', 'parse_restart_after_turn_timeout'),
+    'parse_restart_drain_timeout': ('gateway.restart', 'parse_restart_drain_timeout'),
+    'parse_signal_interrupt_grace_timeout': ('gateway.restart', 'parse_signal_interrupt_grace_timeout'),
+    'project_compaction_message_for_display': ('agent.compaction_display', 'project_compaction_message_for_display'),
+    'repair_explicit_computer_use_media_paths': ('gateway.media_repair', 'repair_explicit_computer_use_media_paths'),
+    'resolve_cron_drain_budget': ('gateway.restart', 'resolve_cron_drain_budget'),
+    'resolve_delivery_transport': ('gateway.delivery', 'resolve_delivery_transport'),
+    'resolve_shutdown_watchdog_delay': ('gateway.shutdown_watchdog', 'resolve_shutdown_watchdog_delay'),
+    'start_loop_liveness_watchdog': ('gateway.shutdown_watchdog', 'start_loop_liveness_watchdog'),
+    't': ('agent.i18n', 't'),
+    'utf16_len': ('gateway.platforms.base', 'utf16_len'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----

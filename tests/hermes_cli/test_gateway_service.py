@@ -461,6 +461,13 @@ class TestGatewayStopCleanup:
 
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        # This test explicitly targets the systemd branch.  Pin service-manager
+        # detection before gateway_command() so running the suite inside an
+        # s6-hosted Hermes container cannot dispatch the test's `stop` action
+        # to the live /run/service/gateway-default supervisor.
+        monkeypatch.setattr(
+            "hermes_cli.service_manager.detect_service_manager", lambda: "systemd"
+        )
 
         service_calls = []
         kill_calls = []
@@ -2461,6 +2468,14 @@ class TestGatewayCommandCatchesSystemScopeError:
         )
         monkeypatch.setattr(gateway_cli.os, "geteuid", lambda: 1000)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        # Scoped intent: this test exercises the non-root systemd branch. Do
+        # not let hosted s6 auto-detection reroute `start --system` to the
+        # real gateway-default supervisor; the canonical guard remains the
+        # outer fail-closed boundary if this pin is ever removed.
+        monkeypatch.setattr(
+            "hermes_cli.service_manager.detect_service_manager", lambda: "systemd"
+        )
         monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda **kw: 0)
 
         args = SimpleNamespace(gateway_command="start", system=True, all=False)

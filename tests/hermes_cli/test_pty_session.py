@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import time
 
 import pytest
@@ -27,6 +28,9 @@ class FakeBridge:
 
     def __init__(self, chunks, *, write_result=True):
         self._chunks = list(chunks)   # bytes; b"" = idle tick; None = EOF
+        self.chunks_consumed = threading.Event()
+        if not self._chunks:
+            self.chunks_consumed.set()
         self.written = bytearray()
         self.write_result = write_result
         self.closed = False
@@ -36,7 +40,10 @@ class FakeBridge:
     def read(self, timeout):
         if not self._chunks:
             return b""                # idle
-        return self._chunks.pop(0)
+        chunk = self._chunks.pop(0)
+        if not self._chunks:
+            self.chunks_consumed.set()
+        return chunk
 
     async def write(self, data):
         if self.write_result:
@@ -57,6 +64,7 @@ class FakeWS:
     def __init__(self):
         self.sent = []               # list of ("bytes"|"text", payload)
         self.close_code = None
+        self.closed = asyncio.Event()
 
     async def send_bytes(self, data):
         self.sent.append(("bytes", bytes(data)))
@@ -66,6 +74,7 @@ class FakeWS:
 
     async def close(self, code=1000, reason=""):
         self.close_code = code
+        self.closed.set()
 
 
 class FailingWS(FakeWS):
@@ -90,7 +99,7 @@ async def test_attach_replays_buffer_then_streams_live():
     bridge = FakeBridge([b"hello ", b"world", None])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
-    await asyncio.sleep(0.05)                      # drain consumes "hello world"
+    assert await asyncio.to_thread(bridge.chunks_consumed.wait, 5)
     ws = FakeWS()
     await s.attach(ws)
     replay = b"".join(p for kind, p in ws.sent if kind == "bytes")
@@ -155,7 +164,7 @@ async def test_reattach_can_force_complete_tui_redraw_after_replay():
     bridge = FakeBridge([b"partial differential frame", b""])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
-    await asyncio.sleep(0.05)
+    assert await asyncio.to_thread(bridge.chunks_consumed.wait, 5)
 
     ws = FakeWS()
     assert await s.attach(ws, force_redraw=True) is True
@@ -264,7 +273,7 @@ async def test_superseded_failed_write_does_not_kill_replacement_session():
 @pytest.mark.asyncio
 async def test_detach_keeps_draining_into_buffer():
     from hermes_cli.pty_session import PtySession
-    bridge = FakeBridge([b"one", b"", b"two"])
+    bridge = FakeBridge([b"one", b"", b"two", b""])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
     ws = FakeWS()
@@ -272,7 +281,7 @@ async def test_detach_keeps_draining_into_buffer():
     s.detach(ws)
     assert s.attached is False
     assert s.last_detached_at is not None
-    await asyncio.sleep(0.05)                      # "two" drains while detached
+    assert await asyncio.to_thread(bridge.chunks_consumed.wait, 5)
     ws2 = FakeWS()
     await s.attach(ws2)
     replay = b"".join(p for kind, p in ws2.sent if kind == "bytes")
@@ -288,7 +297,7 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     await s.start()
     ws = FakeWS()
     await s.attach(ws)
-    await asyncio.sleep(0.05)                      # drain hits None (EOF)
+    await asyncio.wait_for(ws.closed.wait(), timeout=5)
     assert s.alive is False
     assert ws.close_code == 4410
     await s.close()

@@ -9,6 +9,7 @@ import logging
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
@@ -218,8 +219,28 @@ class SessionSearchMixin:
         if not self._fts_enabled:
             return
         try:
-            self._merge_fts_incrementally(max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX)
-        except Exception as exc:
+            merge_limit = int(getattr(self, "_FTS_LIVE_MERGE_MAX_DB_BYTES", 0))
+            db_path = Path(getattr(self, "db_path"))
+            db_size = db_path.stat().st_size
+            if merge_limit > 0 and db_size > merge_limit:
+                if not getattr(self, "_fts_live_merge_size_warned", False):
+                    self._fts_live_merge_size_warned = True
+                    logger.warning(
+                        "Skipping automatic FTS merge for large state DB (%d bytes; "
+                        "limit=%d). Run explicit session-storage optimization "
+                        "during a maintenance window instead.",
+                        db_size,
+                        merge_limit,
+                    )
+                return
+        except OSError as exc:
+            logger.warning("Could not stat state DB before FTS merge: %s", exc)
+            return
+        try:
+            self._merge_fts_incrementally(
+                max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
+            )
+        except Exception as exc:  # noqa: BLE001 - post-commit maintenance
             # The canonical write is already committed before this cadence runs. No maintenance failure —
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
             # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write

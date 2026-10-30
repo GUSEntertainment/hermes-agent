@@ -223,6 +223,11 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kbd._set_worker_pid(conn, t, 12345)
+        monkeypatch.setattr(
+            _kb, "_worker_process_identity", lambda pid: (pid, 1.0)
+        )
+        kb._set_worker_pid(conn, t, 12345)
+
         old_expires = int(time.time()) - 3600
         hb_at = int(time.time()) - 1800
         conn.execute(
@@ -284,6 +289,8 @@ def test_stale_claim_extend_live_worker_does_not_count_failure(
         t = kb.create_task(conn, title="live worker", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
+        # [GUS port] custom guard needs an OS start identity; synthetic PIDs have none.
+        monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (int(pid), 1.0))
         kbd._set_worker_pid(conn, t, 12345)
         old_expires = int(time.time()) - 3600
         conn.execute(
@@ -1429,7 +1436,10 @@ def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
     """archived is terminal for recompute_ready, so linking under an archived
     parent must not demote a ready child (it would only flap back to ready)."""
     with kbc.connect() as conn:
+        # [GUS t_fa49d830] archived only counts as terminal when the card was
+        # completed before retirement; retiring unfinished work must still gate.
         parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent, result="done")
         kb.archive_task(conn, parent)
         child = kb.create_task(conn, title="child")
         assert kb.get_task(conn, child).status == "ready"
@@ -1439,6 +1449,12 @@ def test_link_tasks_archived_parent_is_terminal_no_gate(kanban_home):
         assert gated is False
         assert kb.get_task(conn, child).status == "ready"
         assert "dependency_wait" not in [e.kind for e in kb.list_events(conn, child)]
+
+        unfinished = kb.create_task(conn, title="retired unfinished parent")
+        kb.archive_task(conn, unfinished)
+        other = kb.create_task(conn, title="other child")
+        assert kb.link_tasks(conn, unfinished, other) is True
+        assert kb.get_task(conn, other).status == "todo"
 
 
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
@@ -1586,7 +1602,8 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    # [GUS] custom argv adds -P (safe path) so a task cwd cannot shadow the release.
+    assert kbd._resolve_hermes_argv() == [sys.executable, *kb._python_safe_path_flag(), "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -2042,6 +2059,8 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         # A verified spawn: an uncaptured fingerprint would (correctly) refuse the signal.
         monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
+        # [GUS port] custom guard needs an OS start identity; synthetic PIDs have none.
+        monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (int(pid), 1.0))
         kbd._set_worker_pid(conn, t, 54321)
 
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
@@ -2082,3 +2101,80 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_connect_context_manager_does_not_close_connection(tmp_path):
+    """sqlite3.Connection context managers commit but do not close.
+    This is the upstream behaviour we cannot change; the regression
+    guard is to make sure connect_closing() does the right thing.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        pass
+    # Still usable after with-block exit (the leak).
+    conn.execute("SELECT 1").fetchone()
+    conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_worker_context_renders_scoped_authorization_continuity(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="spec", assignee="planner")
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Spec accepted.",
+            metadata={
+                "authorization_continuity": {
+                    "authorized": True,
+                    "authorized_by": "Chris",
+                    "scope": "Finish the existing Hermes Kanban authorization task in staging.",
+                    "allowed_actions": ["specification", "implementation", "verification"],
+                    "blocked_actions": ["deployment", "live board mutation", "service restart"],
+                    "security_scope": "No audience, credential, or permission expansion.",
+                }
+            },
+        )
+        child = kb.create_task(conn, title="implementation", assignee="worker", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+    assert "## Authorization continuity" in ctx
+    assert "Chris already authorized this outcome chain" in ctx
+    assert "Proceed through specification, implementation, and verification" in ctx
+    assert "Finish the existing Hermes Kanban authorization task in staging." in ctx
+    assert "Still approval-gated: deployment; live board mutation; service restart" in ctx
+    assert f"Inherited from task(s): {parent}" in ctx
+
+
+def test_authorization_continuity_scope_expansion_and_holds_fail_closed(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="spec", assignee="planner")
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Spec changed.",
+            metadata={
+                "authorization_continuity": {
+                    "authorized": True,
+                    "scope": "Original staging-only patch.",
+                    "scope_expansion": True,
+                    "explicit_holds": ["do not restart the live gateway"],
+                    "requires_new_decision": ["publish the release"],
+                }
+            },
+        )
+        child = kb.create_task(conn, title="expanded implementation", assignee="worker", parents=[parent])
+
+        contract = kb.authorization_continuity_for_task(conn, child)
+        ctx = kb.build_worker_context(conn, child)
+
+    assert contract is not None
+    assert contract["authorized"] is False
+    assert contract["status"] == "new_decision_required"
+    assert kb.authorization_continuity_allows_inheritance(contract) is False
+    assert "Do not treat earlier authorization as enough" in ctx
+    assert "Explicit holds: do not restart the live gateway" in ctx
+    assert "Requires new Chris decision: publish the release" in ctx
+    assert "Scope expansion: yes" in ctx
+

@@ -123,7 +123,7 @@ async def test_markdown_link_stays_on_markdown_send(
 
 
 @pytest.mark.asyncio
-async def test_direct_url_only_send_falls_back_to_plain_send(
+async def test_direct_url_only_ambiguous_failure_has_no_plain_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
@@ -132,20 +132,18 @@ async def test_direct_url_only_send_falls_back_to_plain_send(
 
     async def _fake_call(path: str, body: dict[str, Any]) -> dict[str, Any]:
         calls.append((path, body))
-        if path == "/send-richlink":
-            raise RuntimeError("richlink unsupported")
-        return {"ok": True, "messageId": "plain-msg"}
+        raise RuntimeError("richlink acknowledgement ambiguous")
 
     adapter._sidecar_call = _fake_call  # type: ignore[assignment]
 
     result = await adapter.send("+155****4567", _URL)
 
-    assert result.success is True
-    assert result.message_id == "plain-msg"
+    assert result.success is False
     assert calls == [
         ("/send-richlink", {"spaceId": "+155****4567", "url": _URL}),
-        ("/send", {"spaceId": "+155****4567", "text": _URL}),
     ]
+
+
 
 
 @pytest.mark.asyncio
@@ -189,6 +187,46 @@ async def test_standalone_url_only_send_routes_to_richlink_endpoint(
             {"spaceId": "+155****4567", "url": _URL},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_standalone_richlink_ambiguous_failure_has_no_plain_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
+    monkeypatch.setenv("PHOTON_SIDECAR_TOKEN", "tok")
+    posted: List[Tuple[str, Dict[str, Any]]] = []
+
+    class _Resp:
+        status_code = 500
+        text = '{"ok":false,"error":"internal sidecar error","retryable":true}'
+
+        @staticmethod
+        def json() -> Dict[str, Any]:
+            return {"ok": False, "error": "internal sidecar error", "retryable": True}
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url: str, json: Dict[str, Any], headers=None):
+            posted.append((url, json))
+            return _Resp()
+
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _FakeClient)
+
+    cfg = PlatformConfig(enabled=True, token="", extra={})
+    result = await photon_adapter._standalone_send(cfg, "+155****4567", _URL)
+
+    assert result.get("success") is not True
+    assert len(posted) == 1
+    assert posted[0][0].endswith("/send-richlink")
 
 
 @pytest.mark.asyncio

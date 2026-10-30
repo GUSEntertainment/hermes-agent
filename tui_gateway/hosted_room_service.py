@@ -146,11 +146,21 @@ class HostedRoomService:
         return self.local_profiles()
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
+        # Shared singleton rooms use hosted events, but must never enter the
+        # unrestricted multi-agent Discussion executor.
+        import sqlite3
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            shared_ids = ({r[0] for r in conn.execute("SELECT room_id FROM app_shared_rooms")}
+                          if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_shared_rooms'").fetchone()
+                          else set())
         local_gateway_id = hosted_rooms.local_authority_gateway_id()
         return tuple(
             HostedRoomBinding(str(room["room_id"]), *_authority(room))
             for room in hosted_rooms.list_rooms(self.db_path)
-            if str(room["authority_gateway_id"]) == local_gateway_id)
+            if str(room["authority_gateway_id"]) == local_gateway_id
+            and str(room["room_id"]) not in shared_ids
+            and not any(m.get("profile") == "shared" for m in room["members"])
+        )
 
     def _room(self, room_id: str) -> dict[str, Any]:
         return hosted_rooms.room_state(self.db_path, room_id=room_id)
@@ -460,6 +470,26 @@ class HostedRoomService:
                                                      local_profiles=self.room_profiles(room))
                     admitted = existing
                 else:
+                    # Reserve before admission. A failed admission consumes its
+                    # reservation rather than risking an unmetered retry.
+                    import sqlite3
+                    with sqlite3.connect(self.db_path, timeout=30) as budget_conn:
+                        budget_conn.execute("PRAGMA busy_timeout=30000")
+                        if budget_conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_room_ownership'"
+                        ).fetchone():
+                            cursor = budget_conn.execute(
+                                """UPDATE app_room_ownership SET reserved_turns=reserved_turns+1,
+                                   paused=CASE WHEN reserved_turns+1 >= turn_limit THEN 1 ELSE paused END
+                                   WHERE room_id=? AND stopped=0 AND paused=0
+                                   AND reserved_turns < turn_limit
+                                   AND reserved_turns < lifetime_turn_limit""",
+                                (binding.room_id,),
+                            )
+                            if cursor.rowcount == 0 and budget_conn.execute(
+                                "SELECT 1 FROM app_room_ownership WHERE room_id=?", (binding.room_id,)
+                            ).fetchone():
+                                return
                     admitted = driver.admit_task(
                         self.db_path, decision.task.identity, payload=decision.task.payload, clock=time.time)
                 # A stop can race the policy read from another process: re-read after admission

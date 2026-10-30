@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -1037,6 +1038,48 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
+    def test_search_projection_skips_context_enrichment_queries(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="before")
+        db.append_message("s1", role="assistant", content="projectionneedle")
+        db.append_message("s1", role="user", content="after")
+
+        statements = []
+        # Read connections are leased per operation and can be replaced.
+        # Trace the connection actually used, rather than a previously idle one.
+        original_read_ctx = db._read_ctx
+
+        @contextmanager
+        def traced_read_ctx():
+            with original_read_ctx() as conn:
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        def context_query_count():
+            normalized = (" ".join(sql.upper().split()) for sql in statements)
+            return sum("WITH TARGET AS (" in sql for sql in normalized)
+
+        with mock.patch.object(db, "_read_ctx", traced_read_ctx):
+            projected = db.search_messages(
+                "projectionneedle", fields=("session_id", "snippet")
+            )
+            assert len(projected) == 1
+            assert context_query_count() == 0
+
+            full = db.search_messages(
+                "projectionneedle", fields=("session_id", "context")
+            )
+            assert len(full) == 1
+            assert full[0]["context"]
+            assert context_query_count() == 1
+
+            default = db.search_messages("projectionneedle")
+            assert len(default) == 1
+            assert default[0]["context"]
+            assert context_query_count() == 2
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -3897,6 +3940,22 @@ class TestOptimizeFts:
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
+    def test_write_path_skips_incremental_fts_merge_for_large_database(
+        self, db, monkeypatch
+    ):
+        """Live writes must not run merge commands on production-scale DBs."""
+        db._FTS_MERGE_EVERY_N_WRITES = 1
+        db._FTS_LIVE_MERGE_MAX_DB_BYTES = 1
+        calls = []
+        monkeypatch.setattr(
+            db,
+            "_merge_fts_incrementally",
+            lambda *, max_pages: calls.append(max_pages),
+        )
+
+        db.create_session(session_id="large", source="cli")
+
+        assert calls == []
 
 
 class TestAutoMaintenance:

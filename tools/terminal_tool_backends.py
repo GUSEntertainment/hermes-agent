@@ -54,7 +54,8 @@ _BUILTIN_BACKENDS = "local, docker, modal, daytona, vercel_sandbox, ssh"
 # Config -> kwargs shapers, driven by (out_key, config_key, default) tables. The container table's
 # (key, default) literal is intentionally greppable; tools/terminal_tool.py keeps its own for the AST test.
 _SSH_KEYS = (("host", "ssh_host", ""), ("user", "ssh_user", ""), ("port", "ssh_port", 22),
-             ("key", "ssh_key", ""), ("persistent", "ssh_persistent", True))
+             ("key", "ssh_key", ""), ("persistent", "ssh_persistent", True),
+             ("sync_files", "ssh_sync_files", True))
 _RESOURCE_KEYS = (("cpu", "container_cpu", 1), ("memory", "container_memory", 5120),
                   ("disk", "container_disk", 51200), ("persistent_filesystem", "container_persistent", True))
 _CONTAINER_KEYS = (
@@ -131,7 +132,9 @@ def _modal_unavailable_reason(modal_state: dict[str, Any]) -> tuple[str, str]:
 # --- Environment builders. Signature: (*, image, cwd, timeout, cc, task_id, ssh_config, local_config, host_cwd)
 # (env_type is only forwarded to the plugin-registry fallback, not to the built-in builders.)
 def _build_local_env(*, cwd, timeout, local_config=None, **_):
-    return _LocalEnvironment(cwd=cwd, timeout=timeout, persistent=(local_config or {}).get("persistent", True))
+    lc = local_config or {}
+    return _LocalEnvironment(cwd=cwd, timeout=timeout, persistent=lc.get("persistent", True),
+                             env=lc.get("env"), replace_env=lc.get("replace_env", False))
 
 
 def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
@@ -207,7 +210,8 @@ def _build_ssh_env(*, cwd, timeout, ssh_config, probe_only=False, **_):
         raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
     return _SSHEnvironment(host=ssh_config["host"], user=ssh_config["user"], port=ssh_config.get("port", 22),
                            key_path=ssh_config.get("key", ""), cwd=cwd, timeout=timeout, probe_only=probe_only,
-                           persistent=ssh_config.get("persistent", True))
+                           persistent=ssh_config.get("persistent", True),
+                           sync_files=ssh_config.get("sync_files", True))
 
 
 def _stamp_sandbox_home(env_obj, provider, cwd) -> None:
@@ -279,6 +283,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     for local/ssh/vercel; ``container_config`` carries the container_*/docker_* resource keys; ``host_cwd`` is
     the host dir bound into Docker when cwd mounting is enabled. ``probe_only`` asks ssh for a throwaway
     connection with no remote setup/sync (the prompt-time probe). Unknown types fall through to plugin backends."""
+    # [GUS v0.21.5 port] Authenticated private workers run ONLY in a local,
+    # workspace-confined, non-persistent shell (privacy wall).
+    from tools.terminal_tool import _private_worker_environment
+    if _private_worker_environment() is not None:
+        if env_type != "local":
+            raise PermissionError("Private worker requires local confined execution")
+        from tools.workspace_confinement import resolve_confined_path
+        cwd = str(resolve_confined_path(cwd, task_id=task_id, access="write"))
+        local_config = {"persistent": False}
     builder = _ENV_BUILDERS.get(env_type)
     kwargs = dict(image=image, cwd=cwd, timeout=timeout, cc=container_config or {}, task_id=task_id,
                   ssh_config=ssh_config, local_config=local_config, host_cwd=host_cwd, probe_only=probe_only)

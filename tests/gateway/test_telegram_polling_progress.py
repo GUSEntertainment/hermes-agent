@@ -201,20 +201,22 @@ async def test_webhook_disconnect_polling_reconnect_resets_mode_and_waits_for_pr
 
     monkeypatch.delenv("TELEGRAM_WEBHOOK_URL")
     monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET")
+    started = asyncio.Event()
+    polling_app.updater.start_polling = AsyncMock(side_effect=lambda **kw: started.set())
+    connect_task = asyncio.create_task(adapter.connect(is_reconnect=True))
     try:
-        assert await adapter.connect(is_reconnect=True) is True
-        assert adapter._webhook_mode is False
-        assert adapter._polling_heartbeat_task is not None
-        assert not adapter._polling_heartbeat_task.done()
-        await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
-        assert heartbeat_modes == [False]
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not connect_task.done()
         assert adapter._send_path_degraded is True
-
         generation = adapter._polling_generation
         polling_request = builders[1].polling_request
         polling_request.result = (200, b'{"ok":true,"result":[]}')
         await _request_for_generation(generation, polling_request, "getUpdates")
-        await asyncio.wait_for(adapter._polling_progress_verifier_task, timeout=1)
+        assert await asyncio.wait_for(connect_task, timeout=2) is True
+        assert adapter._webhook_mode is False
+        await asyncio.wait_for(heartbeat_started.wait(), timeout=2)
+        assert heartbeat_modes == [False]
+        assert adapter.transport_health()["status"] == "ok"
         assert adapter._send_path_degraded is False
     finally:
         await adapter.disconnect()

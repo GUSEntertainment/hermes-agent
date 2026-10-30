@@ -74,8 +74,9 @@ def test_startup_fast_import_weight():
     """Importing _startup_fast must not drag in any heavy module."""
     probe = (
         "import sys, json\n"
+        "before = set(sys.modules)\n"
         "import hermes_cli._startup_fast\n"
-        "print(json.dumps(sorted(sys.modules.keys())))\n"
+        "print(json.dumps(sorted(set(sys.modules) - before)))\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", probe],
@@ -133,10 +134,12 @@ def test_fast_version_parity_on_termux(tmp_path):
 def test_fast_version_reports_install_method_stamp(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
-    (home / ".install_method").write_text("git\n", encoding="utf-8")
-    result = _run_version({"HERMES_HOME": str(home)})
+    # A legacy Git stamp can legitimately be overridden by a packaged build.
+    # Use the neutral supported stamp to exercise the legacy read path itself.
+    (home / ".install_method").write_text("unknown\n", encoding="utf-8")
+    result = _run_version({"HERMES_HOME": str(home), "TERMUX_VERSION": ""})
     assert result.returncode == 0, result.stderr
-    assert "Install method: git" in result.stdout
+    assert "Install method: unknown" in result.stdout
 
 
 def test_literal_tilde_hermes_home_expands_before_any_reader(tmp_path):

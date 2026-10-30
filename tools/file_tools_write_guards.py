@@ -223,18 +223,26 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     if not enabled:
         return None
 
-    normalized = os.path.normpath(_expand_tilde(filepath))
-    try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
-    except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+    # [GUS] Remote caller lanes: classify the remote path lexically; never
+    # consult an unrelated host symlink or the gateway's own HOME.
+    import posixpath
+    from gateway.host_tool_authority import remote_required
+    remote = remote_required()
+    normalized = posixpath.normpath(filepath) if remote else os.path.normpath(_expand_tilde(filepath))
+    if remote:
+        resolved = normalized
+    else:
+        try:
+            resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            resolved = os.path.realpath(normalized)
 
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
     # Must run before the ``.hermes`` component rule, which would match the home.
     # ``_hermes_exempt_homes`` also covers the ROOT when the active home is a named
     # profile, so ~/.hermes/<file> cannot read as project-local ``.hermes`` config.
-    for real_home in _hermes_exempt_homes():
+    for real_home in (() if remote else _hermes_exempt_homes()):
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
@@ -428,6 +436,9 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     """Soft-guard: warn when ``filepath`` lands on a host-side or Docker sandbox MIRROR of
     Hermes state (a write the host never reads). Not profile isolation — that guard was
     removed; ``cross_profile=True`` keeps bypassing this one for replay compat. Fails open."""
+    from gateway.host_tool_authority import remote_required
+    if remote_required():
+        return None  # [GUS] Host-only mirror warnings cannot classify SSH paths.
     try:
         from agent.file_safety import get_container_mirror_warning, get_sandbox_mirror_warning
     except Exception:
@@ -567,6 +578,9 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
     """
     if file_state.guard_disabled():
         return None
+    from tools.file_tools_read_tracking import _host_metadata_allowed
+    if not _host_metadata_allowed(task_id):
+        return None  # [GUS] remote caller: host staleness cannot classify SSH paths
     stale = file_state.check_stale(task_id, resolved) if resolved else None
     if stale:
         return stale

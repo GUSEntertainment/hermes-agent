@@ -212,6 +212,31 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
+def _confined_worker_skill_boundary_active() -> bool:
+    """Return true only for a process with authenticated durable admission."""
+    try:
+        from agent.private_worker_mode import get_authenticated_worker_contract
+
+        contract = get_authenticated_worker_contract()
+        return bool(contract and contract.get("workspace_confinement") is True)
+    except Exception:
+        if os.environ.get("HERMES_WORKER_ADMISSION_FD", "").strip():
+            raise
+        return False
+
+
+def _apply_confined_worker_skill_boundary(tools_to_include: set) -> None:
+    if not _confined_worker_skill_boundary_active():
+        return
+    tools_to_include.difference_update(resolve_toolset("skills"))
+    tools_to_include.update(resolve_toolset("worker_skills"))
+    from agent.private_worker_mode import get_authenticated_worker_contract
+    contract = get_authenticated_worker_contract()
+    if contract and contract.get("member_company_policy"):
+        from gateway.member_worker_policy import allowed_tools
+        tools_to_include.intersection_update(allowed_tools())
+
+
 def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
                          quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
@@ -221,12 +246,51 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    from gateway.josh_board_authority import app_binding
+    app=app_binding()
+    if app is not None and (enabled_toolsets is None or set(enabled_toolsets)-set(app["toolsets"])):
+        raise PermissionError("Toolsets outside installed app authority")
+    from gateway.josh_pilot_tools import pilot_required, TOOLSET
+    if pilot_required():
+        if os.environ.get("HERMES_SESSION_SOURCE")=="kanban":
+            from gateway.native_owner_board import current as native_current
+            native_current()
+            if enabled_toolsets not in ([], ["kanban"]):raise PermissionError("Unexpected native worker toolsets: " + repr(enabled_toolsets))
+            permitted={"kanban_show","kanban_complete","kanban_block","kanban_heartbeat"}
+            result=_compute_tool_definitions([],disabled_toolsets,quiet_mode,skip_tool_search_assembly=True)
+            result=[item for item in result if item["function"]["name"] in permitted]
+            if {item["function"]["name"] for item in result}!=permitted:raise PermissionError("Native lifecycle tools unavailable")
+            return result
+        if enabled_toolsets != [TOOLSET]:
+            raise PermissionError("Unexpected Josh toolset request")
+        skip_tool_search_assembly = True
+        from gateway.josh_pilot_tools import schema_names
+        permitted = schema_names()
+        result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, skip_tool_search_assembly=True)
+        # Registry membership is process-global and is not authority: narrow every
+        # registration to this run's snapshot. Never widen; missing tools fail closed.
+        _extra = {x['function']['name'] for x in result} - permitted
+        if _extra:
+            logger.warning('Josh toolset: dropped stray tools %s', sorted(_extra))
+        result = [x for x in result if x['function']['name'] in permitted]
+        if {x['function']['name'] for x in result} != permitted:
+            raise PermissionError('Unexpected native owner tools: ' + repr(sorted({x['function']['name'] for x in result} ^ permitted)))
+        return result
+
+    if app is not None:
+        # Process-global registrations (for example Photon credential tools)
+        # must not advertise capabilities absent from this installed app policy.
+        allowed=set().union(*(set(resolve_toolset(t)) for t in app['toolsets'])) | {'tool_search','tool_describe','tool_call'}
+        result=_compute_tool_definitions(enabled_toolsets,disabled_toolsets,quiet_mode,skip_tool_search_assembly=skip_tool_search_assembly)
+        return [item for item in result if item['function']['name'] in allowed]
+
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                          skip_tool_search_assembly=skip_tool_search_assembly)
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    cache_key = (cache_key, __import__("gateway.gbrain_authority", fromlist=["cache_scope"]).cache_scope(), __import__("gateway.host_tool_authority", fromlist=["scope"]).scope()) if cache_key is not None else None
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -504,8 +568,14 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
+    _apply_confined_worker_skill_boundary(tools_to_include)
     with scoped_kanban_toolset_selection(enabled_toolsets):
-        filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+        from gateway.gbrain_authority import filter_definitions
+        from gateway.host_tool_authority import tool_allowed as host_tool_allowed
+        filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+        filtered_tools = filter_definitions(filtered_tools)
+        filtered_tools = [d for d in filtered_tools if host_tool_allowed(d.get("function", {}).get("name", ""))]
+        filtered_tools = _apply_dynamic_schemas(filtered_tools)
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
@@ -836,6 +906,11 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
+        from gateway.member_worker_policy import allowed_tool as member_tool_allowed
+        from gateway.josh_board_authority import app_tool_allowed
+        from gateway.josh_pilot_tools import pilot_required, allowed_names
+        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names()):
+            return tool_error("Tool not admitted for Josh pilot")
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
@@ -886,6 +961,36 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from gateway.gbrain_authority import tool_allowed, DENIED
+    if not tool_allowed(function_name):
+        return DENIED
+    from gateway.host_tool_authority import tool_allowed as host_tool_allowed
+    if not host_tool_allowed(function_name):
+        return DENIED
+    from gateway.member_worker_policy import allowed_tool as member_tool_allowed
+    try:
+        if not member_tool_allowed(function_name):
+            return tool_error("Tool outside current member task admission")
+    except PermissionError:
+        return tool_error("Member task authority unavailable")
+    from gateway.josh_board_authority import app_tool_allowed
+    from gateway.josh_pilot_tools import pilot_required, TOOL, allowed_names
+    try:
+        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names()):
+            return tool_error("Tool not admitted for Josh pilot")
+    except PermissionError:
+        return tool_error("Tool not admitted without authenticated Josh authority")
+
+    if (
+        _confined_worker_skill_boundary_active()
+        and function_name in set(resolve_toolset("skills"))
+    ):
+        return tool_error(
+            f"'{function_name}' is unavailable to workspace-confined workers; "
+            "use the read-only worker skill tools."
+        )
+
+    # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

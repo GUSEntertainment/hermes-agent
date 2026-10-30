@@ -127,6 +127,13 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+        from hermes_cli.kanban_completion import request_token_limit
+        worker_ceiling = request_token_limit()
+        if worker_ceiling is not None:
+            ctx = min(int(ctx), worker_ceiling) if ctx else worker_ceiling
+        # budget_for_context_window(None) (rather than DEFAULT_BUDGET) so the
+        # config-driven MCP threshold override still applies when the context
+        # length isn't resolvable.
         return budget_for_context_window(int(ctx) if ctx else None)
     except Exception:
         return DEFAULT_BUDGET

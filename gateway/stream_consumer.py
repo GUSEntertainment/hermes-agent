@@ -140,8 +140,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Only platforms needing an explicit finalize call (DingTalk AI Cards) force a
         # redundant final edit; ``is True`` keeps MagicMock adapters out.
         self._adapter_requires_finalize = getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
-        # Telegram bounds edit retries at 5s; a fallback must not wait longer.
-        self._max_fallback_flood_retry_seconds = 5.0
+        # Keep fallback recovery responsive by default. Platforms with a bounded
+        # final-delivery cleanup window can opt into a longer RetryAfter budget.
+        _final_retry_budget = getattr(adapter, "FINAL_DELIVERY_RETRY_BUDGET_SECONDS", None)
+        if not isinstance(_final_retry_budget, (int, float)) or isinstance(_final_retry_budget, bool):
+            _final_retry_budget = 5.0
+        self._max_fallback_flood_retry_seconds = min(85.0, max(0.0, float(_final_retry_budget)))
 
         self._queue: queue.Queue = queue.Queue()
         # Every real preview id on screen this response (fresh-final deletes them all);

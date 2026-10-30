@@ -868,6 +868,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 persist_tools=True,
             )
             return
+        from agent.system_prompt import stored_prompt_date_stale as _date_stale
+        if _date_stale(stored_prompt):
+            # Local day rolled over since this prompt was stored: rebuild once so the
+            # model sees today's date, then persist so later turns today reuse it.
+            logger.info("Stored system prompt for session %s is from a previous day; rebuilding date anchor.", agent.session_id)
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            if agent._session_db:
+                try:
+                    agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+                except Exception as exc:
+                    logger.warning("Session DB update_system_prompt failed after date rollover (session=%s): %s", agent.session_id, exc)
+            return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
@@ -1728,6 +1740,16 @@ def _run_conversation_turn(
             break
         _run_phase(prepare_iteration, agent, s)
         _run_phase(assemble_api_request, agent, s)
+        # Preserve the worker's hard budget independently of the model context ceiling.
+        from hermes_cli.kanban_completion import token_budget_reason, prepare_request_budget, record_worker_budget_exit
+        prepare_request_budget(agent)
+        _kanban_budget_reason = token_budget_reason(agent, s.request_pressure_tokens)
+        if _kanban_budget_reason in {"kanban_invalid_token_budget", "kanban_total_token_budget"}:
+            s._turn_exit_reason = _kanban_budget_reason
+            s.failed = True
+            s.final_response = "Worker budget reached; progress is retained for the accountable owner."
+            record_worker_budget_exit(_kanban_budget_reason)
+            break
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
             return _pg.result
@@ -1735,6 +1757,17 @@ def _run_conversation_turn(
             break
         if _pg.action == "continue":
             continue
+        # Compression may rebuild the request. Never send an oversized worker request.
+        _kanban_budget_reason = token_budget_reason(agent, s.request_pressure_tokens)
+        if _kanban_budget_reason:
+            s._turn_exit_reason = _kanban_budget_reason
+            s.failed = True
+            s.final_response = "Worker budget reached; progress is retained for the accountable owner."
+            record_worker_budget_exit(_kanban_budget_reason)
+            s.api_call_count -= 1
+            agent._api_call_count = s.api_call_count
+            agent.iteration_budget.refund()
+            break
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries

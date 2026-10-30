@@ -197,6 +197,43 @@ _READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
 _READ_BUSY_TIMEOUT_S = 5.0
 
 
+
+def _parse_boolish(value: Any, default: bool = True) -> bool:
+    """Parse bool-like config/env values without importing config helpers."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _trigram_search_enabled() -> bool:
+    """[GUS custom] Whether the optional trigram FTS index should be maintained.
+
+    Opt out via sessions.enable_trigram_search: false or HERMES_DISABLE_FTS_TRIGRAM=1
+    (the trigram table can be several GB on heavy gateway profiles). Default on.
+    """
+    if os.getenv("HERMES_DISABLE_FTS_TRIGRAM") is not None:
+        return not _parse_boolish(os.getenv("HERMES_DISABLE_FTS_TRIGRAM"), default=False)
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        sessions_cfg = cfg.get("sessions") or {}
+        if isinstance(sessions_cfg, dict) and "enable_trigram_search" in sessions_cfg:
+            return _parse_boolish(sessions_cfg.get("enable_trigram_search"), default=True)
+    except Exception:
+        pass
+    return True
+
+
 def _default_db_path() -> Path:
     """Default state DB path at CALL time: a re-pointed ``DEFAULT_DB_PATH`` wins, else
     ``get_hermes_home()`` is resolved fresh (a runtime HERMES_HOME redirect works regardless of import)."""
@@ -504,6 +541,9 @@ class SessionDB(
     # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
     # DB, longer than a writer's patience); up to _COMMANDS_PER_PASS per index, stopping on no-progress.
     _FTS_MERGE_EVERY_N_WRITES, _FTS_MERGE_MAX_PAGES_PER_INDEX, _FTS_MERGE_COMMANDS_PER_PASS = 1000, 500, 4
+    # [GUS custom] Skip automatic live FTS merges on stores above 1 GiB: FTS5 merge can hold
+    # the sole WAL writer lock for minutes on multi-GB indexes.
+    _FTS_LIVE_MERGE_MAX_DB_BYTES = 1024 * 1024 * 1024
     # Imports cap lower than exports: an import holds one BEGIN IMMEDIATE.
     _IMPORT_MAX_SESSIONS, _IMPORT_MAX_MESSAGES_PER_SESSION, _IMPORT_MAX_TOTAL_MESSAGES = 500, 10_000, 50_000
     _IMPORT_MAX_SESSION_BYTES, _IMPORT_MAX_TOTAL_BYTES = 5 * 1024 * 1024, 25 * 1024 * 1024
@@ -583,6 +623,7 @@ class SessionDB(
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
+        self._trigram_config_enabled = _trigram_search_enabled()
         # Keep only the opening call site, never a frame (which pins caller locals).
         self._creation_site = "unknown"
         caller = None
@@ -740,7 +781,21 @@ class SessionDB(
                 try:
                     apply_database_pragmas(conn, db_label="state.db")
                     cursor = conn.cursor()
-                    self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
+                    # [GUS custom] honour fts_stale marker on read-only attach.
+                    from hermes_state_common import FTS_STALE_KEY
+                    try:
+                        self._fts_stale = cursor.execute(
+                            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                            (FTS_STALE_KEY,),
+                        ).fetchone() is not None
+                    except UnicodeDecodeError:
+                        self._fts_stale = True
+                    except sqlite3.OperationalError as exc:
+                        if "no such table" not in str(exc).lower():
+                            raise
+                    self._fts_enabled = not self._fts_stale and (
+                        self._fts_table_probe(cursor, "messages_fts") is True
+                    )
                     if self._fts_enabled:
                         self._trigram_available = (
                             self._fts_table_probe(cursor, "messages_fts_trigram") is True

@@ -43,6 +43,8 @@ def _prefix_names_served_profile(profile: str) -> bool:
 
 
 # Per-request /p/<profile>/ selection: set by the profile-prefix middleware, read by handlers.
+from gateway.josh_board_authority import request_principal, execution_scope
+
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None)
 _api_request_browser_control_principal: ContextVar[str] = ContextVar(
@@ -137,7 +139,9 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
+from gateway.platforms import api_server_business_data as _business_data
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_app_rooms as _app_rooms
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
@@ -838,6 +842,14 @@ def _admit_api_agent_request(handler):
             else self._check_auth(request))
         if auth_err:
             return auth_err
+        # Pause NEW authenticated work before body parsing or reservation.
+        # Status and health handlers do not use this admission decorator.
+        from agent.estop import is_engaged
+        if is_engaged():
+            return web.json_response(
+                {"error": {"type": "gateway_paused", "message": "Hermes is paused; retry shortly."}},
+                status=503, headers={"Retry-After": "1"},
+            )
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -1122,6 +1134,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # API-only profile admission does not activate its Telegram listeners or cron.
+        api_profiles = extra.get("profile_allowlist", [])
+        if not isinstance(api_profiles, list) or any(not isinstance(p, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", p) for p in api_profiles):
+            raise ValueError("Invalid API profile allowlist")
+        self._api_profile_allowlist = tuple(api_profiles)
+        # The default listener has no /p/<profile>/ identity, so cockpit use is
+        # opt-in and names the human principal bound to this credential. Named
+        # multiplex profiles derive the principal from the authenticated URL
+        # profile instead (see _check_auth); request body/header values never do.
+        self._cockpit_principal: str = str(extra.get("cockpit_principal") or "").strip().lower()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -1488,6 +1510,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Validate the Bearer token; None when OK, else a 401. The no-key branch (connect()
         refuses to start without API_SERVER_KEY) exists for tests/manual wiring on the default
         listener only; named profiles fail closed rather than inherit the owner's key."""
+        request_principal.set(None)  # Failed authentication cannot retain authority.
         profile = _api_request_profile.get()
         expected_key = self._expected_api_key()
         if not expected_key:
@@ -1504,9 +1527,75 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and the
             # token is raw client input — a stray byte must 401, not 500.
             if hmac.compare_digest(token.encode(), expected_key.encode()):
+                principal = str(profile if profile and profile != "default" else self._cockpit_principal).strip().lower()
+                request_principal.set(principal or None)
+                if principal:
+                    try:
+                        request["hermes.authenticated_principal"] = principal
+                    except TypeError:
+                        setattr(request, "hermes_authenticated_principal", principal)
                 return None
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
+
+    def _bind_cockpit_request(
+        self,
+        request: "web.Request",
+        body: Any,
+        gateway_session_key: Optional[str],
+    ) -> tuple[Optional[Any], Optional["web.Response"]]:
+        """Resolve cockpit routing solely from the authenticated principal.
+
+        Ordinary API requests remain untouched. A cockpit-shaped session key
+        or body is treated as an assertion, never authority: every supplied
+        identity field must equal the canonical lane derived from the API key's
+        principal. This preserves generic API/profile multiplexing while
+        preventing a shared listener client from selecting another cockpit.
+        """
+        payload = body if isinstance(body, dict) else {}
+        cockpit_keys = ("requesting_user", "board", "cockpit_board", "audience")
+        cockpit_shaped = bool(
+            str(gateway_session_key or "").strip().startswith("agent-os:cockpit")
+            or any(key in payload for key in cockpit_keys)
+        )
+        if not cockpit_shaped:
+            return None, None
+
+        board = payload.get("cockpit_board")
+        if board is None:
+            board = payload.get("board")
+        elif payload.get("board") is not None and str(payload.get("board")).strip() != str(board).strip():
+            return None, web.json_response(
+                _openai_error("Conflicting cockpit board assertions", code="cockpit_route_rejected"),
+                status=403,
+            )
+        try:
+            from gateway.cockpit_user_routing import bind_cockpit_principal
+
+            request_get = getattr(request, "get", None)
+            principal = (
+                request_get("hermes.authenticated_principal")
+                if callable(request_get)
+                else getattr(request, "hermes_authenticated_principal", None)
+            )
+            lane = bind_cockpit_principal(
+                principal,
+                session_key=gateway_session_key,
+                requesting_user=payload.get("requesting_user"),
+                board=board,
+                audience=payload.get("audience"),
+            )
+        except Exception:
+            # Do not reflect which field/principal failed across the API trust
+            # boundary; malformed, unknown and mismatched routes all look alike.
+            return None, web.json_response(
+                _openai_error(
+                    "Cockpit route is not authorized for this API principal",
+                    code="cockpit_route_rejected",
+                ),
+                status=403,
+            )
+        return lane, None
 
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
@@ -1584,7 +1673,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None if _prefix_names_served_profile(profile) else _PROFILE_REJECTED
         try:
             from hermes_cli.profiles import profiles_to_serve
-            served = {name for name, _ in profiles_to_serve(multiplex=True)}
+            configured = getattr(cfg, "multiplex_profile_allowlist", None)
+            extra_profiles = getattr(self, "_api_profile_allowlist", ())
+            api_allowlist = None if configured is None else list(dict.fromkeys([*configured, *extra_profiles]))
+            # v0.21.5 removed the roster keyword. Filter AFTER enumerating so
+            # parked/standalone exclusions and an explicit legacy policy remain.
+            served = {name for name, _ in profiles_to_serve(multiplex=True)
+                      if api_allowlist is None or name == "default" or name in api_allowlist}
         except Exception:
             return _PROFILE_REJECTED
         return profile if profile in served else _PROFILE_REJECTED
@@ -1626,7 +1721,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             profile = self._resolve_request_profile(request)
             if profile is _PROFILE_REJECTED:
                 return web.json_response({"error": "Unknown or unconfigured profile"}, status=404)
+            if request.headers.get("X-Hermes-Intake-Receipt") is not None and (
+                request.method != "POST" or not profile or request.path != f"/p/{profile}/v1/runs"
+            ):
+                return web.json_response(_openai_error("Intake requires native runs", code="intake_native_run_required"), status=403)
             token = _api_request_profile.set(profile)
+            authority_token = request_principal.set(None)
             try:
                 with self._profile_scope(profile):
                     resolved_profile = profile or "default"
@@ -1640,6 +1740,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
+                request_principal.reset(authority_token)
                 _api_request_profile.reset(token)
         return profile_prefix_middleware
 
@@ -1653,6 +1754,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("GET", "/v1/business/boards/{slug}", self._handle_business_board),
+            ("POST", "/v1/business/knowledge/search", self._handle_business_knowledge_search),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
@@ -1687,11 +1790,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
+        routes.extend(_app_rooms._routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+
+    async def _handle_business_board(self, request: "web.Request") -> "web.Response":
+        return await _business_data._handle_business_board(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
+
+    async def _handle_business_knowledge_search(self, request: "web.Request") -> "web.Response":
+        return await _business_data._handle_business_knowledge_search(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
 
     # -- Session header helpers -------------------------------------------------------
 
@@ -2290,6 +2409,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
+        from gateway.josh_pilot_tools import pilot_required, prepare, assert_schemas, schema_names, schema_scope
+        josh_pilot = pilot_required()
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2351,7 +2472,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
-        agent = AIAgent(**agent_kwargs)
+        if josh_pilot:
+            with schema_scope():
+                agent_kwargs["enabled_toolsets"] = prepare()
+                agent_kwargs["skip_memory"] = True
+                agent = AIAgent(**agent_kwargs)
+                assert_schemas(agent.tools)
+                difference = set(agent.valid_tool_names) ^ schema_names()
+                if difference:
+                    raise PermissionError("Unexpected Josh pilot executable tools: difference " + repr(sorted(difference)))
+        else:
+            agent = AIAgent(**agent_kwargs)
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -2364,9 +2495,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     # -- HTTP handlers ----------------------------------------------------------------
 
-    async def _handle_health(self, request: web.Request) -> web.Response:
+    def _transport_readiness(self) -> dict:
+        """Read actual adapter progress, separately from HTTP liveness."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+        if runner is None:
+            return {}
+        platforms = getattr(getattr(runner, "config", None), "platforms", {})
+        cfg = platforms.get(Platform.TELEGRAM)
+        if cfg is None or not cfg.enabled:
+            return {}
+        adapter = getattr(runner, "adapters", {}).get(Platform.TELEGRAM)
+        if adapter is None:
+            return {"telegram": {"status": "degraded", "reason": "adapter_unavailable"}}
+        try:
+            return {"telegram": adapter.transport_health()}
+        except Exception:
+            return {"telegram": {"status": "degraded", "reason": "transport_probe_unavailable"}}
+
+    async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
-        return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
+        return web.json_response(
+            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version(),
+             "transport_readiness": self._transport_readiness()}
+        )
 
     @_require_auth
     async def _handle_health_detailed(self, request: web.Request) -> web.Response:
@@ -2397,6 +2551,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             configured_model=_resolve_gateway_model(), runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
+        for name, probe in self._transport_readiness().items():
+            readiness["checks"][name] = probe
+            if probe.get("status") != "ok":
+                readiness["status"] = "degraded"
         return web.json_response({
 "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
             "version": _hermes_version(), "gateway_state": gw_state,
@@ -2480,6 +2638,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "transports": {
                     "local_vps": "websocket-subprotocol-ticket",
                     "cloud": "authenticated-gateway-rpc"}}}
+        from gateway.app_private_board_authority import capabilities as private_board_capabilities
+        private_board = private_board_capabilities(
+            _api_request_profile.get(), request.get("hermes.authenticated_principal"))
+        features.update({
+            "owner_board_control": private_board,
+            "run_events_replay": _api_runs._run_events_replay_capabilities(self, store_type=RunIdempotencyStore),
+            "business_data": _business_data._business_data_capabilities(self, _api_server=sys.modules[__name__]),
+        })
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -3314,6 +3480,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return None, err
+        cockpit_lane, cockpit_err = self._bind_cockpit_request(request, body, gateway_session_key)
+        if cockpit_err is not None:
+            return None, cockpit_err
+        if cockpit_lane is not None:
+            gateway_session_key = cockpit_lane.session_key
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return None, err
@@ -4199,12 +4370,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
+        authenticated_principal = request_principal.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
 
         def _run():
             from gateway.session_context import clear_session_vars
-            with self._profile_scope(request_profile):
+            with self._profile_scope(request_profile), execution_scope(request_profile, authenticated_principal):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",
@@ -4251,10 +4423,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # two callers pass ``agent_ref``, and only /v1/runs has a run_id, so neither is a usable
                     # hook for the rest. See #63529.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    from gbrain_corrections.native_runtime import api_note
+                    _correction_note = api_note(user_message, active_run_id or str(uuid.uuid4()), effective_task_id)
+                    _correction_message = (user_message + "\n\n[Memory correction status: " + _correction_note + "]") if _correction_note else user_message
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
-                        user_message=user_message,
+                        user_message=_correction_message,
+                        persist_user_message=user_message if _correction_note else None,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                         **author_kwargs,
@@ -4348,7 +4524,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop):
         return _api_runs._make_run_event_callback(self, run_id, loop, _api_server=sys.modules[__name__])
 
-    def _run_idempotency_scope(self, request: web.Request) -> str:
+    def _decorate_durable_run_event(
+        self, run_id: str, event: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return _api_runs._decorate_durable_run_event(self, run_id, event)
+
+    def _persist_durable_run_event(
+        self, run_id: str, event: Dict[str, Any]
+    ) -> Optional[int]:
+        return _api_runs._persist_durable_run_event(self, run_id, event)
+
+    def _list_durable_run_events(
+        self,
+        request: "web.Request",
+        run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        return _api_runs._list_durable_run_events(
+            self,
+            request,
+            run_id,
+            after_cursor=after_cursor,
+            limit=limit,
+        )
+
+    def _run_idempotency_scope(self, request: "web.Request") -> str:
         return _api_runs._run_idempotency_scope(self, request, _api_server=sys.modules[__name__])
 
     @staticmethod
@@ -4395,6 +4597,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_resolve_unknown_run = _run_route_delegate("_handle_resolve_unknown_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
+    _handle_delegation_handoff = _run_route_delegate("_handle_delegation_handoff")
 
     async def _sweep_orphaned_runs(self) -> None:
         return await _api_runs._sweep_orphaned_runs(self)
@@ -4462,6 +4665,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "`/platform resume api_server`.",
                 retryable=False)
             return False
+
+        # Await fixed public imports before binding the health/API listener.
+        # Per-turn profile, credentials, authority and clients stay request-local.
+        from hermes_cli.api_startup_prewarm import prewarm_api_dependencies
+        await prewarm_api_dependencies()
+
         try:
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,

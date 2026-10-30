@@ -8,6 +8,7 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 """
 
 from __future__ import annotations
+from hermes_cli.direct_turn_timing import timed_call
 
 import logging
 import os

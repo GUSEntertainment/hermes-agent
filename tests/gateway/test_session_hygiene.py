@@ -320,6 +320,8 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     worker_started = threading.Event()
     release_worker = threading.Event()
     lease_released = threading.Event()
+    worker_returned = threading.Event()
+    live_agent_started = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
     # The DB-backed cooldown check calls this before compressing; a bare
@@ -348,19 +350,24 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
             if commit_fence is not None:
                 commit_fence.register_cancelled_lock_release(lease_released.set)
             worker_started.set()
-            assert release_worker.wait(timeout=10)
-            if commit_fence is not None and not commit_fence.begin_commit():
-                return (messages, None)
             try:
-                self._session_db.archive_and_compact(
-                    self.session_id,
-                    [{"role": "assistant", "content": "too late"}],
-                )
-                self._last_compaction_in_place = True
-                return ([{"role": "assistant", "content": "too late"}], None)
+                # Longer than the handler's outer deadlock guard below, so
+                # this worker cannot self-release and fake fail-open behavior.
+                assert release_worker.wait(timeout=30)
+                if commit_fence is not None and not commit_fence.begin_commit():
+                    return (messages, None)
+                try:
+                    self._session_db.archive_and_compact(
+                        self.session_id,
+                        [{"role": "assistant", "content": "too late"}],
+                    )
+                    self._last_compaction_in_place = True
+                    return ([{"role": "assistant", "content": "too late"}], None)
+                finally:
+                    if commit_fence is not None:
+                        commit_fence.finish_commit()
             finally:
-                if commit_fence is not None:
-                    commit_fence.finish_commit()
+                worker_returned.set()
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = SlowCompressAgent
@@ -405,6 +412,200 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+
+    async def run_live_agent_while_hygiene_worker_is_blocked(*_args, **_kwargs):
+        # This is the behavioral synchronization that matters: the live turn
+        # starts after the hygiene worker has entered compression, but before
+        # that worker is released (and therefore before it can return).
+        assert worker_started.is_set()
+        assert not worker_returned.is_set()
+        live_agent_started.set()
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(
+        side_effect=run_live_agent_while_hygiene_worker_is_blocked
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    hygiene_agent = None
+    try:
+        # The outer deadline is only a deadlock guard. Ordering events below,
+        # rather than scheduler wall time, prove the fail-open timeout path.
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=10)
+
+        hygiene_agent = SlowCompressAgent.last_instance
+        assert hygiene_agent is not None
+        assert result == "ok"
+        assert worker_started.is_set()
+        assert live_agent_started.is_set()
+        assert not worker_returned.is_set()
+        assert runner._run_agent.await_count == 1
+        # Cooldown must be persisted to the state DB (survives restart, #74136),
+        # not stashed in an in-memory dict.
+        assert fake_db.record_compression_failure_cooldown.called
+        _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
+        assert _cd_args[0] == "sess-timeout"
+        assert _cd_args[1] > time.time()
+        timeout_warnings = [
+            s for s in adapter.sent
+            if "took too long" in s["content"]
+        ]
+        assert len(timeout_warnings) == int(warning_notifications)
+        fake_db.archive_and_compact.assert_not_called()
+        assert lease_released.is_set()
+        hygiene_agent.close.assert_not_called()
+    finally:
+        # Never leak the deliberately blocked executor worker, even when an
+        # assertion above fails.
+        release_worker.set()
+        if SlowCompressAgent.last_instance is not None:
+            await asyncio.wait_for(
+                asyncio.to_thread(cleanup_done.wait), timeout=10
+            )
+
+    # The late worker observed cancellation at the commit fence, so it never
+    # mutated the live session after the new turn began. Cleanup still ran once
+    # it was safe to tear down the helper agent's clients/providers.
+    assert hygiene_agent is not None
+    assert worker_returned.is_set()
+    fake_db.archive_and_compact.assert_not_called()
+    hygiene_agent.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("progress_notices", [False, True])
+async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
+    monkeypatch, tmp_path, progress_notices
+):
+    """A compression that still streams progress must not hold the turn hostage.
+
+    Regression test for the bounded turn-hold (#TKT-0029). The worker keeps
+    ticking the commit fence (touch_progress), so the per-slice inactivity
+    timeout NEVER fires — without a turn-hold budget the gateway would extend
+    the wait up to the total ceiling (default 600s) while zero bytes hit the
+    wire, severing the transport. The turn must instead be abandoned once it
+    exceeds ``hygiene_max_turn_hold_seconds``, proceed on the uncompressed
+    transcript, and fence the stale commit.
+    """
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+    fake_db = MagicMock()
+    fake_db.get_compression_failure_cooldown.return_value = None
+
+    class StreamingCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock(side_effect=cleanup_done.set)
+            type(self).last_instance = self
+
+        def _compress_context(
+            self, messages, *_args, commit_fence=None, **_kwargs
+        ):
+            worker_started.set()
+            # Stream progress continuously so the inactivity slice never
+            # times out; only the turn-hold budget can abandon this wait.
+            while not release_worker.is_set():
+                if commit_fence is not None:
+                    commit_fence.touch_progress()
+                time.sleep(0.01)
+            if commit_fence is not None and not commit_fence.begin_commit():
+                return (messages, None)
+            try:
+                self._session_db.archive_and_compact(
+                    self.session_id,
+                    [{"role": "assistant", "content": "too late"}],
+                )
+                self._last_compaction_in_place = True
+                return ([{"role": "assistant", "content": "too late"}], None)
+            finally:
+                if commit_fence is not None:
+                    commit_fence.finish_commit()
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StreamingCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "compression:\n"
+        "  enabled: true\n"
+        # Inactivity budget is huge, so the slice timeout can never fire on
+        # its own; the turn-hold budget is the ONLY thing that abandons.
+        "  hygiene_timeout_seconds: 60\n"
+        "  hygiene_total_ceiling_seconds: 600\n"
+        "  hygiene_max_turn_hold_seconds: 0.3\n"
+        f"  progress_notices: {str(progress_notices).lower()}\n"
+        "  hygiene_failure_cooldown_seconds: 120\n"
+    )
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = HygieneCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-turnhold",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -433,35 +634,56 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         message_id="1",
     )
 
-    result = await runner._handle_message(event)
+    started = time.monotonic()
+    result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+    elapsed = time.monotonic() - started
 
+    # The turn proceeded on the uncompressed transcript well under the 600s
+    # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
     assert result == "ok"
+    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    # Cooldown must be persisted to the state DB (survives restart, #74136),
-    # not stashed in an in-memory dict.
-    assert fake_db.record_compression_failure_cooldown.called
-    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    assert _cd_args[0] == "sess-timeout"
-    assert _cd_args[1] > time.time()
-    timeout_warnings = [s for s in adapter.sent if "took too long" in s["content"]]
-    assert len(timeout_warnings) == int(warning_notifications)
+    # The stale commit must be fenced: the late worker never mutates the session.
     fake_db.archive_and_compact.assert_not_called()
-    assert lease_released.is_set()
-    # Event/state assertions prove the host returned before the detached
-    # worker's event-gated wait completed without a scheduler-sensitive clock
-    # bound: cleanup runs only when that worker actually exits.
-    SlowCompressAgent.last_instance.close.assert_not_called()
 
     release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
-
-    # The late worker observed cancellation at the commit fence, so it never
-    # mutated the live session after the new turn began. Cleanup still ran once
-    # it was safe to tear down the helper agent's clients/providers.
+    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
     fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_called_once()
+    StreamingCompressAgent.last_instance.close.assert_called_once()
 
+    # Behavior witness 1: turn-hold expiry must NOT stamp the idle-timeout
+    # provenance or send the "no output" user message.
+    sent_contents = [m["content"] for m in adapter.sent]
+    assert not any(
+        "timed out" in c.lower() and "no output" in c.lower()
+        for c in sent_contents
+    ), f"turn-hold must not send idle-timeout message, got: {sent_contents}"
+    assert any(
+        "deferred" in c.lower() or "still streaming" in c.lower()
+        for c in sent_contents
+    ) is progress_notices, f"deferral notice must respect quiet mode: {sent_contents}"
+
+    # Behavior witness 2: turn-hold must NOT advance the failure STREAK.
+    fake_db.get_compression_failure_cooldown.assert_called()
+    # The escalating ladder (x1, x3, x9) is reserved for real failures via
+    # _hygiene_cooldown_for_failure -> increment_hygiene_failure_streak.
+    # The turn-hold path records only a flat, non-escalating retry-after
+    # (spacing out re-attempts so sustained traffic does not spawn and
+    # cancel a fresh compressor every turn) and must never touch the streak.
+    assert not fake_db.increment_hygiene_failure_streak.called, \
+        "turn-hold must not advance the failure streak"
+    assert fake_db.record_compression_failure_cooldown.called, \
+        "turn-hold must record the flat retry-after spacing"
+    _th_args = fake_db.record_compression_failure_cooldown.call_args[0]
+    import time as _time_mod
+    _th_retry = _th_args[1] - _time_mod.time()
+    assert _th_retry <= 120, (
+        f"turn-hold retry-after must stay flat (~60s), got {_th_retry:.0f}s "
+        "— escalating ladder leaked into the deferral path"
+    )
+    assert "turn-hold" in (_th_args[2] or ""), \
+        "retry-after reason must name the turn-hold deferral"
 
     # Behavior witness 3: the #87011 contract remains truthful —
     # "session hygiene compression timed out" still means a real idle

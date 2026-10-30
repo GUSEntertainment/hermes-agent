@@ -198,3 +198,13 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 
 
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _legacy_conservative_technical_limit(monkeypatch):
+    # Pins the original loop-guard contract; the t_017ce141 same-owner
+    # technical allowance is covered in test_same_owner_recovery.py.
+    monkeypatch.setattr(kb, "TECHNICAL_BLOCK_RECURRENCE_LIMIT", kb.BLOCK_RECURRENCE_LIMIT)

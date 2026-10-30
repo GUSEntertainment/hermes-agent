@@ -1811,6 +1811,19 @@ def resolve_channel_prompt(config_extra: dict, channel_id: str, parent_id: str |
     return None
 
 
+def resolve_telegram_channel_prompt(
+    config_extra: dict,
+    chat_id: str,
+    thread_id: str | None = None,
+) -> str | None:
+    """Resolve Telegram prompts by exact parent-chat plus topic identity."""
+    chat = str(chat_id or "").strip()
+    thread = str(thread_id or "").strip()
+    if thread:
+        return resolve_channel_prompt(config_extra, f"{chat}:{thread}", chat)
+    return resolve_channel_prompt(config_extra, chat)
+
+
 def resolve_channel_skills(
     config_extra: dict, channel_id: str, parent_id: str | None = None) -> list[str] | None:
     """Auto-loaded skill(s) for a channel/thread from ``channel_skill_bindings`` (entries
@@ -3613,6 +3626,29 @@ class BasePlatformAdapter(ABC):
         result = await _send(content)
         if result.success or self._send_retry_is_final(result):
             return result
+
+        # A rate-limit rejection is definite non-delivery, not a formatting
+        # error. Honor its delay even when the adapter does not set retryable.
+        # Bound the total wait: extreme penalties must not pin a worker or
+        # trigger more sends (including a plain-text failure notice).
+        rate_wait_budget = 90.0
+        rate_attempts = 0
+        while not result.success and result.retry_after is not None:
+            try:
+                delay = float(result.retry_after)
+            except (TypeError, ValueError):
+                return result
+            if not 0 <= delay <= rate_wait_budget or rate_attempts >= max_retries:
+                return result
+            rate_wait_budget -= delay
+            rate_attempts += 1
+            await asyncio.sleep(delay)
+            result = await self.send(
+                chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata,
+            )
+        if result.success:
+            return result
+
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
         # (honoring the server's retry_after when present) rather than fall
@@ -4306,7 +4342,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                from gateway.direct_document_custody import send_selected
+                result = await send_selected(self, event, path, metadata)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
@@ -4361,8 +4398,13 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        delivery_metadata = metadata
+        if obligation_id is not None and getattr(event.source.platform, "value", event.source.platform) == "photon":
+            delivery_metadata = dict(metadata or {})
+            delivery_metadata["delivery_obligation_id"] = obligation_id
+            delivery_metadata["logical_message_id"] = obligation_id
         result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=delivery_metadata)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
@@ -4403,7 +4445,11 @@ class BasePlatformAdapter(ABC):
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            if getattr(event.source.platform, "value", event.source.platform) == "photon":
+                from plugins.platforms.photon.failure_reply import send_processing_failure
+                await send_processing_failure(self, event, self._event_session_key(event), _thread_metadata)
+            else:
+                await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)

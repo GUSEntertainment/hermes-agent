@@ -651,6 +651,30 @@ def build_channel_continuity_note(entry: SessionEntry, source: SessionSource) ->
     )
 
 
+_SHARED_GROUP_CHATS_CACHE = None
+
+
+def _shared_group_session_chats() -> set:
+    """Chat IDs in config.yaml ``shared_group_session_chats``: one shared session for all participants."""
+    global _SHARED_GROUP_CHATS_CACHE
+    if _SHARED_GROUP_CHATS_CACHE is None:
+        ids = set()
+        try:
+            import os as _os
+            import yaml
+            home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
+            with open(_os.path.join(home, "config.yaml")) as fh:
+                data = yaml.safe_load(fh) or {}
+            raw = data.get("shared_group_session_chats") or []
+            if isinstance(raw, (str, int)):
+                raw = str(raw).split(",")
+            ids = {str(x).strip() for x in raw if str(x).strip()}
+        except Exception:
+            ids = set()
+        _SHARED_GROUP_CHATS_CACHE = ids
+    return _SHARED_GROUP_CHATS_CACHE
+
+
 def is_shared_multi_user_session(
     source: SessionSource, *, group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
@@ -659,6 +683,8 @@ def is_shared_multi_user_session(
     isolation rules in :func:`build_session_key`)."""
     if source.chat_type == "dm":
         return False
+    if source.chat_id and str(source.chat_id) in _shared_group_session_chats():
+        return True
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
 
 
@@ -711,7 +737,8 @@ def build_session_key(
     else:
         # Threads are shared by default; per-user isolation only via thread_sessions_per_user or
         # outside a thread.
-        isolate_user = group_sessions_per_user and not (thread_id and not thread_sessions_per_user)
+        isolate_user = (group_sessions_per_user and not (thread_id and not thread_sessions_per_user)
+                        and not (chat_id and str(chat_id) in _shared_group_session_chats()))
     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
 
@@ -1067,6 +1094,115 @@ class SessionStore(
             parent_session_id=decision.prev_session_id,
         )
 
+    def reset_session_with_transcript(
+        self,
+        session_key: str,
+        messages: List[Dict[str, Any]] | Any,
+        display_name: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
+        """Seed a replacement durably, then CAS-publish its routing entry.
+
+        The old route remains live on every seed/create failure.  The complete
+        ``SessionSource`` is retained both in memory and in state.db's
+        ``origin_json`` so profile/scope/parent/thread identity survives.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            old_entry = self._entries.get(session_key)
+            db = self._db
+            if old_entry is None or db is None:
+                return None
+            old_session_id = old_entry.session_id
+            old_origin = old_entry.origin
+            now = _now()
+            session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            new_entry = SessionEntry(
+                session_key=session_key,
+                session_id=session_id,
+                created_at=now,
+                updated_at=now,
+                origin=old_origin,
+                display_name=(display_name if display_name is not None else old_entry.display_name),
+                platform=old_entry.platform,
+                chat_type=old_entry.chat_type,
+                is_fresh_reset=True,
+                prev_session_id=old_session_id,
+            )
+
+        try:
+            seed = messages(session_id) if callable(messages) else messages
+            origin_json = json.dumps(old_origin.to_dict()) if old_origin else None
+            db.create_session(
+                session_id=session_id,
+                source=old_entry.platform.value if old_entry.platform else "unknown",
+                user_id=old_origin.user_id if old_origin else None,
+                session_key=session_key,
+                chat_id=old_origin.chat_id if old_origin else None,
+                chat_type=old_origin.chat_type if old_origin else None,
+                thread_id=old_origin.thread_id if old_origin else None,
+                profile_name=old_origin.profile if old_origin else None,
+                origin_json=origin_json,
+                display_name=new_entry.display_name,
+                parent_session_id=old_session_id,
+                model_config={"_reset_from": old_session_id},
+            )
+            db.replace_messages(session_id, list(seed or []))
+        except Exception as exc:
+            logger.warning("Session rotation seed write failed for %s: %s", session_key, exc)
+            try:
+                db.end_session(session_id, "rotation_seed_failed")
+            except Exception:
+                pass
+            return None
+
+        route_persist_error: Optional[Exception] = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            current = self._entries.get(session_key)
+            if current is None or current.session_id != old_session_id:
+                try:
+                    db.end_session(session_id, "rotation_route_changed")
+                except Exception:
+                    pass
+                return None
+            self._entries[session_key] = new_entry
+            try:
+                self._save()
+            except Exception as exc:
+                # Publication and persistence are one logical transition.  A
+                # failed durable write must leave the exact prior object live:
+                # the gateway caller still holds that entry and its cached
+                # agent, so retaining the candidate here would split routing
+                # from both the durable index and prompt-cache/session state.
+                self._entries[session_key] = old_entry
+                route_persist_error = exc
+
+        if route_persist_error is not None:
+            logger.warning(
+                "Session rotation route save failed for %s; restored %s: %s",
+                session_key,
+                old_session_id,
+                route_persist_error,
+            )
+            try:
+                db.end_session(session_id, "rotation_route_persist_failed")
+            except Exception:
+                pass
+            return None
+
+        try:
+            promote = getattr(db, "promote_to_session_reset", None)
+            if callable(promote):
+                promote(old_session_id, "session_reset")
+            else:
+                db.end_session(old_session_id, "session_reset")
+            self._record_gateway_session_peer(
+                session_id, session_key, old_origin, display_name=new_entry.display_name
+            )
+        except Exception:
+            logger.warning("Session rotation predecessor finalization failed", exc_info=True)
+        return new_entry
+
     def update_session(
         self, session_key: str, last_prompt_tokens: int | None = None, touch_activity: bool = True,
     ) -> None:
@@ -1105,8 +1241,6 @@ class SessionStore(
 
     def set_model_override(self, session_key: str, override: Optional[dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
-        from dataclasses import replace
-
         cleaned = sanitize_model_override(override)
 
         with self._lock:

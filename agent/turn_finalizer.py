@@ -127,6 +127,7 @@ def _resolve_budget_fallback(
 ) -> tuple[Any, Any, bool, Any]:
     """Iteration-budget exhaustion. Returns ``(final_response, _turn_exit_reason,
     preserved_verification_fallback, interrupted)``."""
+    bounded_kanban = bool(os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_TOTAL_TOKEN_LIMIT")) and is_dispatcher_owned_worker_context()
     budget_exhausted = (
         api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
     )
@@ -151,16 +152,17 @@ def _resolve_budget_fallback(
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_diagnostic_status(
                 f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— asking model to summarise"
+                + ("— retaining progress without another model call" if bounded_kanban else "— asking model to summarise")
             )
             if not agent.quiet_mode:
                 agent._safe_print(
                     f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                    "— requesting summary...", diagnostic=True,
+                    + ("— retaining progress." if bounded_kanban else "— requesting summary..."), diagnostic=True,
                 )
             _summary_start = time.time()
             try:
-                final_response = agent._handle_max_iterations(messages, api_call_count)
+                final_response = ("Worker iteration budget reached; progress is retained for the accountable owner."
+                                  if bounded_kanban else agent._handle_max_iterations(messages, api_call_count))
             except InterruptedError:
                 # The turn ends interrupted, so the pending interrupt message is returned
                 # for requeue instead of being cleared behind a fallback summary. A redirect
@@ -296,6 +298,7 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
         # call on a throwaway transcript and could compact the CANONICAL session rows.
         if (
             _compressor
+            and not (os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_TOTAL_TOKEN_LIMIT") and is_dispatcher_owned_worker_context())
             and getattr(_compressor, '_micro_compact_enabled', False) is True
             and callable(getattr(_compressor, '_micro_compact', None))
             and final_response
@@ -782,6 +785,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not (bool(os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_TOTAL_TOKEN_LIMIT")) and is_dispatcher_owned_worker_context())
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):

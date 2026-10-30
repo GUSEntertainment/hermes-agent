@@ -80,7 +80,7 @@ def test_structured_non_retryable_sidecar_error_not_legacy_retried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_with_retry_uses_structured_retryable_flag(
+async def test_send_with_retry_returns_ambiguous_failure_without_retry_or_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _make_adapter(monkeypatch)
@@ -110,14 +110,15 @@ async def test_send_with_retry_uses_structured_retryable_flag(
         "space-1", "hello", max_retries=1, base_delay=0.25
     )
 
-    assert result.success is True
-    assert result.message_id == "m-2"
-    assert calls == 2
-    # base backoff: base_delay * 2**0 plus up to 1s of jitter
-    assert len(sleeps) == 1 and 0.25 <= sleeps[0] <= 1.25
+    assert result.success is False
+    assert result.retryable is True
+    assert calls == 1
+    assert sleeps == []
 
 
 # -- Gap 2: typing-indicator cooldown ---------------------------------------
+
+
 
 @pytest.mark.asyncio
 async def test_typing_cooldown_suppresses_rapid_repeats(

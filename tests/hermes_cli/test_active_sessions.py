@@ -130,7 +130,11 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
 
         outputs = []
         for worker in workers:
-            stdout, stderr = worker.communicate(timeout=10)
+            # A successful lease holder may legitimately spend up to 10s
+            # waiting for every peer to publish its result. The parent bound
+            # must be strictly larger than that child-side deadline plus
+            # interpreter startup/scheduling under the parallel suite.
+            stdout, stderr = worker.communicate(timeout=30)
             assert worker.returncode == 0, stderr
             outputs.append(stdout.strip())
     finally:

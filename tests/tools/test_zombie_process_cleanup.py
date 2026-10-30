@@ -383,7 +383,17 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2)
+        # SESSION_COORDINATOR resolves hosts through its registry, not through
+        # get_runtime(). Pin that seam too so a host concurrently entering
+        # shutdown in a sibling test cannot win this test's startup race.
+        monkeypatch.setattr(
+            relay_runtime.SESSION_COORDINATOR.registry,
+            "for_profile",
+            lambda *_args, **_kwargs: relay_host,
+        )
+        # This test exercises post-timeout lease ownership, not 100 ms thread
+        # scheduling. Keep the timeout bounded but generous under suite load.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
 
         # The parent's cap must not elapse before the worker thread has opened the child's turn, or
         # the "late result" scenario degrades into "child never started" on a loaded runner. Gate the

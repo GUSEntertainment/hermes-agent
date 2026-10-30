@@ -146,12 +146,10 @@ def get_available_skills() -> dict[str, list[str]]:
 def _resolve_repo_dir() -> Optional[Path]:
     """The active Hermes git checkout, or None if this isn't a git install.
 
-    Prefers the running code's location: ``$HERMES_HOME/hermes-agent/`` may be a stale copy
-    carried over by ``--clone-all``.
+    The shared data home's ``hermes-agent`` path may point to another install.
+    A release without Git metadata uses its own baked build SHA instead.
     """
     repo_dir = Path(__file__).parent.parent.resolve()
-    if not (repo_dir / ".git").exists():
-        repo_dir = get_hermes_home() / "hermes-agent"
     return repo_dir if (repo_dir / ".git").exists() else None
 
 

@@ -127,7 +127,14 @@ def enabled_backends() -> list[LoginBackend]:
     from agent.vault_backends.local import LocalLoginBackend
 
     cfg = _cfg()
-    out: list[LoginBackend] = [LocalLoginBackend()]
+    out: List[LoginBackend] = [LocalLoginBackend()]
+    # Read-only Margot Accounts vault (t_23001aff): on when its folder exists unless opted out.
+    acct = cfg.get("accounts") or {}
+    acct = acct if isinstance(acct, dict) else {}
+    if acct.get("enabled") is not False:
+        from agent.vault_backends.accounts import DEFAULT_ROOT, AccountsLoginBackend
+        if Path(str(acct.get("root") or DEFAULT_ROOT)).is_dir():
+            out.append(AccountsLoginBackend(acct))
     for cls in external_backend_classes():
         if is_enabled(cls.name):
             section = cfg.get(cls.name) or {}

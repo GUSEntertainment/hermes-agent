@@ -329,24 +329,21 @@ class TestRenderCommandTtsTemplate:
 class TestRunCommandTts:
 
 
-    def test_silent_after_progress_still_times_out_with_stderr(self, tmp_path):
-        script = tmp_path / "progress_then_hang.py"
-        script.write_text(
-            "\n".join([
-                "import sys, time",
-                "print('starting tier 1', file=sys.stderr, flush=True)",
-                "time.sleep(1.0)",
-            ]),
-            encoding="utf-8",
-        )
+    def test_silent_after_progress_still_times_out_with_stderr(self):
+        if os.name == "nt":
+            # ``echo`` is a cmd.exe builtin, so progress is emitted before
+            # waiting on an external child process. This avoids making the
+            # timeout assertion depend on Python interpreter startup latency.
+            command = "(echo starting tier 1 1>&2) & ping -n 31 127.0.0.1 >NUL"
+        else:
+            # ``printf`` and the loop are POSIX shell builtins, so progress is
+            # emitted deterministically and process termination adds no output.
+            command = "printf 'starting tier 1\\n' >&2; while :; do :; done"
 
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
-            _run_command_tts(
-                _shell_command(sys.executable, "-u", str(script)),
-                timeout=0.2,
-            )
+            _run_command_tts(command, timeout=3)
 
-        assert "starting tier 1" in (excinfo.value.stderr or "")
+        assert excinfo.value.stderr == "starting tier 1\n"
         assert isinstance(excinfo.value.__cause__, subprocess.TimeoutExpired)
 
 

@@ -340,6 +340,28 @@ _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
+
+
+
+
+
+
+
+
+# =============================================================================
+# Configuration Loading
+# =============================================================================
+
+
+
+
+
+
+
+
+
+# Load configuration at module startup
+
 CLI_CONFIG = load_cli_config()
 
 

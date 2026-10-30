@@ -152,7 +152,11 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
 
     repo = Path(__file__).resolve().parents[1]
     if resolve_store_python(repo) is None:
-        return [sys.executable, str(script)], {}
+        python_exe = sys.executable
+        venv = os.environ.get("VIRTUAL_ENV")
+        if venv and os.path.isfile(os.path.join(venv, "bin", "python")):
+            python_exe = os.path.join(venv, "bin", "python")
+        return [python_exe, str(script)], {}
     # project_python, not committed_venv as on Windows: a pre-PM venv selected before the first
     # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
     python = project_python(repo)

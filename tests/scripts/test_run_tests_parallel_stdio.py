@@ -21,6 +21,8 @@ _RUNNER_PATH = REPO_ROOT / "scripts" / "run_tests_parallel.py"
 def _load_runner():
     spec = importlib.util.spec_from_file_location("run_tests_parallel", _RUNNER_PATH)
     mod = importlib.util.module_from_spec(spec)
+    import sys  # [GUS] runner now defines @dataclass types; dataclasses resolve via sys.modules
+    sys.modules.setdefault(spec.name, mod)
     spec.loader.exec_module(mod)
     return mod
 

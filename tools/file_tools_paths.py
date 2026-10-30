@@ -307,9 +307,25 @@ def _container_default_cwd(task_id: str = "default") -> str | None:
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory
     (absolute inputs are returned resolved-but-unanchored)."""
+    # [GUS v0.21.5 port] Caller-scoped remote lanes (Connor/Josh): SSH paths belong
+    # to the remote filesystem. Keep ~ and relative paths for the scoped SSH
+    # environment; never follow a same-named host symlink or use the gateway HOME.
+    from gateway.host_tool_authority import terminal_environment
+    if terminal_environment() is not None:
+        return _normalize_without_host_deref(filepath)
     if _terminal_env_type_for_task(task_id) == "ssh":
         return _resolve_ssh_path(filepath, task_id)
     container_paths = _uses_container_paths(task_id)
+    if not container_paths:
+        # [GUS v0.21.5 port] Workspace confinement: keep the authorized lexical
+        # pathname for the operation-time OS boundary; resolve() here would
+        # reintroduce a validation-to-use symlink race.
+        from tools.workspace_confinement import resolve_workspace
+        confined_root = resolve_workspace(task_id=task_id)
+        if confined_root is not None:
+            expanded = Path(_expand_tilde(filepath))
+            candidate = expanded if expanded.is_absolute() else confined_root / expanded
+            return Path(os.path.abspath(candidate))
     return _anchor(_host_text(filepath, container_paths),
                    lambda: _resolve_base_dir(task_id, container_paths=container_paths), container_paths)
 

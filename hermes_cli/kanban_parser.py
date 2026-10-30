@@ -160,6 +160,7 @@ _SPECS = [
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),
+        _arg("--capability-contract", metavar="JSON_FILE", help="Trusted capability preflight contract JSON file"),
         _arg("--body-file", metavar="PATH",
              help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
                   "newlines or flag-like lines survive shell quoting. "
@@ -203,6 +204,8 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--reasoning-effort", type=kb.normalize_reasoning_effort, metavar="LEVEL",
+             help="Per-task thinking level; omit to inherit the assignee profile."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -316,6 +319,8 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
         _bulk_ids("block"),
+        _arg("--authorization-checked", action="store_true", help="Confirm task and parent authorization checked"),
+        _arg("--new-decision", help="Exact new decision beyond granted scope, for needs_input"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
                   "parents finish, no human); 'needs_input'/'capability' go to "
@@ -330,6 +335,7 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--preserve-failure-history", action="store_true", help="Keep dispatcher failure count when releasing a hold"),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
@@ -343,6 +349,12 @@ _SPECS = [
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("rebind-review-artifact", [
+        _TASK_ID,
+        _arg("--state-version", type=int, required=True),
+        *(_arg("--" + name, required=True) for name in (
+            "expected-artifact-ref", "expected-artifact-digest", "artifact-ref", "artifact-digest", "reason")),
+    ], help="Native reviewer evidence refresh; requires process-bound authority"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
@@ -355,10 +367,13 @@ _SPECS = [
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
+        _reason("Evidence for reversible archival"),
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("restore", [_reason("Why it is coming back"), _TASK_IDS],
+         help="Restore archived tasks to their prior lane (history kept)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
@@ -425,7 +440,8 @@ _SPECS = [
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
     _cmd("context", [_TASK_ID],
          help="Print the full context a worker sees for a task (title + body + parent results + comments)."),
-    _cmd("specify", _triage_sweep_args("specify", "Specify", "specifier"),
+    _cmd("specify", (*_triage_sweep_args("specify", "Specify", "specifier"),
+                     _reason("Evidence for guarded triage -> todo")),
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "
               "configured under auxiliary.triage_specifier."),

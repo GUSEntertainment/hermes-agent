@@ -13,6 +13,25 @@ from contextlib import suppress
 from typing import Optional
 
 
+def _remote_path_denial(path: str) -> Optional[str]:
+    """Lexical defense-in-depth for remote files, never a host stat oracle.
+
+    Host HOME, host symlinks and host safe roots cannot govern an SSH pathname.
+    Sensitive literal remote components remain denied; the SSH account is the
+    actual remote authority boundary (as it is for terminal). This does not
+    claim symlink containment on the remote account.
+    """
+    import posixpath
+    parts = posixpath.normpath(str(path)).split("/")
+    sensitive = {".hermes", ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure"}
+    secret_names = _BLOCKED_PROJECT_ENV_BASENAMES | {
+        ".netrc", ".pgpass", ".npmrc", ".pypirc", ".git-credentials",
+    }
+    if sensitive.intersection(parts) or parts[-1].lower() in secret_names:
+        return f"Access denied: {path} is a protected remote credential/config path."
+    return None
+
+
 def _constants_path(getter_name: str) -> Path:
     """Call ``hermes_constants.<getter_name>()`` (local import avoids cycles); ``~/.hermes`` on any failure."""
     try:
@@ -255,6 +274,9 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     ``entry=True`` is for ops that unlink/rename the directory entry itself (a
     symlink, not its target): the entry — parent realpath'd, final component
     kept — is vetted as well as the target it resolves to."""
+    from gateway.host_tool_authority import remote_required
+    if remote_required():
+        return "credential" if _remote_path_denial(path) else None
     # NT/device-namespace check runs on the RAW string, before realpath():
     # resolving such a path is itself the NTLM-leak trigger, and namespace
     # prefixes defeat string-prefix denylist comparison after normalization.
@@ -327,6 +349,9 @@ def get_write_denied_error(path: str, *, verb: str = "Write", entry: bool = Fals
 def is_write_approval_required(path: str) -> bool:
     """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
     prompt, callers without a channel treat it as a block (fail closed)."""
+    from gateway.host_tool_authority import remote_required
+    if remote_required():
+        return str(path).replace("\\", "/").endswith("/.ssh/config")
     homes, resolved = _homes_and_resolved(path)
     return any(resolved in build_write_approval_paths(home) for home in homes)
 
@@ -385,6 +410,9 @@ def get_read_block_error(path: str) -> Optional[str]:
     nt_error = get_nt_namespace_error(path, verb="Read")
     if nt_error:
         return nt_error
+    from gateway.host_tool_authority import remote_required
+    if remote_required():
+        return _remote_path_denial(path)
     resolved = Path(path).expanduser().resolve()
     hermes_dirs = _hermes_dirs()
     reason = None

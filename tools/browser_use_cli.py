@@ -265,6 +265,14 @@ def is_browser_use_cli_mode() -> bool:
     unset ``browser.backend`` ("") enables it whenever browser-harness is importable (a core dependency);
     ``browser.backend: off`` keeps the built-in browser_* tools. Camofox always falls back to the built-in
     tools (Firefox, custom HTTP API, no CDP surface for the harness)."""
+    try:
+        from gateway.member_worker_policy import private_worker_active
+
+        if private_worker_active():
+            # Private owner workers use the isolated built-in browser only.
+            return False
+    except Exception:
+        return False
     if _camofox_active():
         return False
     backend = get_browser_backend()

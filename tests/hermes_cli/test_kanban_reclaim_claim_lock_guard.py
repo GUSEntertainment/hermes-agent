@@ -51,11 +51,12 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     host = kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(conn, title="desync", assignee="w")
 
-    # Worker A claims, then dies.
+    # Worker A claims, registers its live start identity, then dies.
     kb.claim_task(conn, tid, claimer=f"{host}:A")
-    dead = subprocess.Popen(["true"])
-    dead.wait()
+    dead = subprocess.Popen(["sleep", "30"])
     kbd._set_worker_pid(conn, tid, dead.pid)
+    dead.terminate()
+    dead.wait(timeout=5)
     old = conn.execute(
         "SELECT claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)
     ).fetchone()
@@ -98,9 +99,10 @@ def test_genuine_crash_still_reclaims(conn):
     host = kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(conn, title="legit", assignee="w")
     kb.claim_task(conn, tid, claimer=f"{host}:A")
-    dead = subprocess.Popen(["true"])
-    dead.wait()
+    dead = subprocess.Popen(["sleep", "30"])
     kbd._set_worker_pid(conn, tid, dead.pid)
+    dead.terminate()
+    dead.wait(timeout=5)
     # Rewind started_at so the launch grace window doesn't skip the check.
     conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
     conn.execute(

@@ -324,6 +324,7 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
               help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)")
     inherited(chat_parser, "--dev", dest="tui_dev", action="store_true", default=SUPPRESS,
               help="With --tui: run TypeScript sources via tsx (skip dist build)")
+    _query_group.add_argument("--private-worker-intake", action="store_true", help=argparse.SUPPRESS)
     return chat_parser
 
 

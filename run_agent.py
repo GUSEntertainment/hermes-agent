@@ -286,6 +286,15 @@ class AIAgent(
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
         from agent.agent_init import init_agent
         init_agent(self, **init_kwargs)
+        if os.environ.get("HERMES_PRIVATE_WORKER") == "1":
+            # Private workers never create/search/write durable sessions.  This
+            # flag is honored by lazy DB creation, persistence, finalization,
+            # prompt-cache scope, and session tools.
+            self._persist_disabled = True
+            # Bind only the finalized server-created parent object. No transcript
+            # persistence is enabled and no model argument can install this proof.
+            from agent.private_session_binding import bind_parent
+            bind_parent(self)
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the
@@ -848,6 +857,11 @@ class AIAgent(
             QUEUE.enqueue(self, _review_queue_key(self), dict(kwargs))
         except Exception:
             logger.debug("Preempted-review requeue failed", exc_info=True)
+
+    def _persist_session(self, messages, conversation_history=None):
+        if os.environ.get("HERMES_PRIVATE_WORKER") == "1":
+            return
+        return super()._persist_session(messages, conversation_history)
 
     _build_memory_write_metadata = _forward("agent.background_review", "build_memory_write_metadata")
     _apply_pending_steer_to_tool_results = _forward("agent.agent_runtime_helpers", "apply_pending_steer_to_tool_results")

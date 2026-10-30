@@ -2089,14 +2089,16 @@ def load_config() -> dict[str, Any]:
     """Load the merged configuration (DEFAULT_CONFIG + config.yaml + managed scope, env-expanded).
     Cached on the file signature; returns a deepcopy since most call sites mutate the result.
     Read-only hot paths should use ``load_config_readonly()`` to skip the deepcopy."""
-    return _load_config_impl(want_deepcopy=True)
+    from gateway.member_worker_policy import runtime_config
+    return runtime_config(_load_config_impl(want_deepcopy=True))
 
 
 def load_config_readonly() -> dict[str, Any]:
     """``load_config()`` without the defensive deepcopy (~half of the 265us cache-hit cost).
     **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
     every subsequent caller** — only for code paths that never write to the result."""
-    return _load_config_impl(want_deepcopy=False)
+    from gateway.member_worker_policy import runtime_config
+    return runtime_config(_load_config_impl(want_deepcopy=False))
 
 
 def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
@@ -2126,7 +2128,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     **{
         key: f"TERMINAL_{key.upper()}"
         for key in (
-            "modal_mode", "degraded_mode", "cwd", "temp_dir", "timeout", "lifetime_seconds",
+            "singularity_image", "ssh_sync_files", "modal_mode", "degraded_mode", "cwd", "temp_dir", "timeout", "lifetime_seconds",
             "docker_image", "docker_forward_env", "modal_image",
             "daytona_image", "vercel_runtime", "vercel_image", "ssh_host", "ssh_user", "ssh_port", "ssh_key",
             "container_cpu", "container_memory", "container_disk", "container_persistent",

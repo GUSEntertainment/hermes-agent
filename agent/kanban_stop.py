@@ -1,13 +1,19 @@
-"""Turn-end guard for kanban workers, which must end with a terminal board tool that hands
-the card to whoever owns it next (``kanban_complete``, ``kanban_block``,
-``kanban_request_review``, ``kanban_request_changes``). Some models narrate the next step
-and stop with no tool calls; Hermes treats that as a clean exit → ``rc=0`` → dispatcher
-``protocol_violation``. Policy-only: return a bounded synthetic nudge so the loop continues
-instead of exiting.
+"""Turn-end guard for kanban workers.
+
+Kanban workers must end with a successful completion, review, owner handoff, or block. Models
+(especially GLM / Qwen families) sometimes narrate the next step
+("Let me write the report now") and stop with ``finish_reason=stop`` and no
+tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
+``protocol_violation``.
+
+This module is policy-only: when a kanban worker tries to finish without a
+terminal board tool, return a bounded synthetic nudge so the conversation
+loop continues instead of exiting.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -31,10 +37,19 @@ _DEFAULT_MAX_ATTEMPTS = 2
 
 
 def kanban_stop_nudge_enabled() -> bool:
-    """On when ``HERMES_KANBAN_TASK`` is set for the dispatcher-owned worker, unless
-    ``HERMES_KANBAN_STOP_NUDGE`` disables it. In-process delegate_task children and cron runs
-    inherit the env var but own no board task and carry no kanban toolset."""
-    if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
+    """Return whether the kanban stop-guard is active for this process.
+
+    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
+    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    """
+    # In-process children inherit the parent process environment, but never
+    # own its native task. Reuse the same context predicate as tool admission;
+    # do not clear process-wide env or weaken the parent terminal requirement.
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if not is_dispatcher_owned_worker_context():
+        return False
+    env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
+    if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     return bool(owned_kanban_task())
 
@@ -49,14 +64,38 @@ def _tool_call_name(tc: Any) -> str:
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
-    for msg in filter(lambda m: isinstance(m, dict), messages or ()):
-        role = msg.get("role")
-        if role == "assistant" and any(
-            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
-        ):
-            return True
-        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+    """Only confirmed, same-task handoffs end a worker's responsibility."""
+    if not messages:
+        return False
+    pending = {}
+    terminal = _TERMINAL_KANBAN_TOOLS | {"kanban_request_review", "kanban_handoff", "kanban_request_changes", "kanban_rebind_review_artifact"}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if call_id:
+                    pending[call_id] = _tool_call_name(tc)
+        elif msg.get("role") == "tool":
+            name = msg.get("name") or pending.get(msg.get("tool_call_id"))
+            if name not in terminal:
+                continue
+            try:
+                result = json.loads(msg.get("content") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if (not isinstance(result, dict) or result.get("ok") is not True
+                    or result.get("error") or result.get("success") is False
+                    or result.get("task_id") != os.environ.get("HERMES_KANBAN_TASK")):
+                continue
+            if name == "kanban_handoff" and (result.get("phase") not in {"execute", "advisory_wait"}
+                                              or result.get("status") not in {"ready", "todo"}):
+                continue
+            if name == "kanban_request_review" and result.get("status") != "review":
+                continue
+            if result.get('continue_work') is True or result.get('status') == 'running':
+                continue
             return True
     return False
 
@@ -83,16 +122,15 @@ def build_kanban_stop_nudge(
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` has not been handed off: this session made no terminal board "
-        "call (`kanban_complete` / `kanban_request_review` / `kanban_block`). Ending now "
-        "causes a protocol violation (clean exit with the card still `running`).\n\n"
+        f"No successful completion or review handoff was observed for task `{tid}`. "
+        "Read `kanban_show` to confirm current state before changing it. "
+        "Ending a still-running task without a board handoff causes a protocol violation.\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
-        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "
-        "and needs no review, `kanban_request_review(summary=...)` if it is a code "
-        "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
-        "blocked. Reviewers approve with `kanban_complete` or send the card back with "
-        "`kanban_request_changes(reason=...)`.\n\n"
+        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
+        "is done, `kanban_request_review` when the verified deliverable needs review, "
+        "OR `kanban_block(reason=...)` for a genuine unresolved blocker. "
+        "Correct rejected tool arguments and retry; preserve an already successful review handoff.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

@@ -9,11 +9,38 @@ volume when a runtime install is unavoidable.
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from plugins.platforms.photon import sidecar_paths
+
+
+_STATIC_IMPORT_RE = re.compile(
+    r"(?:\bimport\s+(?:[^;]*?\s+from\s+)?|\bexport\s+[^;]*?\s+from\s+)"
+    r"[\"'](?P<path>\.[^\"']+)[\"']"
+)
+
+
+def _relative_static_import_closure(entrypoints: list[Path]) -> set[Path]:
+    """Parse the runtime closure without consulting production's copy list."""
+    pending = list(entrypoints)
+    closure: set[Path] = set()
+    while pending:
+        module = pending.pop()
+        module = module.resolve()
+        if module in closure:
+            continue
+        closure.add(module)
+        source = module.read_text(encoding="utf-8")
+        for match in _STATIC_IMPORT_RE.finditer(source):
+            dependency = (module.parent / match.group("path")).resolve()
+            assert dependency.is_file(), f"missing static import {dependency} required by {module}"
+            pending.append(dependency)
+    return closure
 
 
 def _seed_source(source: Path, *, with_node_modules: bool = False) -> None:
@@ -86,6 +113,61 @@ def test_mirror_refresh_updates_changed_files_and_keeps_node_modules(
     assert resolved == mirror
     assert (mirror / "index.mjs").read_text(encoding="utf-8") == "// index.mjs v2\n"
     assert (mirror / "node_modules" / "installed.txt").exists()
+
+
+def test_readonly_mirror_contains_transitive_runtime_import_closure(
+    tmp_path, monkeypatch
+) -> None:
+    """A stale hosted mirror must become an offline-importable bundle."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for the sidecar import check")
+
+    real_source = sidecar_paths.SOURCE_SIDECAR_DIR
+    package = __import__("json").loads(
+        (real_source / "package.json").read_text(encoding="utf-8")
+    )
+    entrypoints = {
+        package["main"],
+        *re.findall(r"\bnode\s+([^\s]+\.mjs)\b", " ".join(package["scripts"].values())),
+    }
+    required = _relative_static_import_closure(
+        [real_source / entrypoint for entrypoint in entrypoints]
+    )
+
+    source = tmp_path / "readonly-source"
+    shutil.copytree(real_source, source, ignore=shutil.ignore_patterns("node_modules"))
+    stale_mirror = tmp_path / "home" / "photon" / "sidecar"
+    stale_mirror.mkdir(parents=True)
+    (stale_mirror / "index.mjs").write_text("// stale\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    _freeze_writability(monkeypatch, writable=False)
+
+    mirror = sidecar_paths.resolve_sidecar_dir(source)
+
+    relative_required = {path.relative_to(real_source) for path in required}
+    assert all((mirror / path).is_file() for path in relative_required)
+    for entrypoint in entrypoints:
+        checked = subprocess.run(
+            [node, "--check", entrypoint],
+            cwd=mirror,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert checked.returncode == 0, checked.stderr
+    imported = subprocess.run(
+        [node, "index.mjs"],
+        cwd=mirror,
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert imported.returncode == 2, imported.stderr
+    assert "must all be set" in imported.stderr
+    assert "ERR_MODULE_NOT_FOUND" not in imported.stderr
 
 
 @pytest.mark.platforms("linux")

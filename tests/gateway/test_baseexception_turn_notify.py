@@ -123,3 +123,19 @@ async def test_plain_exception_still_notifies_without_propagating():
 
     assert adapter.sent, "platform send must be called on a plain Exception"
     assert "error" in adapter.sent[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_photon_exception_uses_durable_failure_path(monkeypatch):
+    from unittest.mock import AsyncMock
+    from plugins.platforms.photon import failure_reply
+    durable = AsyncMock()
+    monkeypatch.setattr(failure_reply, "send_processing_failure", durable)
+    adapter = _make_adapter(_raising_handler(RuntimeError("private error detail")))
+    event = _event()
+    event.source.platform = Platform("photon")
+    event.message_id = "test-photon-error"
+    await adapter._process_message_background(event, build_session_key(event.source))
+    durable.assert_awaited_once()
+    assert durable.call_args.args[1] is event
+    assert not adapter.sent

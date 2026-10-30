@@ -292,6 +292,11 @@ def load_cli_config() -> dict[str, Any]:
     from hermes_cli import managed_scope
 
     defaults = managed_scope.apply_managed_overlay(defaults)
+    # [GUS privacy wall] Member/private workers get the enforced policy config
+    # (no memory, no MCP, confinement) AFTER every user/managed overlay and
+    # BEFORE env mirroring, exactly as on the live release.
+    from gateway.member_worker_policy import runtime_config
+    defaults = runtime_config(defaults)
 
     _mirror_config_to_env(defaults, _file_has_terminal_config)
 

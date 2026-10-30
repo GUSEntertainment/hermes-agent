@@ -828,6 +828,8 @@ class OpenAICompatRoutesMixin:
             ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        if request.headers.get("X-Hermes-Intake-Receipt") is not None:
+            return web.json_response(_openai_error("Intake requires native runs", code="intake_native_run_required"), status=403)
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:

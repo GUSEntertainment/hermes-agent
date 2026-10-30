@@ -71,6 +71,174 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
+    @staticmethod
+    def _is_margot_department_topic(source) -> bool:
+        from gateway.run import _gateway_platform_value
+        return (
+            _gateway_platform_value(getattr(source, "platform", None)) == "telegram"
+            and str(getattr(source, "chat_id", "")) == "-1004479003480"
+            and bool(getattr(source, "thread_id", None))
+        )
+
+    async def _route_department_topic_ingress(self, event, source) -> tuple[bool, Optional[str]]:
+        """Resolve canonical topic authority before hooks, commands, or busy steering."""
+        from gateway.run import _load_gateway_config
+        if not self._is_margot_department_topic(source):
+            return False, None
+
+        routing_cfg = _load_gateway_config()
+        routing_requested = bool(
+            isinstance(routing_cfg, dict)
+            and isinstance(routing_cfg.get("department_topic_routing"), dict)
+            and routing_cfg["department_topic_routing"].get("enabled") is True
+        )
+        try:
+            from gateway.department_topic_router import (
+                dispatch_department_topic,
+                dispatch_to_safe_delegate,
+                load_department_topic_activation,
+                resolve_department_topic,
+            )
+
+            decision = resolve_department_topic(
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                message_id=(
+                    getattr(event, "message_id", None)
+                    or getattr(source, "message_id", None)
+                    or "0"
+                ),
+            )
+        except Exception:
+            logger.warning("Margot OS topic preflight failed closed", exc_info=True)
+            return True, (
+                "The department routing policy is unavailable, so I did not "
+                "default-execute this topic request."
+            )
+
+        if decision.status == "command":
+            return False, None
+        if not routing_requested:
+            return True, (
+                "The accountable department routing gate is not active, "
+                "so I did not default-execute this topic request."
+            )
+
+        try:
+            activation = load_department_topic_activation(routing_cfg)
+            assert activation is not None
+            # This interceptor runs before the normal model-turn session setup.
+            # Bind the same real authorized source now, without env/CLI authority.
+            if not self._is_user_authorized_for_source(source):
+                raise PermissionError("Topic source authorization revoked")
+            session_entry = await self.async_session_store.get_or_create_session(source)
+            from dataclasses import replace as replace_source
+            bound_source = replace_source(source, message_id=str(getattr(event, "message_id", None) or source.message_id or ""))
+            context = build_session_context(bound_source, self.config, session_entry)
+            tokens = self._set_session_env(context)
+            def revalidate_topic():
+                if not self._is_user_authorized_for_source(source):
+                    raise PermissionError("Topic source authorization revoked")
+                current = load_department_topic_activation(_load_gateway_config())
+                if current is None or current.board != activation.board:
+                    raise PermissionError("Topic activation changed")
+                fresh = resolve_department_topic(chat_id=source.chat_id, thread_id=source.thread_id,
+                    message_id=getattr(event, "message_id", None) or getattr(source, "message_id", None) or "0")
+                if fresh != decision:
+                    raise PermissionError("Topic route changed")
+            from gateway.topic_atomic import dispatch as atomic_topic_dispatch
+            try:
+                outcome = await asyncio.to_thread(
+                dispatch_department_topic,
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                message_id=(
+                    getattr(event, "message_id", None)
+                    or getattr(source, "message_id", None)
+                    or "0"
+                ),
+                message_text=event.text or "",
+                create_task=lambda envelope: atomic_topic_dispatch(
+                    envelope, board=activation.board, revalidate=revalidate_topic,
+                    request_sha256=__import__("hashlib").sha256((event.text or "").encode()).hexdigest()
+                ),
+                )
+            finally:
+                self._clear_session_env(tokens)
+            if outcome.status == "delegated":
+                return True, (
+                    "I’ve routed this to the accountable department workflow "
+                    "and will return the verified result here."
+                )
+            if outcome.status == "duplicate":
+                return True, (
+                    "This topic update is already in the accountable department "
+                    "workflow; I’ll return the verified result here."
+                )
+            if outcome.status == "unverified_topic":
+                return True, (
+                    "This candidate topic is not verified for live routing yet, "
+                    "so I did not default-execute the request."
+                )
+            if outcome.status == "unknown_topic":
+                return True, (
+                    "This topic is not mapped to a specialist workflow, so I "
+                    "did not default-execute the request."
+                )
+            return True, (
+                "The department routing policy rejected this request, so I did "
+                "not default-execute it."
+            )
+        except PermissionError as exc:
+            if getattr(exc, "code", None) == "legal_owner_cell_contract_unavailable":
+                logger.warning("Department-topic handoff held: %s", exc.code)
+                return True, "Legal routing needs its protected review contract repaired; I haven't created a task."
+            logger.exception("Department-topic handoff permission check failed closed")
+            return True, "I couldn’t validate this department handoff, so I haven’t created a task."
+        except Exception:
+            logger.exception("Department-topic handoff failed closed")
+            return True, (
+                "I couldn’t validate or create the accountable department "
+                "handoff, so I did not default-execute this topic request."
+            )
+
+    async def _hm_pre_gateway_dispatch_hook(
+        self, event: "MessageEvent", source: SessionSource
+    ) -> Optional["MessageEvent"]:
+        """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
+        Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
+        ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
+        try:
+            from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
+            _hook_results = await _ainvoke_hook(
+                "pre_gateway_dispatch", event=event, gateway=self,
+                # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
+                session_store=getattr(self, "session_store", None),
+            )
+        except Exception as _hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+            _hook_results = []
+
+        for _result in _hook_results:
+            if not isinstance(_result, dict):
+                continue
+            _action = _result.get("action")
+            if _action == "skip":
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    _result.get("reason"), source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return None
+            if _action == "rewrite":
+                _new_text = _result.get("text")
+                if isinstance(_new_text, str):
+                    event = dataclasses.replace(event, text=_new_text)
+                break
+            if _action == "allow":
+                break
+        return event
+
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
         """DM an unauthorized sender a pairing code (rate-limited; groups never reach here)."""
         platform_name = source.platform.value if source.platform else "unknown"
@@ -145,7 +313,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
-        from gateway.run import _is_slack_ignored_channel
+        from gateway.run import _is_slack_ignored_channel, _hermes_home, _load_gateway_config
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
@@ -209,13 +377,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
             return event, source, False
 
+        is_margot_os_topic = self._is_margot_department_topic(source)
+
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
-        source = event.source
+        if not is_margot_os_topic:
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
+            source = event.source
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -238,6 +409,77 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             else:
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
+        # Bot-origin traffic requires an exact, typed handoff after the normal
+        # platform authorization gate and before pause/hooks/session creation.
+        # Broad TELEGRAM_ALLOW_BOTS admission is not delegation authority.
+        # Peer-chat exception: exact (chat_id, sender_id) pairs listed under
+        # gateway config `peer_bot_chats` may talk in plain text, capped at
+        # `max_bot_turns` consecutive bot messages until a human speaks.
+        _peer_bot_ok = False
+        if (
+            not is_internal
+            and source.platform == Platform.TELEGRAM
+        ):
+            try:
+                import yaml as _pb_yaml
+                with open(_hermes_home / "config.yaml") as _pb_fh:
+                    _pb_cfg = (_pb_yaml.safe_load(_pb_fh) or {}).get("peer_bot_chats") or []
+            except Exception:
+                _pb_cfg = []
+            _pb_turns = getattr(self, "_peer_bot_turns", None)
+            if _pb_turns is None:
+                _pb_turns = self._peer_bot_turns = {}
+            _pb_chat = str(source.chat_id or "")
+            for _pb_row in _pb_cfg if isinstance(_pb_cfg, list) else []:
+                if not isinstance(_pb_row, dict) or str(_pb_row.get("chat_id")) != _pb_chat:
+                    continue
+                if not getattr(source, "is_bot", False):
+                    _pb_turns[_pb_chat] = 0
+                    break
+                if str(_pb_row.get("sender_id")) == str(source.user_id or ""):
+                    _pb_max = int(_pb_row.get("max_bot_turns", 3) or 3)
+                    _pb_n = _pb_turns.get(_pb_chat, 0)
+                    if _pb_n >= _pb_max:
+                        logger.info("Peer bot loop guard: dropping bot message in %s after %d turns", _pb_chat, _pb_n)
+                        return None
+                    _pb_turns[_pb_chat] = _pb_n + 1
+                    _peer_bot_ok = True
+                    break
+
+        if (
+            not is_internal
+            and not _peer_bot_ok
+            and source.platform == Platform.TELEGRAM
+            and getattr(source, "is_bot", False)
+        ):
+            from gateway.bot_ingress import BotHandoffReplayStore, classify_bot_ingress
+
+            try:
+                _handoff_cfg = _load_gateway_config()
+                _handoff_store = BotHandoffReplayStore(
+                    _hermes_home / "gateway" / "bot_handoff_replay.sqlite3"
+                )
+                _ingress = await asyncio.to_thread(
+                    classify_bot_ingress,
+                    source_is_bot=True,
+                    text=event.text,
+                    source_user_id=source.user_id,
+                    source_profile=source.profile or "default",
+                    platform=source.platform.value,
+                    config=_handoff_cfg,
+                    replay_store=_handoff_store,
+                    metadata=getattr(event, "metadata", None),
+                )
+            except Exception:
+                logger.warning("Bot handoff admission failed closed", exc_info=True)
+                return None
+            if not _ingress.allowed:
+                logger.info("Silently dropping bot ingress: %s", _ingress.reason)
+                return None
+            _metadata = dict(getattr(event, "metadata", None) or {})
+            _metadata["bot_handoff"] = _ingress.handoff
+            event = dataclasses.replace(event, text=_ingress.message, metadata=_metadata)
+            source = event.source
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
@@ -1258,6 +1500,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # — Discord interaction passthrough builds its own MessageEvent and
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
+
+        if not is_internal and self._is_margot_department_topic(source):
+            handled, response = await self._route_department_topic_ingress(event, source)
+            if handled:
+                return response
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:

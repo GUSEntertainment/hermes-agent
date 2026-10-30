@@ -46,16 +46,26 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import ast
+import ctypes
+import errno
+import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
+import secrets
+import select
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -113,6 +123,27 @@ def _runner_scratch_root() -> str:
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
+
+def _uses_fake_control_plane_lane(file: Path) -> bool:
+    """True only for an explicit module-level pytestmark assignment."""
+    try:
+        tree = ast.parse(file.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if not any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in targets):
+            continue
+        value = statement.value
+        if value is None:
+            continue
+        for node in ast.walk(value):
+            if isinstance(node, ast.Attribute) and node.attr == "fake_control_plane":
+                return True
+    return False
+
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
 # image, etc.) and are run in their own dedicated CI jobs:
@@ -143,6 +174,32 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+
+# A small number of intentionally monolithic test modules need more than the
+# global cap only when they run inside the full parallel suite. Keep this
+# allowlist narrow and bounded; an explicit CLI/env timeout always wins.
+_SLOW_FILE_DEFAULT_TIMEOUTS = {
+    "tests/test_tui_gateway_server.py": 600.0,
+}
+
+
+def _slow_file_default_timeout(
+    file: Path,
+    repo_root: Path,
+    *,
+    configured: float,
+    explicit: bool,
+) -> float:
+    """[GUS] Return a bounded default-only timeout for one test file (named
+    slow-file floors). Upstream v0.21.5's duration scaler keeps the
+    ``_effective_file_timeout`` name; both apply, explicit overrides win."""
+    if explicit:
+        return configured
+    try:
+        relative = file.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return configured
+    return max(configured, _SLOW_FILE_DEFAULT_TIMEOUTS.get(relative, configured))
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
@@ -402,7 +459,459 @@ def _discover_files(roots: list[Path]) -> list[Path]:
     return sorted(out)
 
 
-def _kill_tree(proc: subprocess.Popen, pgid: int | None = None) -> None:
+class UnsafeProcessGroup(RuntimeError):
+    """The runner cannot prove that every current group member is its own."""
+
+
+class _BenignProcessExit(RuntimeError):
+    """An authenticated candidate vanished before the snapshot stabilized."""
+
+
+_GROUP_AUTH_MAX_ATTEMPTS = 4
+_GROUP_AUTH_TIMEOUT = 1.0
+
+
+@dataclass
+class _GroupAuthority:
+    pgid: int
+    leader_pid: int
+    leader_start: str | None
+    leader_pidfd: int | None
+    owner_pid: int
+    domain_fd: int
+    domain_path: Path
+    domain_token: str
+    domain_stat: tuple[int, int]
+
+
+def _process_snapshot(pid: int) -> tuple[str, int, int] | None:
+    """Return a stable ``(start, ppid, pgid)`` identity for *pid*."""
+    if sys.platform.startswith("linux"):
+        try:
+            fields = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+            # An exited zombie cannot receive a signal and must not be treated as
+            # a live foreign member merely because its process-table slot awaits
+            # reaping by an outer namespace wrapper.
+            if fields[0] == "Z":
+                return None
+            return fields[19], int(fields[1]), int(fields[2])
+        except (OSError, IndexError, ValueError):
+            return None
+    try:
+        import psutil
+
+        process = psutil.Process(int(pid))
+        pgid = 0 if sys.platform == "win32" else os.getpgid(int(pid))
+        return repr(process.create_time()), process.ppid(), pgid
+    except Exception:
+        return None
+
+
+def _group_snapshots(pgid: int) -> dict[int, tuple[str, int, int]]:
+    members: dict[int, tuple[str, int, int]] = {}
+    if sys.platform == "win32":
+        return members
+    if sys.platform.startswith("linux"):
+        try:
+            candidate_pids = [
+                int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()
+            ]
+        except OSError:
+            return members
+    else:
+        try:
+            import psutil
+
+            candidate_pids = psutil.pids()
+        except Exception:
+            return members
+    for pid in candidate_pids:
+        snapshot = _process_snapshot(pid)
+        if snapshot is not None and snapshot[2] == int(pgid):
+            members[pid] = snapshot
+    return members
+
+
+def _pidfd_is_live(pidfd: int) -> bool:
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return not poller.poll(0)
+
+
+def _leader_is_live(authority: _GroupAuthority) -> bool:
+    if authority.leader_pidfd is not None:
+        return _pidfd_is_live(authority.leader_pidfd)
+    snapshot = _process_snapshot(authority.leader_pid)
+    return (
+        snapshot is not None
+        and authority.leader_start is not None
+        and snapshot[0] == authority.leader_start
+    )
+
+
+def _open_pidfd(pid: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.pidfd_open(int(pid), 0)
+    if fd < 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            raise ProcessLookupError(pid)
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
+def _enable_child_subreaper() -> None:
+    """Make orphaned test descendants become children of this runner on Linux."""
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.pidfd_send_signal(int(pidfd), int(sig), None, 0) < 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            raise ProcessLookupError(pidfd)
+        raise OSError(error, os.strerror(error))
+
+
+def _domain_mac(token: str, pid: int, start: str) -> str:
+    return hmac.new(token.encode("ascii"), f"{pid}:{start}".encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def _append_domain_identity(fd: int, token: str, pid: int, start: str) -> None:
+    record = {"pid": int(pid), "start": start, "mac": _domain_mac(token, pid, start)}
+    os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("ascii"))
+
+
+def _registered_domain_identities(authority: _GroupAuthority) -> dict[int, set[str]]:
+    """Read only authenticated PID/start records from the retained domain file."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(authority.domain_path, os.O_RDONLY | nofollow)
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != authority.domain_stat or not stat.S_ISREG(opened.st_mode):
+            os.close(fd)
+            raise UnsafeProcessGroup("process domain identity changed")
+    except OSError as exc:
+        raise UnsafeProcessGroup("process domain is unavailable") from exc
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 8 * 1024 * 1024:
+                raise UnsafeProcessGroup("process domain is unexpectedly large")
+        data = b"".join(chunks).decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UnsafeProcessGroup("process domain is unreadable") from exc
+    finally:
+        os.close(fd)
+    identities: dict[int, set[str]] = {}
+    for line in data.splitlines():
+        try:
+            record = json.loads(line)
+            pid, start, mac = record["pid"], record["start"], record["mac"]
+            if (
+                set(record) == {"pid", "start", "mac"}
+                and type(pid) is int
+                and type(start) is str
+                and type(mac) is str
+                and hmac.compare_digest(mac, _domain_mac(authority.domain_token, pid, start))
+            ):
+                identities.setdefault(pid, set()).add(start)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return identities
+
+
+def _stable_descendant_of(pid: int, leader_pid: int, pgid: int) -> bool:
+    observed: dict[int, tuple[str, int, int]] = {}
+    current = int(pid)
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        snapshot = _process_snapshot(current)
+        if snapshot is None or snapshot[2] != pgid:
+            return False
+        observed[current] = snapshot
+        if current == leader_pid:
+            break
+        current = snapshot[1]
+    if current != leader_pid:
+        return False
+    return all(_process_snapshot(member) == snapshot for member, snapshot in observed.items())
+
+
+def _stable_adopted_child(pid: int, authority: _GroupAuthority) -> bool:
+    """Prove the kernel reparented *pid* directly into the retained runner."""
+    first = _process_snapshot(pid)
+    return (
+        sys.platform.startswith("linux")
+        and first is not None
+        and first[1] == authority.owner_pid
+        and _process_snapshot(pid) == first
+    )
+
+
+def _stable_descendant_of_adopted(
+    pid: int, authority: _GroupAuthority, pgid: int
+) -> bool:
+    """Prove a stable chain whose root was adopted by this Linux subreaper."""
+    if not sys.platform.startswith("linux"):
+        return False
+    observed: dict[int, tuple[str, int, int]] = {}
+    current = int(pid)
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        snapshot = _process_snapshot(current)
+        if snapshot is None or snapshot[2] != pgid:
+            return False
+        observed[current] = snapshot
+        if snapshot[1] == authority.owner_pid:
+            return all(
+                _process_snapshot(member) == original
+                for member, original in observed.items()
+            )
+        current = snapshot[1]
+    return False
+
+
+def _is_benign_group_shrink(
+    before: dict[int, tuple[str, int, int]],
+    after: dict[int, tuple[str, int, int]],
+    authority: _GroupAuthority,
+) -> bool:
+    """Recognize only exits and kernel reparenting; never additions or reuse."""
+    before_pids = set(before)
+    after_pids = set(after)
+    if not after_pids < before_pids:
+        return False
+    vanished = before_pids - after_pids
+    for pid, (start, ppid, pgid) in after.items():
+        old_start, old_ppid, old_pgid = before[pid]
+        if (start, pgid) != (old_start, old_pgid):
+            return False
+        if ppid != old_ppid and not (
+            old_ppid in vanished
+            and (ppid == authority.owner_pid or ppid in after_pids)
+        ):
+            return False
+    return True
+
+
+def _authenticate_group_members_once(authority: _GroupAuthority) -> dict[int, str]:
+    """Authenticate a complete group snapshot without trusting a bare PGID."""
+    if authority.pgid != authority.leader_pid or authority.leader_pid <= 1:
+        raise UnsafeProcessGroup("invalid direct process-group authority")
+    members = _group_snapshots(authority.pgid)
+    leader_live = _leader_is_live(authority)
+    leader = members.get(authority.leader_pid)
+    if leader is not None:
+        if not leader_live:
+            raise UnsafeProcessGroup("process group identifier was reused")
+        if authority.leader_start is not None and leader[0] != authority.leader_start:
+            raise UnsafeProcessGroup("process group leader identity changed")
+    elif leader_live and sys.platform != "win32":
+        raise UnsafeProcessGroup("live leader is absent from its process group")
+
+    registered = _registered_domain_identities(authority)
+    expected: dict[int, str] = {}
+    for pid, snapshot in members.items():
+        if pid == authority.leader_pid and leader_live:
+            expected[pid] = snapshot[0]
+        elif leader_live and _stable_descendant_of(pid, authority.leader_pid, authority.pgid):
+            expected[pid] = snapshot[0]
+        elif _stable_descendant_of_adopted(pid, authority, authority.pgid):
+            expected[pid] = snapshot[0]
+        else:
+            # A candidate can exit while its ancestry is being double-read.
+            # Retry only if a fresh kernel enumeration proves a pure shrink;
+            # an extant unauthenticated member remains immediately fatal.
+            current = _group_snapshots(authority.pgid)
+            if _is_benign_group_shrink(members, current, authority):
+                raise _BenignProcessExit
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    "utf-8", "replace"
+                )
+            except OSError:
+                cmdline = "<unavailable>"
+            raise UnsafeProcessGroup(
+                f"foreign member {pid} start={snapshot[0]} ppid={snapshot[1]} "
+                f"registered={sorted(registered.get(pid, set()))!r} cmdline={cmdline!r} "
+                "entered authenticated process group"
+            )
+    current = _group_snapshots(authority.pgid)
+    if current != members:
+        if _is_benign_group_shrink(members, current, authority):
+            raise _BenignProcessExit
+        raise UnsafeProcessGroup("process group membership changed during authentication")
+
+    # Registry records are untrusted candidate hints from test code. Outside
+    # the original group, only stable direct adoption by this Linux subreaper
+    # independently proves ownership.
+    for pid, starts in registered.items():
+        snapshot = _process_snapshot(pid)
+        if snapshot is None:
+            continue
+        if snapshot[0] not in starts:
+            raise UnsafeProcessGroup(
+                f"registered process identity changed for PID {pid}"
+            )
+        if not _stable_adopted_child(pid, authority):
+            # A hostile test may add arbitrary same-user identities.  Reject
+            # that candidate without letting it deny cleanup of proven members.
+            continue
+        expected[pid] = snapshot[0]
+    for pid, start in expected.items():
+        snapshot = _process_snapshot(pid)
+        if snapshot is None:
+            raise _BenignProcessExit
+        if snapshot[0] != start:
+            raise UnsafeProcessGroup("process domain membership changed during authentication")
+    return expected
+
+
+def _authenticate_group_members(authority: _GroupAuthority) -> dict[int, str]:
+    """Return only a complete, stable authority snapshot, retrying benign exits."""
+    deadline = time.monotonic() + _GROUP_AUTH_TIMEOUT
+    for attempt in range(_GROUP_AUTH_MAX_ATTEMPTS):
+        try:
+            return _authenticate_group_members_once(authority)
+        except _BenignProcessExit:
+            if attempt + 1 >= _GROUP_AUTH_MAX_ATTEMPTS or time.monotonic() >= deadline:
+                break
+    raise UnsafeProcessGroup("process group membership did not stabilize during authentication")
+
+
+def _signal_pid_identity(pid: int, expected_start: str, sig: int) -> None:
+    """Deliver to an exact process identity, never to a reusable bare PID."""
+    if sys.platform.startswith("linux"):
+        try:
+            pidfd = _open_pidfd(pid)
+        except ProcessLookupError:
+            return
+        try:
+            snapshot = _process_snapshot(pid)
+            if snapshot is None or snapshot[0] != expected_start:
+                raise UnsafeProcessGroup("process identity changed before delivery")
+            _pidfd_send_signal(pidfd, sig)
+        finally:
+            os.close(pidfd)
+        return
+
+    snapshot = _process_snapshot(pid)
+    if snapshot is None:
+        return
+    if snapshot[0] != expected_start:
+        raise UnsafeProcessGroup("process identity changed before delivery")
+    import psutil
+
+    process = psutil.Process(int(pid))
+    if repr(process.create_time()) != expected_start:
+        raise UnsafeProcessGroup("process identity changed before delivery")
+    if sys.platform == "win32":
+        process.kill()
+    else:
+        process.send_signal(sig)
+
+
+def _terminate_authenticated_group(authority: _GroupAuthority, sig: int) -> None:
+    expected = _authenticate_group_members(authority)
+    for pid, start in expected.items():
+        _signal_pid_identity(pid, start, sig)
+    if not sys.platform.startswith("linux"):
+        return
+
+    # A subreaper becomes the parent of killed orphans. Reap only identities
+    # authenticated for this authority; waitpid(-1) could steal another
+    # worker thread's Popen child.
+    pending = set(expected) - {authority.leader_pid}
+    deadline = time.monotonic() + 2
+    while pending and time.monotonic() < deadline:
+        for pid in tuple(pending):
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                # The original parent may not have exited/reparented this PID
+                # yet. Keep it pending while the bounded window remains.
+                continue
+            if waited == pid:
+                pending.remove(pid)
+        if pending:
+            time.sleep(0.01)
+
+
+def _capture_group_authority(
+    proc: "subprocess.Popen", domain_fd: int, domain_path: Path, domain_token: str
+) -> _GroupAuthority:
+    """Retain direct pidfd authority and register the exec-stable leader identity."""
+    pidfd = _open_pidfd(proc.pid) if sys.platform.startswith("linux") else None
+    try:
+        snapshot = _process_snapshot(proc.pid)
+        if snapshot is None and pidfd is None:
+            raise UnsafeProcessGroup(
+                "portable process authority requires a stable process identity"
+            )
+        leader_start = snapshot[0] if snapshot is not None else None
+        domain_stat = os.fstat(domain_fd)
+        if leader_start is not None:
+            _append_domain_identity(domain_fd, domain_token, proc.pid, leader_start)
+        return _GroupAuthority(
+            pgid=proc.pid,
+            leader_pid=proc.pid,
+            leader_start=leader_start,
+            leader_pidfd=pidfd,
+            owner_pid=os.getpid(),
+            domain_fd=domain_fd,
+            domain_path=domain_path,
+            domain_token=domain_token,
+            domain_stat=(domain_stat.st_dev, domain_stat.st_ino),
+        )
+    except BaseException:
+        if pidfd is not None:
+            os.close(pidfd)
+        raise
+
+
+def _terminate_and_reap_untrusted_child(proc: "subprocess.Popen") -> None:
+    """Bound and reap a child when authority capture failed after spawn."""
+    try:
+        proc.terminate()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    finished = threading.Event()
+
+    def _bounded_reap() -> None:
+        try:
+            proc.wait(timeout=2)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+            pass
+        finally:
+            finished.set()
+
+    threading.Thread(target=_bounded_reap, daemon=True).start()
+    finished.wait(2)
+
+
+def _kill_tree(proc: "subprocess.Popen", authority: _GroupAuthority | None = None) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
     A test run can spin up uvicorn servers, async runtimes, or other
@@ -411,54 +920,43 @@ def _kill_tree(proc: subprocess.Popen, pgid: int | None = None) -> None:
     targets the immediate child; grandchildren reparent to PID 1
     (Linux) / get adopted by services.exe (Windows) and leak.
 
-    POSIX: the caller must pass ``pgid`` — the process group id captured
-    immediately after Popen (via ``os.getpgid(proc.pid)``). We can't
-    look it up here in the happy path because by the time we get
-    called the leader process has already been reaped and its pid is
-    gone from the kernel's process table, even though descendants in
-    the group are still alive. SIGKILL'ing the captured pgid takes out
-    everything in that group atomically.
+    Linux: the caller retains a pidfd for the Popen leader plus a private
+    HMAC-authenticated PID/start registry. Cleanup enumerates the captured
+    group, rejects reuse or any foreign member, then delivers SIGKILL to each
+    authenticated identity through its own pidfd. A bare PGID is never
+    authority, including after the leader exits.
 
-    Windows: ``taskkill /F /T /PID`` walks the recorded ppid chain and
-    terminates the whole tree, even when the root has already exited.
+    macOS/Windows: psutil supplies create-time identities and native per-process
+    delivery. Windows therefore does not invoke taskkill through the startup
+    guard that intentionally blocks service-control commands.
 
-    Why not psutil: psutil walks the parent-child tree, but in the
-    happy path the root has already been reaped so ``psutil.Process(pid)``
-    can't find it; grandchildren reparented to PID 1 are also
-    unreachable by tree walk at that point. The platform-native
-    primitives (process groups / taskkill) handle both cases correctly
-    without an extra abstraction layer.
+    The authenticated registry preserves identities after a happy-path root is
+    reaped and descendants are reparented. Linux then uses pidfds for delivery;
+    portable hosts use psutil's create-time checked native process handles.
     """
     if proc.pid is None:
         return
 
-    if sys.platform == "win32":
-        try:
-            
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )  # windows-footgun: ok
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-    else:
-        # POSIX: kill the captured pgid. Local-import signal so the
-        # SIGKILL attribute is never referenced on Windows.
-        if pgid is not None:
-            try:
-                import signal as _signal
-                os.killpg(pgid, _signal.SIGKILL)  # windows-footgun: ok
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-    # Belt-and-suspenders: ensure subprocess.communicate() sees the exit.
     try:
-        proc.kill()
-    except (ProcessLookupError, OSError):
-        pass
+        if authority is not None:
+            _terminate_authenticated_group(
+                authority, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
+            if not sys.platform.startswith("linux"):
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+        else:
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+    finally:
+        if authority is not None:
+            if authority.leader_pidfd is not None:
+                os.close(authority.leader_pidfd)
+            os.close(authority.domain_fd)
 
 
 def _kill_detached_leftovers(temproot: str) -> None:
@@ -640,12 +1138,52 @@ def _run_one_file_once(
     #
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
-    env = os.environ.copy()
+    child_env = os.environ.copy()
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
-    env["PYTEST_DEBUG_TEMPROOT"] = temproot
+    child_env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
-    env["TMPDIR"] = temproot
+    child_env["TMPDIR"] = temproot
+    # Give this file attempt a private, authenticated process domain.  The
+    # startup guard registers only children created through its Popen wrapper;
+    # descendants inherit the same domain so their PID+start identities remain
+    # provable after their original parent exits and they are reparented.
+    suite_home = Path(os.environ["HERMES_TEST_ISOLATION"])
+    process_domain_token = secrets.token_hex(32)
+    process_domain_path = suite_home / f".process-domain-{process_domain_token}"
+    domain_fd = os.open(
+        process_domain_path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    child_env["HERMES_TEST_PROCESS_DOMAIN"] = str(process_domain_path)
+    child_env["HERMES_TEST_PROCESS_DOMAIN_TOKEN"] = process_domain_token
+    # The authenticated domain registrar is a Python startup hook. Install it
+    # here too (not only in run_tests.sh) because this runner is also a public
+    # entry point and its direct-invocation cleanup guarantees must be real.
+    test_site = str(repo_root / "scripts" / "test_site")
+    inherited_pythonpath = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = (
+        test_site + (os.pathsep + inherited_pythonpath if inherited_pythonpath else "")
+    )
+    # Service-manager implementation tests must opt into a dedicated fake
+    # lane in their source. Every other file enters a private mount namespace
+    # that shadows the hosted control plane before pytest collection.
+    fake_control_plane = _uses_fake_control_plane_lane(file)
+    namespace_helper = os.environ.get("HERMES_TEST_NAMESPACE_HELPER", "")
+    if fake_control_plane:
+        child_env["HERMES_TEST_CONTROL_PLANE_LANE"] = "fake"
+    elif namespace_helper:
+        suite_home = os.environ["HERMES_HOME"]
+        cmd = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            namespace_helper,
+            suite_home,
+            *cmd,
+        ]
 
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -655,30 +1193,31 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
+        env=child_env,
+        # Linux: place the child at the head of its own process group. The
+        # runner is also a child subreaper, so later detached/orphaned members
+        # remain independently attributable through kernel ancestry.
+        # Portable hosts do not detach because no equivalent retained
+        # containment authority is available here.
+        start_new_session=sys.platform.startswith("linux"),
     )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
+    authority: _GroupAuthority | None = None
+    try:
+        authority = _capture_group_authority(
+            proc, domain_fd, process_domain_path, process_domain_token
+        )
+    except BaseException:
         try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
+            _terminate_and_reap_untrusted_child(proc)
+        finally:
+            os.close(domain_fd)
+        raise
 
     try:
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, authority=authority)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
@@ -691,12 +1230,12 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, authority=authority)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
         # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, authority=authority)
 
         output +=  "\n"
     finally:
@@ -1152,6 +1691,7 @@ def _print_failure_report(
 
 def main() -> int:
     _make_stdio_glyph_safe()
+    _enable_child_subreaper()
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1317,6 +1857,14 @@ def main() -> int:
         before, explicit_passthrough = argv[:sep], argv[sep + 1 :]
     else:
         before, explicit_passthrough = argv, []
+
+    file_timeout_explicit = (
+        "HERMES_TEST_FILE_TIMEOUT" in os.environ
+        or any(
+            token == "--file-timeout" or token.startswith("--file-timeout=")
+            for token in before
+        )
+    )
 
     our_args: list[str] = []
     bare_passthrough: list[str] = []
@@ -1541,11 +2089,19 @@ def main() -> int:
         futures: list[Future] = []
         for file in files:
             t0 = time.monotonic()
+            file_timeout = _slow_file_default_timeout(
+                file,
+                repo_root,
+                configured=args.file_timeout,
+                explicit=file_timeout_explicit,
+            )
+            if not file_timeout_explicit:
+                file_timeout = _effective_file_timeout(
+                    file, repo_root, file_timeout, timeout_durations
+                )
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                _effective_file_timeout(
-                    file, repo_root, args.file_timeout, timeout_durations
-                ),
+                file_timeout,
                 args.file_retries,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))

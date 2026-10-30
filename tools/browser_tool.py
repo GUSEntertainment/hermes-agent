@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from typing import Dict, Any, Optional, Union
 from pathlib import Path
 from agent.redact import redact_cdp_url
@@ -760,6 +761,47 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     safety_error = _url_policy_error(url, auto_local=auto_local_this_nav)
     if safety_error is not None:
         return json.dumps(safety_error)
+
+    # Always-blocked floor: cloud metadata / IMDS endpoints are denied
+    # regardless of backend, hybrid routing, or allow_private_urls.
+    # There's no legitimate agent use case for navigating to
+    # 169.254.169.254 / metadata.google.internal / ECS task metadata
+    # via a browser, and routing those to a local Chromium sidecar
+    # on an EC2/GCP/Azure host exfiltrates IAM credentials (#16234).
+    # The floor is UNCONDITIONAL — it must fire for every backend,
+    # including the pure-local headless Chromium and off-host CDP cases
+    # (a local Chromium on a cloud VM still reaches the host IMDS).
+    if _is_always_blocked_url(url):
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: URL targets a cloud metadata endpoint",
+        })
+
+    # _url_policy_error above already applies the local/cloud private-address policy.
+    # Private owner workers: public http(s) only, never local files, loopback,
+    # LAN, or host services, regardless of the local backend exemption.
+    try:
+        from gateway.member_worker_policy import private_worker_active
+        _private_worker = private_worker_active()
+    except Exception:
+        _private_worker = False
+    if _private_worker:
+        if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https") or not _is_safe_url(url):
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: private agents may browse public http(s) sites only",
+            })
+
+    # Website policy check — block before navigating
+    blocked = check_website_access(url)
+    if blocked:
+        return json.dumps({
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+        })
+
+    # Camofox backend — delegate after safety checks pass
 
     if _is_camofox_mode():
         return _camofox("camofox_navigate", url, task_id)

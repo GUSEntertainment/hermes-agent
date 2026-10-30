@@ -101,7 +101,10 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
     claimed = kb.claim_task(conn, child_id)
     assert claimed is not None and claimed.status == "running"
-    kbd._set_worker_pid(conn, child_id, 424242)
+    monkeypatch.setattr(
+        kb, "_worker_process_identity", lambda pid: (int(pid), 1.0)
+    )
+    assert kb._set_worker_pid(conn, child_id, 424242)
 
     kills: list[tuple] = []
 

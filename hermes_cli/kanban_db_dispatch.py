@@ -2960,6 +2960,24 @@ def run_daemon(
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
-from hermes_cli import kanban_db as _kb
-from hermes_cli import kanban_db_connect as _kbc
-from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli.kanban_worker_log import (
+    _rotated_log_path, rotate_worker_log as _rotate_worker_log, worker_log_rotation_config,
+)
+from hermes_cli import kanban_db as _kb  # noqa: E402
+from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
+from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+
+
+# [GUS v0.21.5 port] One implementation per name across kanban_db and this split
+# module. Names Margot customized (vs upstream eea312f8) keep the custom kanban_db
+# version; uncustomized names keep this upstream v0.21.5 version and kanban_db
+# rebinds to it (see bottom of kanban_db.py). Prevents signature drift.
+_GUS_CUSTOM_NAMES = ('DispatchResult', '_default_spawn', '_dispatch_once_locked', '_module_hermes_argv', '_resolve_hermes_argv', '_set_worker_pid', 'check_respawn_guard', 'has_spawnable_ready', 'has_spawnable_review', 'reap_worker_zombies')
+_GUS_UPSTREAM_NAMES = ('_terminate_reclaimed_worker', '_worker_survived_termination', '_record_task_failure', '_absolute_hermes_path', '_classify_worker_exit', '_clear_failure_counter', '_defer_reclaim_for_live_worker', '_error_fingerprint', '_hermes_path_argv', '_is_windows_batch_shim', '_looks_like_path', '_memory_pressure_level', '_path_search_names', '_pid_alive', '_positive_int', '_protocol_violation_streak', '_record_worker_exit', '_resolve_worker_cli_toolsets', '_retag_legacy_worker_sessions', '_rotate_worker_log', '_rotated_log_path', '_safe_which_no_cwd', '_system_memory_sample', '_worker_terminal_timeout_env', 'configured_max_in_progress', 'count_running_tasks', 'count_running_tasks_other_boards', 'derive_default_max_in_progress', 'detect_crashed_workers', 'detect_stale_running', 'dispatch_once', 'enforce_max_runtime', 'heartbeat_worker', 'reconcile_orphaned_running', 'resolve_max_in_progress', 'review_dispatch_enabled', 'run_daemon', 'worker_log_rotation_config')
+for _gus_name in _GUS_CUSTOM_NAMES:
+    globals()[_gus_name] = getattr(_kb, _gus_name)
+
+# [GUS] Bind into kanban_db if this module finished importing after it.
+if hasattr(_kb, "_gus_bind_split_module"):
+    import sys as _gus_sys
+    _kb._gus_bind_split_module(_gus_sys.modules[__name__])

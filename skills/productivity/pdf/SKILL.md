@@ -84,6 +84,18 @@ python scripts/pdf_meta.py doc.pdf --list-attachments | --extract-attachments di
 | Set/clear metadata, attachments | pypdf | `pdf_meta.py --set-meta / --attach / --extract-attachments` |
 | Compress content streams | pypdf | `pdf_split.py f.pdf --pages 1-N --compress` |
 
+## Managed runtime fast path for simple one-page text
+
+When the admitted worker runtime publishes the `hermes_pdf_fast` capability, use its existing interpreter and fixed helper instead of probing unrelated interpreters, installing packages, or writing a PDF engine. This exact reviewed interpreter is inside the existing native confinement runtime closure:
+
+```bash
+"/Users/Chris/.hermes/releases/hermes-agent-20260925-pdf-preparation-v44/.venv/bin/python" -P -m hermes_pdf_fast -o checklist.pdf < spec.json
+```
+
+Write the spec in the current admitted workspace. Supported: title, letter/A4, 1–30 printable ASCII heading/paragraph elements. Output must be a new PDF basename in that workspace. For images, custom layouts, Unicode, forms or multipage work, use the full procedures below. Do not silently simplify a requested document to fit this helper.
+
+Dependency preflight is a deployment/capability check, not a per-task discovery loop. If this managed capability is absent, report the precise unavailable capability; do not borrow a personal interpreter or install packages into a live runtime. A successful helper receipt proves generation and extraction only. Native attachment, independent visual review and requester-bound return are still required.
+
 ## Procedure
 
 1. **Inspect first.** Run `pdf_read.py file.pdf --meta`. Check `encrypted` (if true, decrypt first with `pdf_secure.py --decrypt`) and `likely_scanned_pages`. If pages are image-only, export them with `pdf_page_image.py --pages <scanned> --dpi 300 --out-dir imgs/` and hand the PNGs to the `references/ocr-extraction.md` skill — do not report empty text as "no content".

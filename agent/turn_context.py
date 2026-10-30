@@ -7,6 +7,7 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 ``build_api_messages`` builds the wire copy for one API call."""
 
 from __future__ import annotations
+from hermes_cli.direct_turn_timing import timed, timed_call
 
 import logging
 import sys
@@ -807,7 +808,7 @@ def _collect_pre_llm_call_context(
         return ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = timed_call("pre_llm_hook", _invoke_hook,
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,

@@ -879,3 +879,22 @@ __all__ = [
     "platform_hint",
     "restore_plugin_prompt_sections",
 ]
+
+
+def stored_prompt_date_stale(prompt: str) -> bool:
+    """True when a persisted prompt's date anchor is not today's local date.
+
+    Long-lived app sessions reuse the stored prompt verbatim for prefix-cache
+    reuse, which froze ``Conversation started:`` at the session's birth day, so
+    the model resolved "today" to that day (Jennifer filed an Oct 22 "today"
+    event on Oct 21). A prompt is current when its ``Today's date`` line, or its
+    single ``Conversation started`` line, names today in the configured zone.
+    Timeless prompts (no date line) are never stale.
+    """
+    from hermes_time import now as _hermes_now, safe_strftime
+    lines = [l for l in (prompt or "").splitlines()
+             if l.startswith("Conversation started: ") or l.startswith("Today's date (as of")]
+    if not lines:
+        return False
+    today = safe_strftime(_hermes_now(), "%A, %B %d, %Y")
+    return today not in lines[-1]

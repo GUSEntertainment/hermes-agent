@@ -201,11 +201,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            delivery_policy TEXT NOT NULL DEFAULT 'at_least_once',
+            logical_message_id TEXT,
+            recipient_key TEXT,
+            message_kind TEXT NOT NULL DEFAULT 'text'
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
-        add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    for name, ddl in {"adapter_profile": "TEXT", "delivery_policy": "TEXT NOT NULL DEFAULT 'at_least_once'", "logical_message_id": "TEXT", "recipient_key": "TEXT", "message_kind": "TEXT NOT NULL DEFAULT 'text'"}.items():
+        add_column_if_missing(conn, "delivery_obligations", name, f"{name} {ddl}")
 
 
 def _transaction():
@@ -267,19 +271,47 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
-def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+def canonical_recipient(platform: str, chat_id: Any) -> str:
+    """Canonical recipient identity shared with Photon Python/Node guards."""
+    target = str(chat_id or "").strip()
+    if str(platform or "").strip().lower() != "photon":
+        return target
+    parts = target.split(";", 2)
+    if len(parts) == 3 and parts[0].lower() in {"any", "imessage", "sms"} and parts[1] == "-":
+        return f"dm:{parts[2].strip().lower()}"
+    if target.lower().startswith("dm:"):
+        return f"dm:{target[3:].strip().lower()}"
+    if target.startswith("+") or "@" in target:
+        return f"dm:{target.lower()}"
+    return target
+
+def record_obligation(
+    *,
+    obligation_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    content: str,
+    adapter_profile: Optional[str] = None,
+    logical_message_id: Optional[str] = None,
+    message_kind: str = "text",
+) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
+    policy = "photon_single_send" if platform.strip().lower() == "photon" else "at_least_once"
+    logical_id = str(logical_message_id or obligation_id)
+    recipient = canonical_recipient(platform, chat_id)
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, delivery_policy,
+                logical_message_id, recipient_key, message_kind)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default", policy, logical_id, recipient, str(message_kind or "text")))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -306,7 +338,6 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
              session_key, content, since))
 
-
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
@@ -317,6 +348,10 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def mark_delivery_unknown(obligation_id: str, error: str = "") -> None:
+    _update_state(obligation_id, "delivery_unknown", error=error)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -391,12 +426,13 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at, delivery_policy, logical_message_id, recipient_key, message_kind
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+             delivery_policy, logical_message_id, recipient_key, message_kind) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -422,7 +458,28 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
-                        "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
+                        "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "logical_message_id": logical_message_id or oid,
+                        "recipient_key": recipient_key or canonical_recipient(platform, chat_id),
+                        "message_kind": message_kind or "text"})
+                continue
+            common = {
+                "obligation_id": oid, "session_key": session_key,
+                "platform": platform, "profile": adapter_profile,
+                "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                "logical_message_id": logical_message_id or oid,
+                "recipient_key": recipient_key or canonical_recipient(platform, chat_id),
+                "message_kind": message_kind or "text",
+            }
+            if delivery_policy == "photon_single_send" and state in {"attempting", "failed"}:
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='delivery_unknown', owner_pid=?, owner_started_at=?, updated_at=?
+                       WHERE obligation_id=? AND state=? AND (owner_pid IS ? OR owner_pid=?)""",
+                    (pid, started, now, oid, state, owner_pid, owner_pid),
+                )
+                if cursor.rowcount:
+                    claimed.append({**common, "needs_marker": False, "suppress_send": True, "attempts": attempts})
                 continue
             # Every claim starts a send, so the row leaves 'pending'/'failed' for 'attempting' in the same
             # CAS: a boot killed inside the redelivery then leaves proof the platform may have it (next boot
@@ -442,7 +499,9 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # the marker.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default",
-                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row))
+                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row) | {"logical_message_id": logical_message_id or oid,
+                                            "recipient_key": recipient_key or canonical_recipient(platform, chat_id),
+                                            "message_kind": message_kind or "text", "suppress_send": False})
     return claimed
 
 
@@ -467,11 +526,12 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile, updated_at
+                      owner_started_at, last_error, adapter_profile, updated_at, delivery_policy, logical_message_id, recipient_key, message_kind
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+             owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
+             delivery_policy, logical_message_id, recipient_key, message_kind) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
                 continue
@@ -479,6 +539,26 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if due is None:
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
+            if delivery_policy == "photon_single_send":
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='delivery_unknown', updated_at=?
+                       WHERE obligation_id=? AND state='failed'
+                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                    owner_guard,
+                )
+                if cursor.rowcount:
+                    claimed.append({
+                        "obligation_id": oid, "session_key": session_key,
+                        "platform": row_platform, "profile": adapter_profile,
+                        "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                        "needs_marker": False, "suppress_send": True,
+                        "runtime_recovery": True, "attempts": attempts,
+                        "logical_message_id": logical_message_id or oid,
+                        "recipient_key": recipient_key or canonical_recipient(row_platform, chat_id),
+                        "message_kind": message_kind or "text",
+                    })
+                continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
@@ -501,7 +581,9 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # claim released unsent keeps its flood retry eligibility.
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                                            flood=is_flood_error(last_error), last_error=last_error) | {"logical_message_id": logical_message_id or oid,
+                                            "recipient_key": recipient_key or canonical_recipient(row_platform, chat_id),
+                                            "message_kind": message_kind or "text", "suppress_send": False})
     return claimed
 
 
@@ -538,7 +620,7 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE state IN ('delivered', 'abandoned', 'delivery_unknown') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
@@ -562,3 +644,32 @@ def ledger_enabled(config: Optional[dict[str, Any]] = None) -> bool:
         return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
     except Exception:
         return True
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import json  # noqa: F401,E402
+
+def debug_rows(limit: int = 20) -> str:
+    """Human-readable dump for ad-hoc inspection (sqlite3-free path)."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, state, attempts,
+                      created_at, updated_at, last_error
+               FROM delivery_obligations
+               ORDER BY updated_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return json.dumps(
+        [
+            {
+                "id": r[0], "session": r[1], "state": r[2], "attempts": r[3],
+                "created_at": r[4], "updated_at": r[5], "last_error": r[6],
+            }
+            for r in rows
+        ],
+        indent=2,
+    )
+# ---- END PLUGIN-COMPAT ----

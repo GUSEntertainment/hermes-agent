@@ -871,7 +871,7 @@ class TestFinishedHandleRelease:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
-    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
+    def test_spawn_local_merges_ordinary_background_env_and_strips_secrets(self, registry):
         captured = {}
 
         def fake_popen(cmd, **kwargs):
@@ -893,6 +893,7 @@ class TestSpawnEnvSanitization:
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("tools.environments.local._resolve_hermes_bin_dir", return_value=None), \
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
@@ -907,11 +908,53 @@ class TestSpawnEnvSanitization:
             )
 
         env = captured["env"]
+        assert env["PATH"] == "/usr/bin:/bin"
+        assert env["HOME"] == "/home/user"
+        assert env["USER"] == "tester"
         assert env["MY_CUSTOM_VAR"] == "keep-me"
         assert env["TELEGRAM_BOT_TOKEN"] == "forced-bot-token"
         assert "FIRECRAWL_API_KEY" not in env
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_spawn_local_replaces_parent_env_for_confined_background(self, registry):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+        confined_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/workspace/.hermes-terminal-home",
+            "TMPDIR": "/workspace/.hermes-tmp",
+        }
+
+        with patch.dict(os.environ, {
+            "PATH": "/host/bin",
+            "HOME": "/home/operator",
+            "PARENT_SECRET_CANARY": "must-not-leak",
+        }, clear=True), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local(
+                "echo hello",
+                cwd="/tmp",
+                env_vars=confined_env,
+                replace_env=True,
+            )
+
+        assert captured["env"] == {**confined_env, "PYTHONUNBUFFERED": "1"}
+
+
 
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:
