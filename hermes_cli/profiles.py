@@ -1155,10 +1155,49 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
     if not multiplex:
         return [(active, get_profile_dir(active))]
     serve: list[tuple[str, Path]] = [("default", default)]
+    allow = _margot_multiplex_allowlist(default)
     serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
                  if (include_standalone or not profile_is_standalone(entry))
-                 and (include_parked or not profile_is_parked(entry)))
+                 and (include_parked or not profile_is_parked(entry))
+                 and (include_standalone or allow is None or entry.name in allow))
     return serve
+
+
+def _margot_multiplex_allowlist(default_home: Path) -> Optional[frozenset]:
+    """Margot topology (t_eb74dc48): the default gateway multiplexes ONLY the profiles named in the
+    default home's ``multiplex_profile_allowlist`` (top level or under ``gateway:``). Upstream
+    removed the key (9848e22, "serve every profile"), but this install runs most profiles in their
+    own supervised listeners; serving them all from the host collides with those owners. Absent or
+    malformed key => upstream behaviour (serve every profile)."""
+    from hermes_yaml import YAMLError
+    from utils import file_signature
+    import hermes_yaml as yaml
+
+    path = Path(default_home) / "config.yaml"
+    try:
+        signature = file_signature(path.stat())
+    except OSError:
+        return None
+    cached = _MARGOT_ALLOWLIST_CACHE.get(str(path))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    value: Optional[frozenset] = None
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        if isinstance(raw, dict):
+            entries = raw.get("multiplex_profile_allowlist")
+            gw = raw.get("gateway")
+            if entries is None and isinstance(gw, dict):
+                entries = gw.get("multiplex_profile_allowlist")
+            if isinstance(entries, list) and all(isinstance(e, str) for e in entries):
+                value = frozenset(e.strip() for e in entries if e.strip())
+    except (OSError, UnicodeError, YAMLError):
+        value = None
+    _MARGOT_ALLOWLIST_CACHE[str(path)] = (signature, value)
+    return value
+
+
+_MARGOT_ALLOWLIST_CACHE: dict = {}
 
 
 def _resolve_clone_source(clone_from: Optional[str]) -> Path:
