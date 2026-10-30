@@ -18,7 +18,17 @@ def scope() -> tuple[str | None, str | None] | None:
 
 def remote_required() -> bool:
     current = scope()
-    return current is not None and (current[1] != 'chris' or current[0] in {'connor', 'josh', 'joshgarcia'})
+    return current is not None and (current[1] != 'chris' or current[0] in _member_profiles())
+
+
+def _member_profiles():
+    # t_10f94d4e: registered members are first-class, not a hardcoded trio.
+    try:
+        from gateway.member_registry import members
+        names = set(members())
+    except Exception:
+        names = set()
+    return names | {'connor', 'josh', 'joshgarcia'}
 
 
 def terminal_environment() -> dict[str, str] | None:
@@ -26,7 +36,7 @@ def terminal_environment() -> dict[str, str] | None:
     if current is None or not remote_required():
         return None
     profile, principal = current
-    if profile not in {'connor', 'josh', 'joshgarcia'} or principal not in {profile, 'chris'}:
+    if profile not in _member_profiles() or principal not in {profile, 'chris'}:
         raise PermissionError('Caller-scoped terminal unavailable')
     from hermes_constants import get_hermes_home
     home = Path(get_hermes_home())
@@ -78,20 +88,43 @@ HOST_SIDE_TOOLS = frozenset({
 })
 
 
+def _own_mcp_servers() -> set:
+    """MCP servers declared in the current member profile's config, limited to
+    owner-pinned ones (name prefixed with the owner's short id, e.g. josh_*)."""
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        home = Path(get_hermes_home())
+        cfg = yaml.safe_load((home / 'config.yaml').read_text()) or {}
+        names = set((cfg.get('mcp_servers') or {}).keys())
+        owner = home.name.split('-')[0].replace('garcia', '')
+        if home.name.startswith('josh') or home.name == 'app-gus-joshgarcia-margot':
+            owner = 'josh'
+        else:
+            from gateway.member_registry import owner_of_profile, members
+            p = owner_of_profile(home.name)
+            if p:
+                owner = members()[p].get('short') or p
+        return {n for n in names if owner and n.startswith(owner + '_')}
+    except Exception:
+        return set()
+
+
 def tool_allowed(name: str) -> bool:
     if not remote_required():
         return True
-    if name in {'own_work_show', 'own_work_manage', 'own_work_comment', 'own_work_list'}:
+    if name in {'own_work_show', 'own_work_manage', 'own_work_comment', 'own_work_list', 'own_agent_equip'}:
         # These handlers resolve a fresh generic enrolled member grant. A
         # legacy member with the normal catalog need not enter the pilot.
         from gateway.member_board_tools import enabled
         return enabled()
-    if name in {'own_work_create', 'own_agents_list', 'own_agent_propose', 'own_agent_confirm'}:
+    if name in {'own_work_create', 'own_agents_list', 'own_agent_propose', 'own_agent_confirm', 'own_agent_update'}:
         from gateway.owner_delegation import available
         return available()
     # Owner-native handlers already enforce their own enrolled board/device
     # boundary. Admit only the exact current pilot grant, not generic host tools.
-    if name in {'josh_task_status', 'owner_computer',
+    if name in {'josh_task_status', 'owner_computer', 'owner_google',
                 'owner_secure_intake', 'owner_password_reset'}:
         current = scope()
         if current is None or current[0] != current[1]:
@@ -106,10 +139,14 @@ def tool_allowed(name: str) -> bool:
     if name.startswith('mcp__'):
         # MCP backends are ambient host processes. Only independently scoped
         # GBrain is admitted here; other connectors need explicit scoped review.
-        return name.startswith(('mcp__gbrain__', 'mcp__gbrain_business__', 'mcp__gbrain_private__', 'mcp__gbrain_family__'))
+        if name.startswith(('mcp__gbrain__', 'mcp__gbrain_business__', 'mcp__gbrain_private__', 'mcp__gbrain_family__')):
+            return True
+        # The owner's own operator-provisioned connectors (owner-pinned Google,
+        # per-owner GBrain) live in this member profile's own config; admit them.
+        return name.split('__')[1] in _own_mcp_servers() if name.count('__') >= 2 else False
     if name in {'terminal', 'read_file', 'write_file', 'patch', 'search_files', 'execute_code'}:
         try:
             return terminal_environment() is not None
         except PermissionError:
             return False
-    return name in {'web_search', 'web_extract', 'todo', 'tool_search', 'tool_describe', 'tool_call'}
+    return name in {'web_search', 'web_extract', 'todo', 'todo_list', 'tool_search', 'tool_describe', 'tool_call'}

@@ -198,6 +198,14 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "needs_from_chris": _prop("string", (
+                "One plain-English sentence naming the single action Chris must take "
+                "(e.g. 'Enter your bank country in Etsy'). No ids, paths, pids, model "
+                "names or comment numbers. Leave EMPTY when an agent/Margot/owner can "
+                "fix it (tool error, routing, reassignment, executor bug, budget, "
+                "worker overlap) -- the card then routes back to agents, not Chris."
+        )),
+        "needs_link": _prop("string", "Optional http(s) link Chris needs for that action."),
     },
     ["reason"],
 )
@@ -245,6 +253,14 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional reviewer profile. When provided, the task is "
                 "reassigned to that profile before review dispatch."
         )),
+        "needs_from_chris": _prop("string", (
+                "One plain-English sentence naming the single action Chris must take "
+                "(e.g. 'Enter your bank country in Etsy'). No ids, paths, pids, model "
+                "names or comment numbers. Leave EMPTY when an agent/Margot/owner can "
+                "fix it (tool error, routing, reassignment, executor bug, budget, "
+                "worker overlap) -- the card then routes back to agents, not Chris."
+        )),
+        "needs_link": _prop("string", "Optional http(s) link Chris needs for that action."),
         "metadata": {
             "type": "object",
             "description": (

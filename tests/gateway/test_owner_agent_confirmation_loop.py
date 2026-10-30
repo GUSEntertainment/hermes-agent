@@ -51,6 +51,11 @@ def _transport_enrollment(enrolled, monkeypatch):  # noqa: F811
     from plugins.platforms.photon.secure_intake import canonical_enrollment as ce
     owners = {SENDER: 'joshgarcia', '+15550000002': 'joshgarcia', '+15550000009': 'connor'}
     monkeypatch.setattr(ce, 'canonical_transport_enrollment', lambda identity: {'owner': owners[identity['sender']]})
+    # Josh's independent reviewer is his enrolled Margot profile (fail-closed if absent).
+    from gateway import owner_delegation as work
+    profile = work.ROOT / 'profiles' / work.enrollment('joshgarcia')['profile']
+    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (profile / 'config.yaml').write_text('model: {}\n'); (profile / 'config.yaml').chmod(0o600)
 
 
 def _seed_amanda(root):

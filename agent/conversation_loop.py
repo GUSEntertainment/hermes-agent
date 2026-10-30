@@ -868,18 +868,6 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 persist_tools=True,
             )
             return
-        from agent.system_prompt import stored_prompt_date_stale as _date_stale
-        if _date_stale(stored_prompt):
-            # Local day rolled over since this prompt was stored: rebuild once so the
-            # model sees today's date, then persist so later turns today reuse it.
-            logger.info("Stored system prompt for session %s is from a previous day; rebuilding date anchor.", agent.session_id)
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
-            if agent._session_db:
-                try:
-                    agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
-                except Exception as exc:
-                    logger.warning("Session DB update_system_prompt failed after date rollover (session=%s): %s", agent.session_id, exc)
-            return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt

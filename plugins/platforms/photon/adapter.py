@@ -1336,6 +1336,9 @@ class PhotonAdapter(BasePlatformAdapter):
             from .continuation import pending_current
             if await asyncio.to_thread(pending_current):
                 content = "I’m checking your request."
+        if content and "&" in content:
+            import html as _html, re as _re
+            content = _re.sub(r"&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]{2,8});", lambda m: _html.unescape(m.group(0)), content)
         return await self._sidecar_send(
             chat_id, self.format_message(content), logical_message_id=logical_id,
             reply_to=reply_to,

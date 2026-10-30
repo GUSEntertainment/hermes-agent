@@ -7,7 +7,7 @@ import importlib.util,sys,json,hashlib
 ROOT=Path('/Users/Chris/.hermes')
 REGISTRY=Path('/Users/Chris/.openclaw/workspace/Agent-Shared/roles/role-registry.yaml')
 HELPER=Path(__file__).resolve().parents[1]/'scripts/safe_delegate_card.py'
-HELPER_SHA256 = '81af6fb0e26bb9bfdae797d074d8366bfb6fa2adda38d186e614441778e4d03a'
+HELPER_SHA256 = 'd90caa21239978ed96b58c693b8c9bd28a642585ef8c351874f3fece899c5ebf'
 
 def enrollment(profile):
     from gateway.app_business_authority import canonical_enrollment

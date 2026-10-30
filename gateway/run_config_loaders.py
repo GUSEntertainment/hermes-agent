@@ -16,27 +16,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from gateway.config import Platform
-
-_PEER_BOT_CHATS_CACHE: Optional[frozenset] = None
-
-
-def _peer_bot_chat_ids() -> frozenset:
-    """Chat ids listed under config ``peer_bot_chats`` (read once per process)."""
-    global _PEER_BOT_CHATS_CACHE
-    if _PEER_BOT_CHATS_CACHE is None:
-        ids = set()
-        try:
-            import yaml
-            home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-            with open(os.path.join(home, "config.yaml")) as f:
-                cfg = yaml.safe_load(f) or {}
-            for row in cfg.get("peer_bot_chats") or []:
-                if isinstance(row, dict) and row.get("chat_id"):
-                    ids.add(str(row["chat_id"]))
-        except Exception:
-            pass
-        _PEER_BOT_CHATS_CACHE = frozenset(ids)
-    return _PEER_BOT_CHATS_CACHE
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -378,14 +357,6 @@ class GatewayConfigLoadersMixin:
 
     def _effective_busy_mode(self, source: SessionSource, attr: str) -> str:
         """Busy mode from the routed profile snapshot (``attr``: ``_busy_input_mode`` / ``_busy_text_mode``)."""
-        # Margot local: agent-to-agent peer groups queue instead of interrupting, so rapid
-        # bot chatter can't cancel an in-flight reply on every attempt.
-        try:
-            from gateway.run_config_loaders import _peer_bot_chat_ids
-            if str(getattr(source, "chat_id", "")) in _peer_bot_chat_ids():
-                return "queue"
-        except Exception:
-            pass
         fallback = getattr(self, attr, "interrupt")
         profile_name = self._busy_profile_name_for_source(source)
         if not profile_name:

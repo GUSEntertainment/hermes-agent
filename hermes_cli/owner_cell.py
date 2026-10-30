@@ -89,6 +89,7 @@ def _regular_file_sha256(path: str | Path) -> str:
         os.close(fd)
 
 
+
 def normalize_digest(value: object) -> str:
     """Canonical bare lowercase sha256 hex; accepts an optional 'sha256:' prefix."""
     text = str(value or "").strip()
@@ -1454,7 +1455,14 @@ def assert_mutation_fresh(conn: Any, task_id: str, lease_token: str, *, expected
 
 def assert_realm_access(conn: Any, task_id: str, security_realm: str, runtime_profile: str) -> None:
     row = goal_projection(conn, task_id)
-    if row["security_realm"] != security_realm or row["runtime_profile"] != runtime_profile:
+    # Realm is the privacy wall and must match exactly. The runtime may be any
+    # profile already bound to this same goal (maker, runtime, or its bound
+    # reviewer); a drifted runtime field must not deadlock the owner's card.
+    keys = row.keys() if hasattr(row, "keys") else ()
+    bound = {row[k] for k in ("runtime_profile", "owner_profile",
+                              "required_reviewer_profile", "reviewer_profile")
+             if k in keys and row[k]}
+    if row["security_realm"] != security_realm or runtime_profile not in bound:
         raise OwnerCellGuardError("privacy realm/runtime access rejected")
 
 

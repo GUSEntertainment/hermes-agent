@@ -68,7 +68,54 @@ def is_workspace_confinement_enabled() -> bool:
         return False
 
 
+
+def _ava_shared_read_roots() -> tuple[Path, ...]:
+    """Chris (2026-10-11): workers must be able to READ the files they need.
+    Read-only, never write. Owner-private profiles (Josh/Connor) only get their own areas."""
+    home = Path.home()
+    prof = ""
+    try:
+        prof = str(_active_profile_name() or "")
+    except Exception:
+        pass
+    owner = None
+    for o in ("josh", "connor"):
+        if prof.startswith(o):
+            owner = o
+    if owner == "josh":
+        cands = [home / ".hermes/profiles/joshgarcia/hook_outputs", home / ".hermes/kanban/boards/josh-home/workspaces"]
+    elif owner == "connor":
+        cands = [home / ".hermes/profiles/connor/hook_outputs", home / ".hermes/kanban/boards/connor-home/workspaces"]
+    else:
+        cands = [home / "projects", home / ".openclaw/workspace", home / ".hermes/kanban/boards",
+                 home / ".hermes/skills", home / ".hermes/scripts", home / ".hermes/logs",
+                 home / "Documents", home / "Downloads", home / "Desktop"]
+    out = []
+    for c in cands:
+        try:
+            r = c.resolve(strict=True)
+            if r.is_dir():
+                out.append(r)
+        except OSError:
+            pass
+    return tuple(out)
+
+
 def configured_read_only_roots() -> tuple[Path, ...]:
+    base = _configured_read_only_roots_base()
+    if not base and not _confinement_contract_present():
+        return base
+    return tuple(dict.fromkeys((*base, *_ava_shared_read_roots())))
+
+
+def _confinement_contract_present() -> bool:
+    try:
+        from agent.private_worker_mode import get_authenticated_worker_contract
+        return bool(get_authenticated_worker_contract())
+    except Exception:
+        return False
+
+def _configured_read_only_roots_base() -> tuple[Path, ...]:
     """Return identity-pinned roots from trusted project/runtime provenance."""
     from agent.private_worker_mode import get_authenticated_worker_contract
     contract = get_authenticated_worker_contract()

@@ -559,6 +559,18 @@ def locate_skill(name: str, local_category_name: Optional[str], roots):
                 hint="Inspect the skill in the repo checkout, or untrust the repo with "
                 "`hermes skills untrust`."), None, None
     if not skill_md or not skill_md.exists():
+        # Chris 2026-10-11: agents pick up a missing skill from the shared library
+        # on the spot instead of blocking. Shared library = ~/.hermes/skills.
+        try:
+            _lib = Path.home() / ".hermes" / "skills"
+            _bare = str(name).strip("/").split("/")[-1]
+            _hits = [m for m in _lib.rglob("SKILL.md")
+                     if m.parent.name == _bare and not any(x.startswith(".") for x in m.relative_to(_lib).parts)]
+            if len(_hits) == 1:
+                logger.info("Skill '%s' not in profile; loaded on demand from shared library %s", name, _hits[0])
+                return None, _hits[0].parent, _hits[0]
+        except Exception as _e:  # never let the fallback break normal lookup
+            logger.debug("shared-library skill fallback failed for %s: %s", name, _e)
         available = [s["name"] for s in sort_skills(find_all_skills())[:20]]
         return _fail(f"Skill '{name}' not found.", available_skills=available,
                      hint="Use skills_list to see all available skills"), None, None
@@ -623,12 +635,12 @@ def skill_view(
         if not skill_matches_platform(frontmatter):
             return _fail(f"Skill '{name}' is not supported on this platform.", readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
         resolved_name = frontmatter.get("name", skill_md.parent.name)
-        # Disabled by declared name, or by the exact path that IS this copy's load name (a same-tier
-        # duplicate's row) — whatever alias reached it; an unrelated copy at that path elsewhere is not.
+        # Disabled entries stay out of discovery; explicit loads are on demand.
+        # Keep HEAD's exact-copy matching for aliases and duplicate skills.
         rel = _owned_relative(skill_dir, skill_md, all_dirs)
         if _is_skill_disabled(resolved_name, rel) and (_is_skill_disabled(resolved_name) or any(
                 e["path"] == skill_md and e["load_name"] == rel for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
-            return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
+            logger.info("Skill '%s' is off this profile's list; loading on demand", resolved_name)
         if file_path and skill_dir:
             return _serve_skill_file(
                 skill_dir, file_path, name, list_available=True, mark_read=True,

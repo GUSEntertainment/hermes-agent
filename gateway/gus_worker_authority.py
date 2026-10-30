@@ -11,7 +11,10 @@ from pathlib import Path
 
 REGISTRY = Path('/Users/Chris/.openclaw/workspace/Agent-Shared/roles/role-registry.yaml')
 ROOT = Path('/Users/Chris/.hermes')
-EXCLUDED = frozenset({'default', 'chris', 'connor', 'josh', 'joshgarcia', 'julia', 'family-eliana'})
+# t_9ac68588 (Chris 2026-10-21): no global do-not-run list. Board ownership is
+# the privacy wall: a worker is admitted on a board because that board's owner
+# enrolled it (Chris's canonical roster here for GUS/Chris boards; the member
+# enrollment path in member_worker_policy for member boards).
 
 
 def protected(path, anchor=None):
@@ -52,7 +55,66 @@ def enrolled_profiles(registry=REGISTRY, anchor=None):
         names.extend(values)
     if not isinstance(canonical, list) or any(not isinstance(n, str) for n in names + canonical):
         raise PermissionError('Invalid GUS worker registry')
-    return (set(names) & set(canonical)) - EXCLUDED
+    return (set(names) & set(canonical)) | member_owner_workers()
+
+
+# t_65dff1fd (Chris 2026-10-22): an enrolled member owner's own profile and its
+# private owner agents are workers on that owner's board only. Board ownership
+# (member_worker_policy.select) stays the privacy wall; this only installs them.
+# t_10f94d4e: members come from gateway.member_registry, not a hardcoded name.
+class _Boards(dict):
+    def _f(self):
+        from gateway.member_registry import boards
+        return boards()
+    def __contains__(self, k): return k in self._f()
+    def __getitem__(self, k): return self._f()[k]
+    def get(self, k, d=None): return self._f().get(k, d)
+    def items(self): return self._f().items()
+    def keys(self): return self._f().keys()
+    def __iter__(self): return iter(self._f())
+MEMBER_OWNER_BOARDS = _Boards()
+
+
+def owner_agent_binding(profile, root=ROOT):
+    """(owner, board) for an installed member owner/agent profile, else None."""
+    import yaml
+    if not isinstance(profile, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,99}', profile):
+        return None
+    root = Path(root)
+    path = root / 'profiles' / profile / 'config.yaml'
+    try:
+        protected(path, root)
+        config = yaml.safe_load(path.read_text()) or {}
+    except (OSError, PermissionError, ValueError):
+        return None
+    if profile in MEMBER_OWNER_BOARDS:
+        row = config.get('app_business_authority') or {}
+        if row.get('principal') == profile and row.get('board') == MEMBER_OWNER_BOARDS[profile] and row.get('enabled') is True:
+            return profile, row['board']
+        return None
+    binding = config.get('owner_agent')
+    if not isinstance(binding, dict):
+        return None
+    owner, board = binding.get('owner'), binding.get('board')
+    from gateway.member_registry import agent_prefixes
+    if owner in MEMBER_OWNER_BOARDS and MEMBER_OWNER_BOARDS[owner] == board and profile.startswith(agent_prefixes()):
+        return owner, board
+    return None
+
+
+def member_owner_workers(root=ROOT):
+    root = Path(root)
+    from gateway.member_registry import agent_prefixes
+    out = set()
+    try:
+        candidates = [p.name for p in (root / 'profiles').iterdir()]
+    except OSError:
+        return out
+    for name in candidates:
+        if name in MEMBER_OWNER_BOARDS or name.startswith(agent_prefixes()):
+            if owner_agent_binding(name, root):
+                out.add(name)
+    return out
 
 
 def current(*, home=None, env=None, registry=REGISTRY, root=ROOT):
@@ -66,7 +128,7 @@ def current(*, home=None, env=None, registry=REGISTRY, root=ROOT):
     home = Path(get_hermes_home() if home is None else home)
     root = Path(root)
     profile = home.name
-    if (home.parent != root / 'profiles' or profile in EXCLUDED
+    if (home.parent != root / 'profiles'
             or env.get('HERMES_SESSION_SOURCE') != 'kanban'):
         return None
     if profile not in enrolled_profiles(registry, root.parent):
@@ -78,6 +140,9 @@ def current(*, home=None, env=None, registry=REGISTRY, root=ROOT):
         raise PermissionError('GUS worker database override denied')
     board = env.get('HERMES_KANBAN_BOARD', '')
     task_id = env.get('HERMES_KANBAN_TASK', '')
+    member = owner_agent_binding(profile, root)
+    if member is not None and member[1] != board:
+        raise PermissionError('Member worker outside its owner board')
     if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,79}', board) or not re.fullmatch(r't_[A-Za-z0-9_]+', task_id):
         raise PermissionError('Native GUS assignment required')
     db = root / 'kanban.db' if board == 'default' else root / 'kanban' / 'boards' / board / 'kanban.db'

@@ -182,28 +182,6 @@ def _cmd_rm(args) -> None:
         c.print(f"[red]No vault item with handle {args.handle!r}[/]")
 
 
-def _cmd_allow(args) -> None:
-    from agent.vault_store import get_vault_store
-
-    approved = get_vault_store().allow_payment_origin(args.handle, args.origin)
-    _console().print(f"[green]Approved[/] {args.handle} for: {', '.join(approved)} (every fill still asks you to confirm)")
-
-
-def _cmd_dedupe(args) -> None:
-    import shutil
-    import time
-    from agent.vault_store import get_vault_store
-
-    store = get_vault_store()
-    src = store._vault_path
-    if src.exists():
-        backup = src.with_name(f"{src.name}.bak-dedupe-{time.strftime('%Y%m%dT%H%M%S')}")
-        shutil.copy2(src, backup)
-        _console().print(f"Backup: {backup}")
-    res = store.dedupe_payments()
-    _console().print(f"Removed duplicates: {res['removed'] or 'none'}; kept: {res['kept']}")
-
-
 def register_cli(subparser) -> None:
     """Build the ``hermes vault`` argparse tree (called from main.py)."""
     subs = subparser.add_subparsers(dest="vault_action")
@@ -224,14 +202,6 @@ def register_cli(subparser) -> None:
     p_rm = subs.add_parser("rm", help="Remove a vault item by handle")
     p_rm.add_argument("handle", help="Item handle (see `hermes vault list`)")
     p_rm.set_defaults(_vault_handler=_cmd_rm)
-
-    p_allow = subs.add_parser("allow", help="Approve a checkout origin for a saved payment card (each fill still asks you)")
-    p_allow.add_argument("handle", help="Payment item handle (see `hermes vault list`)")
-    p_allow.add_argument("origin", help="Checkout origin, e.g. https://www.paynearme.com")
-    p_allow.set_defaults(_vault_handler=_cmd_allow)
-
-    p_dd = subs.add_parser("dedupe-cards", help="Merge duplicate saved payment cards (keeps a backup)")
-    p_dd.set_defaults(_vault_handler=_cmd_dedupe)
 
     p_src = subs.add_parser("sources", help="Show detected password managers (1Password, Bitwarden); they are on automatically")
     group = p_src.add_mutually_exclusive_group()

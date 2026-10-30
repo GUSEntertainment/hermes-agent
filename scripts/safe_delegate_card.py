@@ -226,52 +226,13 @@ DEFAULT_FORBIDDEN_ACTIONS = [
     "publish",
     "payment",
     "signature",
+    "deploy",
+    "restart",
+    "config",
     "destructive",
     "credential_change",
     "privacy_wall_change",
 ]
-# Chris-requested work may edit config (with backup), deploy, and request
-# restarts through existing mechanisms without re-approval. Real gates above
-# remain. Own processes never self-restart: post the ready restart for Ava.
-DEFAULT_ALLOWED_SIDE_EFFECTS = [
-    "read_only",
-    "local_artifact",
-    "internal_task_update",
-    "config_edit_with_backup",
-    "deploy_via_existing_mechanism",
-    "restart_via_external_activation",
-    "scoped_tool_install",
-]
-# Baseline for anyone other than Chris, and for private lanes (family,
-# legal, talent): the old conservative defaults stay.
-BASELINE_ALLOWED_SIDE_EFFECTS = ["read_only", "local_artifact", "internal_task_update"]
-BASELINE_EXTRA_FORBIDDEN = ["deploy", "restart", "config"]
-BROAD_DEFAULT_REQUESTERS = frozenset({"chris"})
-BROAD_DEFAULT_PRIVACY_TIERS = frozenset({"team", "normal", ""})
-PRIVATE_DEPARTMENTS = frozenset({"personal_family", "legal_compliance"})
-_HOLD_TO_SIDE_EFFECT = {
-    "deploy": "deploy_via_existing_mechanism",
-    "restart": "restart_via_external_activation",
-    "config": "config_edit_with_backup",
-    "install": "scoped_tool_install",
-}
-
-
-def broad_defaults_apply(route) -> bool:
-    """Chris's standing authorization (t_9add3e3d) covers his own team-lane work only."""
-    return (
-        (route.requesting_user or "") in BROAD_DEFAULT_REQUESTERS
-        and (route.privacy_tier or "") in BROAD_DEFAULT_PRIVACY_TIERS
-        and route.department_id not in PRIVATE_DEPARTMENTS
-    )
-
-
-def default_side_effect_policy(route) -> tuple[list[str], list[str]]:
-    if broad_defaults_apply(route):
-        return list(DEFAULT_ALLOWED_SIDE_EFFECTS), list(DEFAULT_FORBIDDEN_ACTIONS)
-    return list(BASELINE_ALLOWED_SIDE_EFFECTS), list(DEFAULT_FORBIDDEN_ACTIONS) + BASELINE_EXTRA_FORBIDDEN
-
-
 REVIEWER_FALLBACK_ORDER = ("claire", "default", "claude-review")
 PRODUCER_KINDS = {
     "model",
@@ -1493,12 +1454,7 @@ def build_delegation_package(args: argparse.Namespace, route: ResolvedRoute) -> 
             f"legal, finance, production, or personnel actions; unrecognized={unknown_gates}"
         )
     allowed_toolsets = csv_values(args.allowed_toolset) or DEFAULT_ALLOWED_TOOLSETS
-    default_allowed, default_forbidden = default_side_effect_policy(route)
-    # Explicit holds ADD restrictions; they never erase the real gates.
-    forbidden_actions = list(default_forbidden)
-    for hold in csv_values(args.forbidden_action) or []:
-        if hold not in forbidden_actions:
-            forbidden_actions.append(hold)
+    forbidden_actions = list(csv_values(args.forbidden_action) or DEFAULT_FORBIDDEN_ACTIONS)
     if route.department_id == "legal_compliance":
         for forbidden in (
             "external_send",
@@ -1545,10 +1501,7 @@ def build_delegation_package(args: argparse.Namespace, route: ResolvedRoute) -> 
         for field in ("exact_action", "risk_cost_summary", "resume_target")
     ):
         raise ValueError("approval-shaped fields are valid only for decision-class packages")
-    allowed_side_effects = csv_values(args.allowed_side_effect) or default_allowed
-    # Explicit holds always win over the broad defaults.
-    allowed_side_effects = [e for e in allowed_side_effects
-                            if not any(_HOLD_TO_SIDE_EFFECT.get(h) == e for h in forbidden_actions)]
+    allowed_side_effects = csv_values(args.allowed_side_effect) or ["read_only", "local_artifact", "internal_task_update"]
     package_id = package_id_for(args, route)
     duplicate_check = args.duplicate_check or f"kanban board={route.board} idempotency_key={args.idempotency_key or package_id}"
 

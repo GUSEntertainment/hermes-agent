@@ -1075,7 +1075,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_PROFILE") not in {"claire", "scarlett", "steven", "riley", "lauren", "grace", "quinn"}:
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:

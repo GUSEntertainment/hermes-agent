@@ -7,6 +7,10 @@ owner grant. The existing authenticated FD and OS/file sandbox remain authority.
 import copy,json,re,sqlite3
 from pathlib import Path
 ROOT=Path('/Users/Chris/.hermes')
+# t_82ea5042: exact legacy native boards whose owner predates the protected
+# member catalog. Exact slug -> owner only; no prefix/alias, unknown boards stay
+# denied, and a member/catalog claim on the slug still takes precedence.
+LEGACY_OWNER_BOARDS={'chris':'chris'}
 TOOLSETS=('terminal','file','kanban','worker_skills','todo','delegation')
 VERSION='gus-member-workspace/v1'
 PRIVATE_VERSION='owner-private-action-workspace/v1'
@@ -15,7 +19,12 @@ PRIVATE_VERSION='owner-private-action-workspace/v1'
 # their profile declares. Workspace-confined; no MCP, memory, shared history,
 # terminal network, host browser profile, private URLs or other owners' data.
 OWNER_AGENT_PROJECTION_VERSION='owner-agent-tools/v1'
-OWNER_AGENT_EXTRA_TOOLSETS={'joshgarcia':('vision','image_gen','browser')}
+# t_10f94d4e: every registered member gets the same owner-agent extras.
+class _Extras(dict):
+    def get(self,k,d=()):
+        from gateway.member_registry import members
+        return ('vision','image_gen','browser') if k in members() else d
+OWNER_AGENT_EXTRA_TOOLSETS=_Extras()
 
 def owner_agent_extras(config,policy):
     if not isinstance(policy,dict) or policy.get('version')!=PRIVATE_VERSION:return ()
@@ -34,6 +43,9 @@ def select(task_id, board, worker, *, root=ROOT):
     from gateway.gus_worker_authority import enrolled_profiles,REGISTRY,protected
     root=Path(root)
     if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,79}',board or ''):raise PermissionError('Canonical native board required')
+    from gateway.gus_worker_authority import owner_agent_binding
+    member=owner_agent_binding(worker,root) if root==ROOT else None
+    if member is not None and member[1]!=board:raise PermissionError('Member worker outside its owner board')
     from gateway.owner_delegation import worker_policy
     delegated_policy = worker_policy(task_id, board, worker)
     if delegated_policy is not None:return delegated_policy
@@ -67,6 +79,10 @@ def select(task_id, board, worker, *, root=ROOT):
     catalog.update(p for _,p in matches)
     if len(catalog)>1:raise PermissionError('Ambiguous member board owner')
     if catalog=={'chris'}:return None
+    if not catalog and root==ROOT and LEGACY_OWNER_BOARDS.get(board)=='chris':
+        from gateway.member_registry import boards as _member_boards
+        if board not in set(_member_boards().values()):return None
+        raise PermissionError('Ambiguous member board owner')
     if not catalog:
         # Existing non-command boards do not gain a member grant here. A deleted
         # canonical member enrollment remains fail-closed for persisted boards.
@@ -105,9 +121,43 @@ def effective_toolsets(config,policy=None):
     return (*TOOLSETS, *(['web'] if 'web' in declared and 'web' not in disabled else []), *owner_agent_extras(config,policy))
 
 
+def member_owner_full(config,policy):
+    """t_65dff1fd: a member owner's own enrolled profile/agent on its own board
+    keeps its full declared toolsets and ONLY its own configured MCP servers."""
+    if not isinstance(policy,dict):return False
+    from gateway.gus_worker_authority import owner_agent_binding,MEMBER_OWNER_BOARDS
+    worker=policy.get('worker');principal=policy.get('principal');board=policy.get('board')
+    if principal not in MEMBER_OWNER_BOARDS or MEMBER_OWNER_BOARDS[principal]!=board:return False
+    return owner_agent_binding(worker)==(principal,board)
+
+def own_mcp_servers(config):
+    servers=config.get('mcp_servers') or {}
+    return {n:c for n,c in servers.items() if isinstance(c,dict) and str(c.get('enabled',True)).lower() not in {'false','0','no','off','none'}}
+
+def full_toolsets(config):
+    declared=(config.get('platform_toolsets') or {}).get('cli') or config.get('toolsets') or []
+    disabled=(config.get('agent') or {}).get('disabled_toolsets', [])
+    out=[t for t in declared if t!='no_mcp' and t not in disabled]
+    for name in own_mcp_servers(config):
+        if name not in out:out.append(name)
+    for t in TOOLSETS:
+        if t not in out:out.append(t)
+    return out
+
 def effective(config,policy):
     if policy is None:return config
     if policy.get('version') not in {VERSION,PRIVATE_VERSION}:raise PermissionError('Unknown member worker policy')
+    if member_owner_full(config,policy):
+        result=copy.deepcopy(config)
+        toolsets=full_toolsets(config)
+        result['toolsets']=list(toolsets)
+        result['platform_toolsets']={'cli':list(toolsets),'kanban':list(toolsets)}
+        result['mcp_servers']=own_mcp_servers(config)
+        result['privacy']={'redact_pii':True}
+        security=result.setdefault('security',{})
+        conf=security.setdefault('workspace_confinement',{})
+        conf.update({'enabled':True,'root_from_task_cwd':True})
+        return result
     result=copy.deepcopy(config)
     toolsets = effective_toolsets(config,policy)
     result['toolsets']=[*toolsets,'no_mcp']
@@ -144,6 +194,14 @@ def allowed_tools():
     from toolsets import resolve_multiple_toolsets
     from agent.delegation_context import is_delegated_child_context
     allowed=set(resolve_multiple_toolsets(contract['toolsets']))
+    if member_owner_full(None,contract.get('member_company_policy')) and not is_delegated_child_context():
+        # Own MCP servers register at runtime; admit their tools and the
+        # deferred-tool bridge that reaches them.
+        from tools.registry import registry as _reg
+        for ts in contract['toolsets']:
+            try:allowed.update(_reg.get_tool_names_for_toolset(ts))
+            except Exception:pass
+        allowed.update({'tool_search','tool_describe','tool_call'})
     if isinstance(contract.get('member_company_policy'),dict) and contract['member_company_policy'].get('version')==PRIVATE_VERSION:
         # Raw CDP/JS-eval could reach file:// or host endpoints; keep page tools.
         allowed-={'browser_cdp','browser_exec'}
@@ -195,7 +253,9 @@ def admission_schema_definitions(toolsets,policy):
     if not isinstance(policy,dict) or policy.get('version')!=PRIVATE_VERSION:
         return get_tool_definitions(enabled_toolsets=toolsets,quiet_mode=True,skip_tool_search_assembly=True)
     verify(policy)
-    if not set(toolsets).issubset(set(TOOLSETS) | {'web'} | set(OWNER_AGENT_EXTRA_TOOLSETS.get(policy.get('principal'),()))):raise PermissionError('Unexpected private admission toolsets')
+    if not set(toolsets).issubset(set(TOOLSETS) | {'web'} | set(OWNER_AGENT_EXTRA_TOOLSETS.get(policy.get('principal'),()))):
+        if not member_owner_full(None,policy):raise PermissionError('Unexpected private admission toolsets')
+        return _compute_tool_definitions(toolsets,quiet_mode=True,skip_tool_search_assembly=True)
     from toolsets import resolve_multiple_toolsets
     allowed=set(resolve_multiple_toolsets(toolsets))
     schemas=_compute_tool_definitions(toolsets,quiet_mode=True,skip_tool_search_assembly=True)

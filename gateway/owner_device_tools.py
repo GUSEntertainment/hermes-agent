@@ -129,3 +129,82 @@ def register():
         schema={'name':TOOL,
         'description':'Run a shell command on your own mapped Mac. Use this to inspect files or operate installed command-line apps on your computer. This is remote command access, not a screen-control driver. Offline devices return unavailable; never substitute the backend computer. Do not automatically retry a timed-out action.',
         'parameters':{'type':'object','properties':{'command':{'type':'string','maxLength':12000},'timeout':{'type':'integer','minimum':1,'maximum':60}},'required':['command'],'additionalProperties':False}})
+
+
+# ---- Owner-pinned Google (Gmail + Calendar) for the authenticated owner ----
+GOOGLE_TOOL = 'owner_google'
+GOOGLE_ROOT = Path('/Users/Chris/.hermes/agent-os/owner-google-mcp')
+
+
+def _google_launcher():
+    from gateway.josh_board_authority import _execution, restricted
+    scope = _execution.get()
+    if not scope or scope[0] != scope[1] or not restricted():
+        raise PermissionError('Authenticated owner required')
+    owner = scope[0]
+    if not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', owner):
+        raise PermissionError('Invalid owner')
+    path = GOOGLE_ROOT / f'run-{owner}.sh'
+    if not path.is_file():
+        raise PermissionError('Google is not connected for this owner')
+    return str(path)
+
+
+def google_enabled():
+    try:
+        _google_launcher()
+        return True
+    except (PermissionError, OSError, ValueError):
+        return False
+
+
+def google_invoke(args, **kwargs):
+    if type(args) is not dict or set(args) - {'action', 'arguments'}:
+        raise ValueError('Only action and arguments are supported')
+    action = args.get('action') or 'google_account_status'
+    params = args.get('arguments') or {}
+    if type(action) is not str or not re.fullmatch(r'[a-z_]{3,60}', action) or type(params) is not dict:
+        raise ValueError('Invalid Google action')
+    launcher = _google_launcher()
+    import select, time
+    p = subprocess.Popen([launcher], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    def send(o):
+        p.stdin.write(json.dumps(o) + '\n'); p.stdin.flush()
+    try:
+        send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'owner_google', 'version': '1'}}})
+        send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        method, rp = ('tools/list', {}) if action == 'list_actions' else ('tools/call', {'name': action, 'arguments': params})
+        send({'jsonrpc': '2.0', 'id': 2, 'method': method, 'params': rp})
+        end = time.time() + 60
+        while time.time() < end:
+            r, _, _ = select.select([p.stdout], [], [], 1)
+            if not r:
+                continue
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get('id') != 2:
+                continue
+            if action == 'list_actions':
+                return json.dumps({t['name']: t.get('inputSchema', {}).get('properties', {}) for t in msg.get('result', {}).get('tools', [])})
+            if 'result' in msg:
+                return '\n'.join(c.get('text', '') for c in msg['result'].get('content', []))
+            return json.dumps(msg.get('error') or msg)
+        return json.dumps({'error': 'Google did not answer in time'})
+    finally:
+        p.kill()
+
+
+def register_google():
+    if not google_enabled():
+        return
+    from tools.registry import registry
+    registry.register(name=GOOGLE_TOOL, toolset='josh_status_pilot', handler=google_invoke,
+        schema={'name': GOOGLE_TOOL,
+        'description': "Use the owner's own connected Google account (Gmail and Google Calendar). action is one of: google_account_status, gmail_search, gmail_read_message, gmail_create_draft, gmail_send, calendar_list_calendars, calendar_list_events, calendar_create_event, calendar_update_event, calendar_delete_event, or list_actions to see every action and its arguments. arguments is the JSON object for that action, e.g. calendar_list_events {\"timeMin\":\"2026-10-22T00:00:00-04:00\",\"timeMax\":\"2026-10-23T00:00:00-04:00\"}. Always call this before saying anything about the owner's email or calendar; never claim Google is not connected without calling google_account_status. Confirm with the owner before the first send or delete.",
+        'parameters': {'type': 'object', 'properties': {'action': {'type': 'string'}, 'arguments': {'type': 'object'}}, 'required': ['action'], 'additionalProperties': False}})

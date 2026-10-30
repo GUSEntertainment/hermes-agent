@@ -478,7 +478,7 @@ def assert_rework_progress(conn, task_id, *, artifact_ref, artifact_digest):
             'Rework artifact digest does not match current file bytes. Recompute the digest '
             'and correct the review binding in this same run; the task remains assigned to you.'
         )
-    if actual_digest == oc.normalize_digest(corrections['artifact_digest']):
+    if actual_digest == corrections['artifact_digest']:
         raise oc.OwnerCellGuardError(
             'Rework artifact is unchanged from the latest rejected version. Continue in this same run: '
             'apply the current review corrections to the controlling source/generator, regenerate '
@@ -675,7 +675,7 @@ def _verify_brief(task, ref, digest):
     if not task.workspace_path or not path.is_relative_to(workspace):
         raise oc.OwnerCellGuardError('brief must be in the assigned task workspace')
     actual = oc._regular_file_sha256(ref)
-    if actual != oc.normalize_digest(digest) or not path.stat().st_size:
+    if actual != digest or not path.stat().st_size:
         raise oc.OwnerCellGuardError('brief bytes do not match the supplied digest or are empty')
     return str(path)
 
@@ -1237,7 +1237,7 @@ def import_fable_wrapper_receipt(conn, task_id, *, parent_task_id, receipt_path,
                 or binding.get('packet_digest') != packet['packet_digest']
                 or receipt.get('manifest_sha256') != binding.get('artifact_digest')
                 or binding.get('artifact_digest') != parent[0]['review_artifact_digest']
-                or not oc.digest_matches(parent[0]['review_artifact_ref'], binding.get)('artifact_digest')):
+                or not oc.digest_matches(parent[0]['review_artifact_ref'], binding.get('artifact_digest'))):
             raise oc.OwnerCellGuardError('external review is not bound to the exact authorized Fable packet and artifact')
         _assert_advisory_binding(conn, parent_task_id, parent[0], binding)
         parent_body = conn.execute('SELECT body FROM tasks WHERE id=?', (parent_task_id,)).fetchone()[0] or ''

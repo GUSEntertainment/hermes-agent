@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from pathlib import Path
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -15,7 +16,7 @@ import sqlite3
 KIND = 'owner-delegation-return-v1'
 ROOT = Path('/Users/Chris/.hermes')
 _ACTIVE = ContextVar('owner_delegation', default=None)
-TOOLS = {'own_work_create', 'own_agents_list', 'own_agent_propose', 'own_agent_confirm'}
+TOOLS = {'own_work_create', 'own_agents_list', 'own_agent_propose', 'own_agent_confirm', 'own_agent_update'}
 
 
 def encode(value):
@@ -82,7 +83,7 @@ def database(board_name=None):
     return ROOT / 'kanban/boards' / board_name / 'kanban.db'
 
 
-def agents(principal=None):
+def agents(principal=None, *, include_legacy=False):
     """Same owner_agents table used by the member sidebar; absent means deny.
 
     Legacy contacts are seeded only by the app's authorized backend resolver.
@@ -92,13 +93,30 @@ def agents(principal=None):
     enrollment(principal)
     with closing(_connect(ROOT / 'agent-os/owner-agents.sqlite')) as conn:
         rows = conn.execute('SELECT id,owner,name,purpose,archivedAt FROM owner_agents WHERE owner=? AND archivedAt IS NULL ORDER BY createdAt,id', (principal,)).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows if include_legacy or principal != 'joshgarcia'
+            or re.fullmatch(r'oa_[a-f0-9]{32}', r['id'])]
 
 
-def agent(identifier, principal=None):
+def owner_reviewer(principal, selected):
+    """Josh's independent review stays with his own enrolled Margot.
+
+    No GUS profile fallback, metadata-selected runtime or new access grant.
+    The existing private worker policy still confines the review to this task.
+    """
+    if principal != 'joshgarcia':
+        return agent('grace' if selected['runtime'] != 'grace' else 'scarlett', principal)
+    authority = enrollment(principal)
+    from gateway.app_business_authority import protected_bytes
+    protected_bytes(ROOT / 'profiles' / authority['profile'] / 'config.yaml', anchor=ROOT)
+    return dict(id='margot', owner=principal, name='Margot',
+                purpose='Review this owner’s delegated work in its private workspace.',
+                archivedAt=None, runtime=authority['profile'])
+
+
+def agent(identifier, principal=None, *, historical=False):
     principal = owner() if principal is None else principal
     authority = enrollment(principal)
-    rows = [r for r in agents(principal) if r['id'] == identifier]
+    rows = [r for r in agents(principal, include_legacy=historical) if r['id'] == identifier]
     if len(rows) != 1 or identifier in {'margot', 'default', principal, 'fable-review'}:
         raise PermissionError('Choose an active agent in your sidebar')
     row = rows[0]
@@ -109,12 +127,29 @@ def agent(identifier, principal=None):
     else:
         raise PermissionError('Invalid sidebar agent')
     from gateway.app_business_authority import protected_bytes
-    raw = protected_bytes(ROOT / 'profiles' / runtime / 'config.yaml', anchor=ROOT)
+    try:
+        raw = protected_bytes(ROOT / 'profiles' / runtime / 'config.yaml', anchor=ROOT)
+    except FileNotFoundError:
+        # Sidebar metadata is already owner-scoped. Provision only in a live,
+        # authenticated owner work request, using the existing private recipe.
+        # Never repair legacy/system profiles or weaken an existing denial.
+        ctx = current()
+        if not identifier.startswith('oa_') or ctx['principal'] != principal or ctx['authority'] != authority:
+            raise PermissionError('Authenticated sidebar owner required')
+        from gateway.owner_agent_creation import _profile_for
+        _profile_for(identifier, row['name'], row['purpose'],
+                     principal=principal, board_name=authority['board'])
+        raw = protected_bytes(ROOT / 'profiles' / runtime / 'config.yaml', anchor=ROOT)
     if identifier.startswith('oa_'):
         import yaml
         config = yaml.safe_load(raw) or {}
         if config.get('owner_agent') != {'owner': principal, 'id': identifier, 'board': authority['board']}:
             raise PermissionError('Private agent ownership changed')
+        try:
+            from gateway.owner_agent_creation import sync_agent_model
+            sync_agent_model(runtime, principal)
+        except Exception:
+            logging.getLogger(__name__).warning('owner agent model sync failed for %s', runtime, exc_info=True)
     return dict(row, runtime=runtime)
 
 
@@ -230,7 +265,7 @@ def create(args, **kwargs):
         if type(args[key]) is not str or not args[key].strip() or len(args[key]) > limit:
             raise ValueError('Bounded work intent required')
     selected = agent(args['agent'])
-    reviewer = agent('grace' if selected['runtime'] != 'grace' else 'scarlett')
+    reviewer = owner_reviewer(principal, selected)
     source = ctx['identity']['message'] if ctx['identity'] else ctx['run']
     key = digest([principal, 'photon' if ctx['identity'] else 'app', source])
     # One substantive source request -> one native card, even after a tool retry.
@@ -283,9 +318,16 @@ def verify_task(conn, task_id):
     actual = Path(next(r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'))
     if actual != database(board_name):
         raise PermissionError('Private delegation board changed')
-    if value['authority'] != authority or agent(value['selected']['id'], principal) != value['selected'] or agent(value['reviewer']['id'], principal) != value['reviewer']:
-        raise PermissionError('Private delegation authority revoked')
     task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+    historical = bool(task and task['status'] in {'done', 'archived'})
+    selected = agent(value['selected']['id'], principal, historical=historical)
+    # Preserve custody/readability of finished pre-policy work, never eligibility
+    # for another GUS execution. Reopening changes status and fails closed.
+    reviewer = (owner_reviewer(principal, selected)
+                if principal == 'joshgarcia' and (not historical or value['reviewer']['id'] == 'margot')
+                else agent(value['reviewer']['id'], principal, historical=historical))
+    if value['authority'] != authority or selected != value['selected'] or reviewer != value['reviewer']:
+        raise PermissionError('Private delegation authority revoked')
     goal = conn.execute('SELECT * FROM owner_cell_goals WHERE task_id=?', (task_id,)).fetchone()
     binding_row = conn.execute('SELECT binding_json FROM task_return_intents WHERE task_id=?', (task_id,)).fetchone()
     if not task or not goal or not binding_row:
@@ -313,6 +355,8 @@ def worker_policy(task, board, worker):
         value, native, goal, binding = verify_task(conn, task)
     principal, board_name = value['authority']['owner'], value['authority']['board']
     maker, reviewer = value['selected']['runtime'], value['reviewer']['runtime']
+    if principal == 'joshgarcia' and (reviewer != principal or not re.fullmatch(r'josh-agent-[a-f0-9]{32}', maker)):
+        raise PermissionError('Josh work requires his own producer and reviewer')
     if worker != native['assignee'] or worker not in {maker, reviewer}:
         raise PermissionError('Private worker assignment changed')
     if worker == reviewer and (goal['phase'] != 'review' or goal['reviewer_profile'] != reviewer):

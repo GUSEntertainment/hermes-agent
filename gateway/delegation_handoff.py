@@ -111,8 +111,15 @@ def session():
     return row[0]
 
 
-def consume(request_sha256):
-    """Atomically bind the token to one request; same request may replay (idempotency)."""
+def consume(request_sha256, board):
+    """Atomically bind the token to one request on one board.
+
+    Re-presenting the same request on the same board is allowed only so the
+    kanban idempotent-replay path can recover the SAME committed task; the
+    kanban transaction (task_return_intents.ensure) refuses any second task
+    carrying this token, so a consumed token can never create another task.
+    """
+    bound_request = _sha(f'{request_sha256}:{board}')
     token = _token()
     if token is None:
         return None
@@ -125,16 +132,18 @@ def consume(request_sha256):
             if row is None or row[2] < time.time():
                 raise PermissionError('Delegation handoff invalid or expired')
             run_id, session_id, _exp, used, bound = row
-            if used is not None and bound != request_sha256:
+            if used is not None and bound != bound_request:
                 raise PermissionError('Delegation handoff already used')
             found = conn.execute('SELECT session_id, binding_json FROM run_bindings WHERE run_id=?', (run_id,)).fetchone()
             if found is None or found[0] != session_id:
                 raise PermissionError('Delegation handoff run binding missing')
             if used is None:
                 conn.execute('UPDATE tokens SET used_at=?, request_sha256=? WHERE token_sha256=?',
-                             (time.time(), request_sha256, digest))
+                             (time.time(), bound_request, digest))
             conn.execute('COMMIT')
         except BaseException:
             conn.execute('ROLLBACK')
             raise
-    return json.loads(found[1])
+    snap = json.loads(found[1])
+    snap['handoff_sha256'] = digest
+    return snap

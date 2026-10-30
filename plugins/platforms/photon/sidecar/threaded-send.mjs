@@ -1,8 +1,19 @@
 import { secureLinkContent } from "./secure-link-content.mjs";
+import { plainOutbound } from "./outbound-plain.mjs";
 // One send attempt, with a reply target resolved only in the destination space.
 export async function sendText(body, deps) {
-  const { spaceId, text, format = "text", logicalMessageId = null, replyTo = null } = body || {};
+  const { spaceId, format = "text", logicalMessageId = null, replyTo = null } = body || {};
+  let { text } = body || {};
   if (!spaceId || typeof text !== "string") throw new TypeError("spaceId and text are required");
+  // Chris's notification rules: finished work or one decision, plain words, no internals.
+  if (process.env.PHOTON_PLAIN_OUTBOUND !== "0") {
+    const plain = plainOutbound(text);
+    if (plain.drop) {
+      console.error(`[photon-sidecar] suppressed outbound (${plain.reason})`);
+      return { id: null, suppressed: plain.reason };
+    }
+    text = plain.text;
+  }
   if (!["text", "markdown"].includes(format)) throw new TypeError("format must be text or markdown");
   const space = await deps.resolveSpace(spaceId);
   const target = await resolveReplyTarget(space, replyTo);

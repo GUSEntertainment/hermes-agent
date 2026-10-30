@@ -237,6 +237,11 @@ def _apply_confined_worker_skill_boundary(tools_to_include: set) -> None:
         tools_to_include.intersection_update(allowed_tools())
 
 
+def TRUSTED_EXTRA_NAMES_SET():
+    from gateway.josh_pilot_tools import TRUSTED_EXTRA_NAMES
+    return TRUSTED_EXTRA_NAMES
+
+
 def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
                          quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
@@ -265,15 +270,24 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
             raise PermissionError("Unexpected Josh toolset request")
         skip_tool_search_assembly = True
         from gateway.josh_pilot_tools import schema_names
-        permitted = schema_names()
-        result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, skip_tool_search_assembly=True)
+        permitted = set(schema_names())
+        from gateway.josh_pilot_tools import TRUSTED_EXTRA_TOOLSETS
+        from gateway.host_tool_authority import tool_allowed as _host_ok
+        result = _compute_tool_definitions(list(enabled_toolsets) + TRUSTED_EXTRA_TOOLSETS, disabled_toolsets, quiet_mode, skip_tool_search_assembly=True)
+        try:
+            from tools.registry import registry as _reg
+            result += [d for d in _compute_tool_definitions([t for t in ('gbrain_josh',) if _reg.get_tool_names_for_toolset(t)], disabled_toolsets, quiet_mode, skip_tool_search_assembly=True)]
+        except Exception:
+            pass
+        _optional = {x['function']['name'] for x in result if x['function']['name'] not in permitted and x['function']['name'].startswith('mcp__gbrain_josh__')}
+        permitted = {n for n in permitted if n not in TRUSTED_EXTRA_NAMES_SET() or _host_ok(n)} | {n for n in _optional if _host_ok(n)}
         # Registry membership is process-global and is not authority: narrow every
         # registration to this run's snapshot. Never widen; missing tools fail closed.
         _extra = {x['function']['name'] for x in result} - permitted
         if _extra:
             logger.warning('Josh toolset: dropped stray tools %s', sorted(_extra))
         result = [x for x in result if x['function']['name'] in permitted]
-        if {x['function']['name'] for x in result} != permitted:
+        if not {n for n in permitted if n not in TRUSTED_EXTRA_NAMES_SET()} <= {x['function']['name'] for x in result}:
             raise PermissionError('Unexpected native owner tools: ' + repr(sorted({x['function']['name'] for x in result} ^ permitted)))
         return result
 
@@ -909,7 +923,7 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         from gateway.member_worker_policy import allowed_tool as member_tool_allowed
         from gateway.josh_board_authority import app_tool_allowed
         from gateway.josh_pilot_tools import pilot_required, allowed_names
-        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names()):
+        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names() and not function_name.startswith('mcp__gbrain_josh__')):
             return tool_error("Tool not admitted for Josh pilot")
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
@@ -976,10 +990,19 @@ def handle_function_call(
     from gateway.josh_board_authority import app_tool_allowed
     from gateway.josh_pilot_tools import pilot_required, TOOL, allowed_names
     try:
-        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names()):
+        if not member_tool_allowed(function_name) or not app_tool_allowed(function_name) or (pilot_required() and function_name not in allowed_names() and not function_name.startswith('mcp__gbrain_josh__')):
             return tool_error("Tool not admitted for Josh pilot")
     except PermissionError:
         return tool_error("Tool not admitted without authenticated Josh authority")
+
+    # Retry course-correction pre-work gate (t_64ae1aaf / t_b338f418 E).
+    try:
+        from hermes_cli.retry_course_correction import prework_gate as _prework_gate
+        _pw = _prework_gate(_LEGACY_TOOL_ALIASES.get(function_name, function_name))
+    except Exception:
+        _pw = None
+    if _pw:
+        return tool_error(_pw)
 
     if (
         _confined_worker_skill_boundary_active()

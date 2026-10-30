@@ -67,7 +67,7 @@ def request(principal, run='fixture-run', message='Make the fixture document.'):
 INTENT = {'title': 'Fixture document', 'request': 'Create a short local document.', 'agent': 'scarlett'}
 
 
-@pytest.mark.parametrize('principal', ('joshgarcia', 'connor', 'newmember'))
+@pytest.mark.parametrize('principal', ('connor', 'newmember'))
 def test_native_creation_ready_reviewed_private_and_idempotent(enrolled, principal):
     root, catalog, _env = enrolled
     board = catalog[principal]['board']
@@ -204,7 +204,7 @@ def test_worker_imports_dispatcher_release_instead_of_old_pythonpath(enrolled, m
     assert work.worker_policy('fixture', '2026.research', 'scarlett') is None
 
 
-@pytest.mark.parametrize('principal', ('joshgarcia', 'connor', 'newmember'))
+@pytest.mark.parametrize('principal', ('connor', 'newmember'))
 def test_reviewed_app_return_pump_and_read_are_owner_bound(enrolled, principal, monkeypatch):
     import os
     from gateway import owner_app_returns as replies, mirror

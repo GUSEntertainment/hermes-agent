@@ -1606,6 +1606,15 @@ class GatewayStartupMixin:
         """Spawn the long-lived supervised background watchers."""
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
+        # Needs-from-Chris asks: one iMessage + Telegram ping per ask (Oct 7
+        # card-clarity spec item 5). Owner gateway only.
+        try:
+            from gateway.run import _hermes_home as _np_home
+            if os.path.realpath(str(_np_home)) == os.path.realpath(os.path.expanduser("~/.hermes")):
+                from gateway import kanban_needs_ping as _needs_ping
+                self._spawn_supervised(lambda: _needs_ping.watcher(self), "kanban_needs_ping_watcher")
+        except Exception:
+            logger.warning("needs ping watcher not started", exc_info=True)
         if self._failed_platforms:
             logger.info(
                 "Starting reconnection watcher for %d failed platform(s): %s",

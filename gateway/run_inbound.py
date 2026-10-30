@@ -1492,6 +1492,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
+        # A reply to a "Waiting on you" ask lands on the card (needs ping,
+        # t_2c12c11b / t_b338f418). After admission: only authorized senders.
+        if not is_internal and getattr(event, "reply_to_message_id", None):
+            try:
+                from gateway import kanban_needs_ping as _needs_ping
+                _np_ack = await _needs_ping.maybe_handle_reply(self, event)
+            except Exception:
+                logger.warning("needs ping reply handling failed", exc_info=True)
+                _np_ack = None
+            if _np_ack:
+                return _np_ack
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,

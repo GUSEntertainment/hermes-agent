@@ -10,9 +10,11 @@ def enrolled(tmp_path):
     root=tmp_path/'hermes';home=root/'profiles'/'claire';home.mkdir(parents=True)
     (home/'config.yaml').write_text('toolsets: [kanban, file]\n')
     registry=tmp_path/'registry.yaml'
-    registry.write_text(json.dumps({'profile_roster':{'canonical':['claire','julia','family-eliana','joshgarcia'],
-        'department_owners':['claire','julia'],'department_makers':['family-eliana'],
-        'review_and_bounded_support':['joshgarcia']}}))
+    # t_9ac68588: member profiles are enrolled by their own board owner, never in
+    # Chris's roster; no global exclusion list strips them back out.
+    registry.write_text(json.dumps({'profile_roster':{'canonical':['claire','julia'],
+        'department_owners':['claire','julia'],'department_makers':[],
+        'review_and_bounded_support':[]}}))
     board=root/'kanban'/'boards'/'chris-home';board.mkdir(parents=True);db=board/'kanban.db'
     with sqlite3.connect(db) as conn:
         conn.execute('CREATE TABLE tasks (id TEXT, assignee TEXT, runtime_profile TEXT)')
@@ -38,10 +40,15 @@ def test_api_request_does_not_inherit_native_worker_exemption(enrolled):
     assert authority.current(**enrolled) is None
 
 
-@pytest.mark.parametrize('profile',['julia','family-eliana','joshgarcia','unknown'])
+@pytest.mark.parametrize('profile',['family-eliana','joshgarcia','unknown'])
 def test_family_members_and_unknown_profiles_not_team_workers(enrolled,profile):
-    enrolled['home']=enrolled['root']/'profiles'/profile;enrolled['env']['HERMES_PROFILE']=profile
+    # Not in Chris's roster -> no GUS/Chris worker authority (scope wall), with no
+    # hardcoded name list involved.
+    home=enrolled['root']/'profiles'/profile;home.mkdir(parents=True,exist_ok=True)
+    (home/'config.yaml').write_text('toolsets: [kanban]\n')
+    enrolled['home']=home;enrolled['env']['HERMES_PROFILE']=profile
     assert authority.current(**enrolled) is None
+    assert not hasattr(authority,'EXCLUDED')
 
 
 def test_registry_and_task_assignment_both_required(enrolled):
@@ -90,3 +97,13 @@ def test_api_principal_binding_takes_precedence_over_process_worker(monkeypatch)
         assert board.restricted()
         with pytest.raises(PermissionError):board.admitted_board('chris-home')
     finally:board._execution.reset(token)
+
+
+def test_julia_hermes_profile_is_a_worker(enrolled):
+    """t_96d87a50: ~/.hermes/profiles/julia is a real worker lane (not OpenClaw Julia)."""
+    home=enrolled['root']/'profiles'/'julia';home.mkdir(parents=True)
+    (home/'config.yaml').write_text('toolsets: [kanban, file]\n')
+    with sqlite3.connect(enrolled['env']['HERMES_KANBAN_DB']) as conn:
+        conn.execute('UPDATE tasks SET assignee="julia", runtime_profile=NULL')
+    enrolled['home']=home;enrolled['env']['HERMES_PROFILE']='julia'
+    assert authority.current(**enrolled)=={'profile':'julia','board':'chris-home','task':'t_fixture'}

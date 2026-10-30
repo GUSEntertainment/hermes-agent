@@ -11,7 +11,8 @@ SHOW_TOOL = "own_work_show"
 MANAGE_TOOL = "own_work_manage"
 COMMENT_TOOL = "own_work_comment"
 LIST_TOOL = "own_work_list"
-TOOLS = frozenset((SHOW_TOOL, MANAGE_TOOL, COMMENT_TOOL, LIST_TOOL))
+EQUIP_TOOL = "own_agent_equip"
+TOOLS = frozenset((SHOW_TOOL, MANAGE_TOOL, COMMENT_TOOL, LIST_TOOL, EQUIP_TOOL))
 
 
 def _grant():
@@ -127,6 +128,40 @@ def comment(args, **kwargs):
     return result
 
 
+def _roster(principal):
+    """Installed runtime profiles of the member's own active agents (verified, not model input)."""
+    from gateway.owner_delegation import agents, agent_profile_name
+    from hermes_cli.board_owner_manage import ROOT
+    import re as _re
+    out = set()
+    for row in agents(principal):
+        if _re.fullmatch(r"oa_[a-f0-9]{32}", row["id"]):
+            name = agent_profile_name(principal, row["id"])
+            if (ROOT / "profiles" / name / "config.yaml").is_file():
+                out.add(name)
+    return out
+
+
+def equip(args, **kwargs):
+    """Equip-first recovery for one blocked card on the member's own board."""
+    grant = _grant()
+    if (type(args) is not dict or set(args) != {"task_id"} or not isinstance(args["task_id"], str)
+            or not 1 <= len(args["task_id"]) <= 200):
+        raise ValueError("One task_id is required; workspace, owner and agent come from your account")
+    from hermes_cli.board_owner_manage import member_board, _validate_member_connection, ROOT
+    board = member_board(grant, None)
+    owner = grant["principal"]
+    from hermes_cli import kanban_db as kb, blocked_lane_recovery as rec
+    from gateway.josh_board_authority import admitted_board
+    with kb.connect_closing(ROOT / "kanban" / "boards" / board / "kanban.db") as conn:
+        _validate_member_connection(conn, grant)
+        result = rec.run_member(conn, board, args["task_id"], {"joshgarcia": "josh"}.get(owner, owner),
+                                _roster(owner), root=ROOT)
+    if _grant() != grant:
+        raise PermissionError("Own-board authority changed; inspect the card before retrying")
+    return json.dumps(result)
+
+
 def register(toolset):
     from tools.registry import registry
     from tools.kanban_tools import KANBAN_MANAGE_SCHEMA
@@ -172,6 +207,12 @@ def register(toolset):
         "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1, "maxLength": 200}, "board": {"type": "string", "description": "Verified Chris admin only: explicit enrolled maintenance board."}, "history_limit": {"type": "integer", "minimum": 1, "maximum": 20}, "comments_before_id": {"type": "integer", "minimum": 1}, "events_before_id": {"type": "integer", "minimum": 1}, "include_event_payloads": {"type": "boolean", "description": "Retrieve original audit payloads only when needed; default view omits repeated prepared briefs."}},
                        "required": ["task_id"], "additionalProperties": False},
     }, handler=show, check_fn=enabled)
+    registry.register(name=EQUIP_TOOL, toolset=toolset, schema={
+        "name": EQUIP_TOOL,
+        "description": "Fix a blocked card on your own board by equipping its assigned agent first: adds a missing internal toolset, a shared skill, an MCP server already installed in that agent's profile, or a read path inside that agent's own workspace, then requeues the SAME agent. Credentials, logins, network, spending or new accounts are never granted: the card is held with one plain ask to you. Only your own agents and board.",
+        "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "minLength": 1, "maxLength": 200}},
+                       "required": ["task_id"], "additionalProperties": False},
+    }, handler=equip, check_fn=enabled)
     registry.register(name=COMMENT_TOOL, toolset=toolset, schema={
         "name": COMMENT_TOOL,
         "description": "Record the user's actual existing direction, a verified changed condition, or a durable finding on a card in your workspace. Then inspect own_work_show for fresh recovery evidence. Do not invent consent or treat a comment as permission for new external actions.",

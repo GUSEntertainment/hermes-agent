@@ -157,6 +157,8 @@ def _external_delivery_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_AD_FAILED_UNTIL: dict = {}  # (board, task_id) -> epoch; failed auto-decompose cards are skipped for 1h
+
 def _resolve_command_boards(config: Any) -> tuple[str, ...] | None:
     """Resolve the shared command-board allowlist without an implicit board."""
     from hermes_cli.command_boards import resolve_command_boards
@@ -1889,17 +1891,38 @@ class GatewayKanbanWatchersMixin:
                             slug, exc,
                         )
                         triage_ids = []
+                    _now_ad = time.time()
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        if _AD_FAILED_UNTIL.get((slug, tid), 0) > _now_ad:
+                            continue  # recently failed: don't let one card block the queue
+                        try:
+                            # Private owner-delegated cards (Josh/Connor) are hash-pinned; rewriting
+                            # their body breaks the binding and blocks them forever. Promote as-is.
+                            with _kb.connect_closing(board=slug) as _pc:
+                                _realm = _pc.execute("SELECT security_realm FROM tasks WHERE id=?", (tid,)).fetchone()
+                                if _realm and str(_realm[0] or "").startswith("owner:"):
+                                    _pc.execute("UPDATE tasks SET status='todo' WHERE id=? AND status='triage'", (tid,))
+                                    _pc.commit()
+                                    continue
+                        except Exception:
+                            pass
                         attempted += 1
                         try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
-                            )
+                            # Multiplexed gateway: the dispatcher thread has no secret scope, so the
+                            # decomposer's LLM call raised UnscopedSecretError on every card. Run it
+                            # under the default (owner) profile scope, like a normal owner turn.
+                            from gateway.run import _profile_runtime_scope as _prs
+                            from hermes_constants import get_hermes_home as _ghh
+                            with _prs(_ghh()):
+                                outcome = _decomp.decompose_task(
+                                    tid, author="auto-decomposer",
+                                )
                         except Exception:
+                            _AD_FAILED_UNTIL[(slug, tid)] = time.time() + 3600
                             logger.exception(
-                                "kanban auto-decompose: decompose_task crashed on %s",
+                                "kanban auto-decompose: decompose_task crashed on %s (retry in 1h)",
                                 tid,
                             )
                             continue
@@ -1918,8 +1941,9 @@ class GatewayKanbanWatchersMixin:
                         else:
                             # Common no-op reasons (no aux client configured) shouldn't
                             # spam logs every tick. Log at debug.
-                            logger.debug(
-                                "kanban auto-decompose [%s]: %s skipped: %s",
+                            _AD_FAILED_UNTIL[(slug, tid)] = time.time() + 3600
+                            logger.warning(
+                                "kanban auto-decompose [%s]: %s skipped (retry in 1h): %s",
                                 slug, tid, outcome.reason,
                             )
                 finally:

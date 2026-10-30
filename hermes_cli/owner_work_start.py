@@ -53,7 +53,7 @@ def current(conn, task_id):
         return {**order, 'event_id': row['id'], 'preserved_stop': record.get('preserved_stop'),
                 'latest_comment_id': record['latest_comment_id'],
                 'prior_run_id': record['prior_run_id'],
-                'max_attempts_per_revision': 1 if order['recovery'] else None}
+                'max_attempts_per_revision': None}
     except (KeyError, ValueError, TypeError):
         return None
 

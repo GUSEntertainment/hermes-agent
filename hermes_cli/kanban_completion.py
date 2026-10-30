@@ -201,6 +201,14 @@ def input_fingerprint(conn, task_id: str) -> str:
         (task_id,)).fetchone()[0]
     if holds:  # absent key keeps every existing fingerprint unchanged
         data["repeated_input_holds"] = holds
+    # t_df999f30 round 2: a reviewer's changes_requested verdict, or any new
+    # owner work-order revision event, is new substantive input even when the
+    # stored order no longer binds (e.g. review recovery moved the projection).
+    fresh = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind IN ('changes_requested','owner_work_requested')",
+        (task_id,)).fetchone()[0]
+    if fresh:
+        data["fresh_input_events"] = fresh
     data["dependencies"] = [dict(row) for row in conn.execute(
         "SELECT l.parent_id,l.edge_role,p.status,p.result "
         "FROM task_links l JOIN tasks p ON p.id=l.parent_id "
@@ -301,8 +309,8 @@ def _first_review_reserve_available(conn, task_id: str, binding: dict | None) ->
 
 
 def admission_reason(conn, task_id: str, limits: dict, *, now: int | None = None) -> str | None:
-    if not limits:
-        return None
+    # Chris 2026-10-11: run caps and repeated-input holds removed; board must always move.
+    return None
     at = int(time.time()) if now is None else now
     scope = limits.get("budget_scope", "maintenance")
     recent = sum(json.loads(row[0]).get("budget_scope", "maintenance") == scope

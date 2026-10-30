@@ -61,7 +61,7 @@ def system_failure(event_kind, payload):
     return any(marker in reason for marker in _SYSTEM_MARKERS)
 
 
-SAME_OWNER_AUTO_RETRIES = 6
+SAME_OWNER_AUTO_RETRIES = 3
 
 
 def _route_to_operator(conn, task_id, event_id, requester):
@@ -83,31 +83,32 @@ def _route_to_operator(conn, task_id, event_id, requester):
         same_owner_retry(conn, task_id, event_id)
 
 
-# 2026-10-09 (Chris): the old check scanned the card body and every comment for
-# words like "never", "hold", "restart", "privacy", "connor", so almost every
-# card was treated as held and never retried. Only an explicit hold counts now:
-# a needs_input block, or a stop/approval sentence aimed at Chris/the owner.
 _HOLD_RE = __import__('re').compile(
-    r"\b(needs? (chris|owner)('?s)? (approval|ok|sign-?off|decision)|"
-    r"(waiting|wait) (on|for) chris|chris (must|needs to|has to) (approve|decide|sign|confirm)|"
-    r"do not (send|pay|publish|sign|delete|deploy) until)", __import__('re').I)
+    r"\b(do not|don'?t|never|must not|until\b.{0,40}\b(approv|confirm|sign|decid)|hold\b|"
+    r"needs? (chris|approval|sign-?off)|approv(e|al|es)\b.{0,30}\b(chris|owner|payment|send))", __import__('re').I)
 
 
 def has_action_hold(conn, task):
-    """Explicit hold only: title money/send words, or a hold sentence in a
-    comment or stop reason. Body boilerplate no longer counts."""
+    """Conservative check over title, body and every comment.
+
+    Any protected keyword or explicit stop/approval language means the
+    automatic retry stays out; a person or the owner releases it instead.
+    """
     from gateway.gus_admin_cli import PROTECTED
-    if PROTECTED.search(task.title or '') and _HOLD_RE.search(task.title or '') is None and \
-            any(w in (task.title or '').lower() for w in ('capital', 'payment', 'purchase', 'spend', 'wire', 'refund')):
-        return True
-    if getattr(task, 'block_kind', None) == 'needs_input':
-        return True
-    texts = [r[0] or '' for r in conn.execute('SELECT body FROM task_comments WHERE task_id=?', (task.id,))]
+    # Review 3: strip ONLY the machine routing-metadata JSON fence; any other
+    # fenced text is human content and is scanned like the rest of the body.
+    body = __import__('re').sub(r"## Routing metadata\s*```json.*?```", "", task.body or '',
+                                flags=__import__('re').S)
+    texts = [task.title or '', body]
+    texts += [r[0] or '' for r in conn.execute('SELECT body FROM task_comments WHERE task_id=?', (task.id,))]
+    # Stop/block reasons live in event payloads; a hold written there counts too.
     texts += [r[0] or '' for r in conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND kind IN "
-        "('blocked','block_loop_detected','capability_preflight_blocked','gave_up') "
-        "ORDER BY id DESC LIMIT 3", (task.id,))]
-    return any(_HOLD_RE.search(t) for t in texts)
+        "('blocked','block_loop_detected','capability_preflight_blocked','gave_up')", (task.id,))]
+    for text in texts:
+        if _HOLD_RE.search(text) or PROTECTED.search(text):
+            return True
+    return False
 
 
 def same_owner_retry(conn, task_id, event_id):
@@ -127,6 +128,11 @@ def same_owner_retry(conn, task_id, event_id):
     used = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='same_owner_retry'",
                         (task_id,)).fetchone()[0]
     if used >= SAME_OWNER_AUTO_RETRIES:
+        # 2026-10-22 (Chris): retries exhausted on a technical wall -> flag for
+        # the operator sweep (Margot fixes setup or finishes it), never park.
+        if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='operator_sweep_needed'", (task_id,)).fetchone():
+            kb._append_event(conn, task_id, 'operator_sweep_needed', {'event_id': event_id, 'owner': task.assignee})
+            conn.commit()
         return False
     try:
         ok = kb.unblock_task(conn, task_id, preserve_failure_history=True)

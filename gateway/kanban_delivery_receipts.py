@@ -39,6 +39,7 @@ def reviewed_artifacts(c,task_id):
  if not task or task['status']!='done' or task['current_run_id'] is not None or goal['phase']!='completed':raise DeliveryHeld('Review not currently completed')
  maker=c.execute("SELECT profile FROM task_runs WHERE task_id=? AND outcome='review_requested' ORDER BY id DESC LIMIT 1",(task_id,)).fetchone()
  reviewer=goal['reviewer_profile'];version=goal['current_state_version'];digest=goal['review_artifact_digest']
+ bare=str(digest or '').removeprefix('sha256:')
  if not isinstance(version,int) or version<1 or not maker or maker[0]==reviewer or not reviewer or goal['required_reviewer_profile']!=reviewer or task['assignee']!=reviewer or task['current_state_version']!=version or goal['review_state_version']!=version:raise DeliveryHeld('Independent current reviewer proof missing')
  verdicts=c.execute('SELECT * FROM review_verdicts WHERE task_id=? AND review_round=(SELECT MAX(review_round) FROM review_verdicts WHERE task_id=?)',(task_id,task_id)).fetchall()
  if not verdicts or any(v['verdict']!='PASS' or v['reviewer_profile']!=reviewer or v['state_version']!=version or v['artifact_digest']!=digest or v['artifact_ref']!=goal['review_artifact_ref'] for v in verdicts):raise DeliveryHeld('Current PASS does not bind artifact')
@@ -54,7 +55,7 @@ def reviewed_artifacts(c,task_id):
     if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_uid!=os.getuid() or before.st_mode&0o022 or before.st_size!=row['size'] or before.st_size>25*1024*1024:continue
     data=f.read(25*1024*1024+1);after=os.fstat(f.fileno())
     if (before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):continue
-   if sha(data)==digest:out.append({'id':row['id'],'name':name,'bytes':data,'sha256':digest})
+   if sha(data)==bare:out.append({'id':row['id'],'name':name,'bytes':data,'sha256':bare})
   except OSError:continue
  if Path(str(goal['review_artifact_ref'])).is_absolute() and not out:raise DeliveryHeld('Reviewed durable artifact missing or changed')
  return out[:1] # Current native review binds one artifact; identical copies deduplicate.

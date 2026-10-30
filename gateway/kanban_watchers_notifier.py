@@ -401,6 +401,33 @@ def _fmt_completed(ev, n) -> tuple:
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
+def _needs_top_line(board_slug, task_id):
+    """Plain 'Waiting on you' / 'Agents handling it' line, or None (t_2c12c11b).
+
+    On the owner's board a Chris ask is delivered ONCE per channel by the
+    needs-ping watcher (gateway/kanban_needs_ping.py); this notifier then only
+    points at it instead of repeating the ask (t_b338f418 D cross-notifier dedupe).
+    """
+    try:
+        from hermes_cli import kanban_db as _kb, kanban_needs as _needs
+        conn = _kb.connect(board=board_slug) if board_slug else _kb.connect()
+        try:
+            needs = _needs.lookup(conn, task_id)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if needs and needs.get("waiting_on") == "chris" and needs.get("needs_from_chris") \
+            and (board_slug or "") == "chris-home":
+        return "Waiting on you — Margot sent the question separately."
+    return _needs.notification_line(needs)
+
+
+def _with_needs(ev, n, fallback: str) -> str:
+    line = _needs_top_line(n.board_slug, n.task_id)
+    return f"{n.title}\n{line}" if line else fallback
+
+
 def _fmt_review_requested(ev, n) -> tuple:
     # Implementation done; task moved to the review lane. Carry the handoff
     # into the wake turn like ``completed`` so the reviewer needn't re-read the board.
@@ -411,7 +438,7 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
-    return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+    return _with_needs(ev, n, t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff)), wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -472,7 +499,7 @@ def _fmt_timed_out(ev, n) -> tuple:
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (
-        t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
+        _with_needs(ev, n, t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160))),
         None, None,
     ),
     "gave_up": _fmt_gave_up,

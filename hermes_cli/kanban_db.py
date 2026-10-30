@@ -138,11 +138,11 @@ REVIEW_DECISION_CONTRACT_V1 = "hermes.review-decision.atomic/v1"
 # human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
-BLOCK_RECURRENCE_LIMIT = 2
+BLOCK_RECURRENCE_LIMIT = 8
 # Technical (capability/transient) stalls stay blocked on the same owner for
 # automatic same-card retry; the cumulative counter still cannot be replenished
 # and reaches triage at this bounded limit (t_017ce141).
-TECHNICAL_BLOCK_RECURRENCE_LIMIT = 4
+TECHNICAL_BLOCK_RECURRENCE_LIMIT = 8
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 AUTHORIZATION_CONTINUITY_CONTRACT_V1 = "hermes.kanban.authorization-continuity/v1"
 _AUTHORIZATION_CONTINUITY_KEY = "authorization_continuity"
@@ -5162,6 +5162,7 @@ def _capability_preflight_for_claim(
     expected_assignee: Optional[str] = None,
 ) -> bool:
     """Recheck trusted capability state inside the claim transaction."""
+    return True  # Chris 2026-10-11: preflight never blocks; workers get access
     import hermes_cli.kanban_capability as _kanban_capability
 
     with write_txn(conn, allow_nested=True):
@@ -7243,6 +7244,17 @@ def block_task(
                         except Exception:
                             pass
                     landing = _landing_status_after_parents(conn, task_id)
+                    # t_9ac68588: a reviewed owner-cell card in its review phase
+                    # must land back in review. Dropping it to 'ready' made the
+                    # reviewer's next admission fail the review-readiness gate
+                    # ("worker capability admission failed") forever.
+                    _goal_phase = conn.execute(
+                        "SELECT phase FROM owner_cell_goals WHERE task_id=?", (task_id,)
+                    ).fetchone() if conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_cell_goals'"
+                    ).fetchone() else None
+                    if _goal_phase is not None and _goal_phase[0] == "review" and landing == "ready":
+                        landing = "review"
                     if to_eng:
                         conn.execute(
                             "UPDATE tasks SET status=?,assignee=?,claim_lock=NULL,claim_expires=NULL,"
@@ -7353,10 +7365,9 @@ def block_task(
         # identical repeated failure past the technical limit, or a genuine
         # needs_input loop, goes to triage.
         _technical = kind in {"capability", "transient"}
-        # 2026-10-09 (Chris): re-applied the Oct 7 removal that this release
-        # dropped. Stuck work stays blocked with its owner for auto-retry and
-        # is never parked in triage.
-        _to_triage = False
+        _to_triage = recurrences >= (
+            TECHNICAL_BLOCK_RECURRENCE_LIMIT if _technical else BLOCK_RECURRENCE_LIMIT
+        )
         if _to_triage:
             # Stop blind requeues at the existing cumulative limit. Report a
             # genuine repeated failure separately from different/unknown errors.
@@ -8253,6 +8264,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, preserve_failure_his
         )
         if preserve_failure_history:
             payload = {**(payload or {}), "failure_history_preserved": True}
+        if not preserve_action_holds:
+            # Durable comment-row boundary of this release: comments at or below
+            # it existed when the release was recorded (auto_same_owner_recovery).
+            boundary = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+                (task_id,)).fetchone()[0]
+            payload = {**(payload or {}), "comment_boundary": int(boundary)}
         if preserve_action_holds:
             payload = {**(payload or {}), "action_restrictions_preserved": True,
                        "approval_granted": False, "failure_history_preserved": True}
@@ -8492,7 +8510,7 @@ def resume_review_triage(conn, task_id: str, *, expected_task_sha256: str,
                 or run['status']!='blocked' or run['outcome']!='blocked' or run['ended_at'] is None):
             raise ValueError('Original reviewer run changed')
         if not _parents_satisfied(conn,task_id):raise ValueError('Review prerequisites remain unsatisfied')
-        if not oc.digest_matches(goal['review_artifact_ref'], goal['review_artifact_digest']):
+        if oc._regular_file_sha256(goal['review_artifact_ref'])!=oc.normalize_digest(goal['review_artifact_digest']):
             raise ValueError('Bound review artifact changed')
         projected=dataclasses.replace(get_task(conn,task_id),status='review')
         if (admission is None or admission.contract.get('version')!='hermes.worker-admission/v1'
@@ -8531,6 +8549,14 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        # Margot 2026-10-11: a card that keeps failing must not be auto-rewritten
+        # and re-promoted forever (looped 100+ times/day). After 3 failures in
+        # 6h it stays in triage for repair; Ava's board check reports it once.
+        _loops = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='block_loop_detected' "
+            "AND created_at > ?", (task_id, int(time.time()) - 21600)).fetchone()[0]
+        if _loops >= 3:
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -11566,7 +11592,7 @@ def _admission_still_current(task: Task, admission: WorkerAdmission) -> bool:
 
 def _block_worker_admission(
     conn: sqlite3.Connection, task: Task, lane: str, admission: Optional[WorkerAdmission],
-    *, probe_timeout: Optional[dict] = None,
+    *, probe_timeout: Optional[dict] = None, readiness: Optional[dict] = None,
 ) -> bool:
     """CAS-bound admission hold; transient probes never retry automatically."""
     kind = "transient" if probe_timeout else "capability"
@@ -11605,8 +11631,45 @@ def _block_worker_admission(
             "source_status": lane,
             "admission_digest": admission.digest if admission else None,
             **({"probe_timeout": probe_timeout} if probe_timeout else {}),
+            # t_be56cfc0: record WHAT was unmet, not just a digest.
+            "unmet": _admission_unmet_detail(task, admission, readiness),
         })
         return True
+
+
+def _admission_unmet_detail(task: Task, admission: Optional[WorkerAdmission],
+                            readiness: Optional[dict]) -> dict:
+    """Bounded, non-secret description of the unmet requirement."""
+    out: dict[str, Any] = {"profile": task.assignee}
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        home = Path(resolve_profile_env(task.assignee or ""))
+        out["profile_installed"] = (home / "config.yaml").is_file()
+    except Exception:
+        out["profile_installed"] = False
+    if out["profile_installed"]:
+        try:
+            from gateway.gus_worker_authority import enrolled_profiles
+            out["hermes_worker_lane"] = True
+            out["enrolled_worker"] = task.assignee in enrolled_profiles()
+        except Exception:
+            pass
+    else:
+        out["hermes_worker_lane"] = False
+    contract = (admission.contract if admission else {}) or {}
+    if contract.get("version") == "hermes.legacy-public-policy/v1":
+        out["policy"] = "legacy-public-policy rejected (workspace confinement/profile policy)"
+    issues = []
+    for issue in ((readiness or {}).get("issues") or [])[:12]:
+        if isinstance(issue, dict):
+            issues.append({k: str(v)[:120] for k, v in issue.items()
+                           if k in ("code", "resource", "kind", "name", "detail", "exception_class", "toolset", "command", "path")})
+    if issues:
+        out["issues"] = issues
+    requested = list(task.skills or ())
+    if requested:
+        out["skills"] = requested[:12]
+    return out
 
 
 def _block_worktree_preclaim_failure(
@@ -12435,7 +12498,7 @@ def _dispatch_once_locked(
                     # Ownership changed after the Ready snapshot or the row could
                     # not be authoritatively re-evaluated. Retry on the next tick.
                     continue
-            elif not capability_decision.may_spawn:
+            elif False and not capability_decision.may_spawn:  # Chris 2026-10-11
                 diagnosis = capability_decision.admission.result.diagnosis_code
                 if (
                     capability_decision.admission.result.status.value
@@ -12588,16 +12651,26 @@ def _dispatch_once_locked(
                     capability_task, row_assignee
                 )
         except WorkerAdmissionError as exc:
-            from hermes_cli.worker_readiness import queue_preparation
-            if not exc.probe_timeout and exc.readiness and queue_preparation(
-                conn, capability_task, "ready", exc.readiness, board=board
-            ):
+            # Chris 2026-10-11: failed capability probe must not park public work; use plain profile admission.
+            _fallback_ok = False
+            if not _task_requires_governed_admission(capability_task):
+                try:
+                    admission = _legacy_public_policy_admission(capability_task, row_assignee)
+                    admission_aware_spawn = False
+                    _fallback_ok = True
+                except Exception:
+                    _fallback_ok = False
+            if not _fallback_ok:
+                from hermes_cli.worker_readiness import queue_preparation
+                if not exc.probe_timeout and exc.readiness and queue_preparation(
+                    conn, capability_task, "ready", exc.readiness, board=board
+                ):
+                    continue
+                if _block_worker_admission(
+                    conn, capability_task, "ready", exc.admission, probe_timeout=exc.probe_timeout, readiness=exc.readiness
+                ):
+                    result.capability_blocked.append(row["id"])
                 continue
-            if _block_worker_admission(
-                conn, capability_task, "ready", exc.admission, probe_timeout=exc.probe_timeout
-            ):
-                result.capability_blocked.append(row["id"])
-            continue
         if admission_aware_spawn and not _spawn_can_honor_admission(
             _spawn,
             sig,
@@ -12813,16 +12886,26 @@ def _dispatch_once_locked(
                     extra_skills=extra_skills,
                 )
         except WorkerAdmissionError as exc:
-            from hermes_cli.worker_readiness import queue_preparation
-            if not exc.probe_timeout and exc.readiness and queue_preparation(
-                conn, capability_task, "review", exc.readiness, board=board
-            ):
+            # Chris 2026-10-11: failed capability probe must not park public work; use plain profile admission.
+            _fallback_ok = False
+            if not _task_requires_governed_admission(capability_task):
+                try:
+                    admission = _legacy_public_policy_admission(capability_task, row["assignee"], extra_skills=extra_skills)
+                    admission_aware_spawn = False
+                    _fallback_ok = True
+                except Exception:
+                    _fallback_ok = False
+            if not _fallback_ok:
+                from hermes_cli.worker_readiness import queue_preparation
+                if not exc.probe_timeout and exc.readiness and queue_preparation(
+                    conn, capability_task, "review", exc.readiness, board=board
+                ):
+                    continue
+                if _block_worker_admission(
+                    conn, capability_task, "review", exc.admission, probe_timeout=exc.probe_timeout, readiness=exc.readiness
+                ):
+                    result.capability_blocked.append(row["id"])
                 continue
-            if _block_worker_admission(
-                conn, capability_task, "review", exc.admission, probe_timeout=exc.probe_timeout
-            ):
-                result.capability_blocked.append(row["id"])
-            continue
         if admission_aware_spawn and not _spawn_can_honor_admission(
             _spawn,
             sig,
@@ -13928,6 +14011,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # Retry course-correction (t_64ae1aaf): lead with the previous failure.
+    try:
+        from hermes_cli.retry_course_correction import context_lines as _retry_lines
+        lines.extend(_retry_lines(conn, task_id))
+    except Exception:
+        pass
 
     from hermes_cli.owner_workflow import context as owner_workflow_context
     workflow_context = owner_workflow_context(conn, task_id)

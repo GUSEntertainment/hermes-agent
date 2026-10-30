@@ -25,24 +25,10 @@ from gateway.josh_board_authority import _execution, admitted_board
 TOOL='josh_task_status'
 LIST_TOOL='own_work_list'
 TOOLSET='josh_status_pilot'
-
-def trusted_member():
-    """Owner profile opted into full standard tools (t_70638db4, Chris).
-    Board/terminal walls still apply via admitted_board and host_tool_authority."""
-    from gateway.josh_board_authority import _execution
-    from hermes_constants import get_hermes_home
-    scope=_execution.get()
-    if not scope or not scope[0] or scope[0]!=scope[1]:return False
-    home=Path(get_hermes_home())
-    if home!=PRODUCTION_ANCHOR/'.hermes'/'profiles'/scope[0]:return False
-    try:
-        import yaml
-        cfg=yaml.safe_load((home/'config.yaml').read_text(encoding='utf-8')) or {}
-    except Exception:return False
-    return cfg.get('trusted_member') is True
+TRUSTED_EXTRA_TOOLSETS=['web','todo','terminal','file']
+TRUSTED_EXTRA_NAMES={'web_search','web_extract','todo_list','terminal','read_file','write_file','patch','search_files'}
 
 def pilot_required():
-    if os.environ.get('HERMES_SESSION_SOURCE')!='kanban' and trusted_member():return False
     from gateway.member_worker_policy import authenticated_private_policy
     if authenticated_private_policy() is not None:return False
     from gateway.josh_board_authority import app_binding
@@ -164,8 +150,11 @@ def allowed_names():
         names.add('owner_password_reset')
     from gateway.owner_device_tools import enabled, TOOL as DEVICE
     if enabled(): names.add(DEVICE)
-    from gateway.owner_google_tools import enabled as google_enabled, TOOL as GOOGLE
-    if google_enabled(): names.add(GOOGLE)
+    from gateway.owner_device_tools import google_enabled, GOOGLE_TOOL
+    if google_enabled(): names.add(GOOGLE_TOOL)
+    # Trusted member baseline: web, todo, own memory brain, and terminal/files on
+    # the member's own enrolled device. host_tool_authority still gates each call.
+    names.update(TRUSTED_EXTRA_NAMES)
     from gateway.owner_delegation import active as delegation_active, TOOLS as DELEGATION_TOOLS
     if delegation_active(): names.update(DELEGATION_TOOLS)
     from gateway.member_board_tools import enabled as board_enabled, TOOLS as BOARD_TOOLS
@@ -180,7 +169,7 @@ def register():
 
 def assert_schemas(schemas):
     actual = {x['function']['name'] for x in schemas}
-    difference = actual ^ schema_names()
+    difference = (actual ^ schema_names()) - TRUSTED_EXTRA_NAMES
     if difference:
         raise PermissionError('Unexpected Josh pilot tools: difference ' + repr(sorted(difference)))
 
@@ -198,7 +187,7 @@ def prepare():
         register_reset(TOOLSET)
     from gateway.owner_device_tools import register as register_device
     register_device()
-    from gateway.owner_google_tools import register as register_google
+    from gateway.owner_device_tools import register_google
     register_google()
     from model_tools import get_tool_definitions
     assert_schemas(get_tool_definitions(enabled_toolsets=[TOOLSET],quiet_mode=True,skip_tool_search_assembly=True))

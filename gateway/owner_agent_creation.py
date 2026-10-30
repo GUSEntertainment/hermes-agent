@@ -182,26 +182,60 @@ def propose(args, **kwargs):
     return json.dumps({'proposal_id': key, 'suggestion': f"Want a {args['name']} agent for {args['purpose']}?", 'created': False})
 
 
-OWNER_SKILL_BUNDLE = 'private/owner-agent-skills/v1'
+OWNER_SKILL_BUNDLE = 'private/owner-agent-skills/v2'
 
 
 def _install_owner_skills(folder):
-    """Copy the sanitized, neutral-brand owner skill bundle (no GUS data)."""
-    import shutil
-    source = work.ROOT / OWNER_SKILL_BUNDLE
-    if not source.is_dir() or source.is_symlink():
-        return
-    target = folder / 'skills' / 'owner-toolkit'
-    if target.exists():
-        return
-    target.parent.mkdir(mode=0o700, exist_ok=True)
-    shutil.copytree(source, target, symlinks=False, ignore=shutil.ignore_patterns('*.json'))
+    """Retired (Chris 2026-10-13, t_1f6212c7): member/tester agents share the
+    canonical skills by reference via skills.external_dirs; never copy skills."""
+    return
+
+
+_FALLBACK_MODEL = {'default': 'gpt-6.1-sol', 'provider': 'openai-codex'}
+
+
+def owner_main_model(principal):
+    """Model of the owner's own main Margot (t_1c0b29f3). Only the model name
+    and provider are read; no keys, auth or other settings are inherited."""
+    import yaml
+    try:
+        if not re.fullmatch('[a-z][a-z0-9_-]{0,59}', principal or ''):
+            raise ValueError
+        cfg = yaml.safe_load((work.ROOT / 'profiles' / f'app-gus-{principal}-margot' / 'config.yaml').read_text()) or {}
+        m = cfg.get('model') or {}
+        if isinstance(m, dict) and isinstance(m.get('default'), str) and isinstance(m.get('provider'), str):
+            return {'default': m['default'], 'provider': m['provider']}
+    except Exception:
+        logging.getLogger(__name__).warning('owner main model unavailable for %s; using fallback', principal)
+    return dict(_FALLBACK_MODEL)
+
+
+def sync_agent_model(runtime, principal):
+    """Follow the owner's main Margot model unless the agent has an explicit
+    override (owner_agent_model_override: true). Atomic, mode 600."""
+    import yaml
+    path = work.ROOT / 'profiles' / runtime / 'config.yaml'
+    if path.is_symlink():
+        raise PermissionError('Private profile path changed')
+    cfg = yaml.safe_load(path.read_text()) or {}
+    if cfg.get('owner_agent_model_override') is True:
+        return cfg.get('model')
+    want = owner_main_model(principal)
+    if cfg.get('model') != want:
+        cfg['model'] = want
+        tmp = path.with_name('.config.yaml.tmp')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(yaml.safe_dump(cfg, sort_keys=True))
+        os.replace(tmp, path)
+    return want
 
 
 def _profile(identifier, name, purpose):
     return _profile_for(identifier,name,purpose,principal=work.owner(),board_name=work.board())
 
 
+# Chris 2026-10-21 t_7e020435: owner agents get the full shared skill set (disabled: []).
 def _profile_for(identifier,name,purpose,*,principal,board_name):
     runtime = work.agent_profile_name(principal, identifier)
     folder = work.ROOT / 'profiles' / runtime
@@ -210,16 +244,16 @@ def _profile_for(identifier,name,purpose,*,principal,board_name):
         raise PermissionError('Private profile path changed')
     # No mutable global default/template import, company configs, copied keys or
     # auth files. Model selection follows the dispatcher's normal provider config.
-    config = {'model': {'default': 'gpt-6-sol', 'provider': 'openai-codex'},
+    config = {'model': owner_main_model(principal),
               'toolsets': ['terminal', 'file', 'kanban', 'worker_skills', 'todo', 'web', 'browser', 'memory', 'session_search', 'vision', 'image_gen', 'code_execution', 'delegation'],
-              'mcp_servers': {}, 'memory': {'memory_enabled': True, 'user_profile_enabled': True},
+              'mcp_servers': {}, 'skills': {'external_dirs': ['/Users/Chris/projects/gus-shared-skills'], 'disabled': []}, 'memory': {'memory_enabled': True, 'user_profile_enabled': True},
               # Chris 2026-09-28: same permissions as Josh's Margot, same Mac terminal.
               'terminal': {'backend': 'ssh', 'cwd': '/Users/jj', 'ssh_host': '100.71.37.12', 'ssh_user': 'jj', 'ssh_port': 22,
                            'ssh_key': '/Users/Chris/.ssh/josh-margot-temp', 'timeout': 600, 'persistent_shell': False, 'ssh_sync_files': False},
               'owner_device_enabled': True,
               'owner_agent': {'owner': principal, 'id': identifier, 'board': board_name},
               'security': {'workspace_confinement': {'enabled': True, 'root_from_task_cwd': True,
-                  'deny_terminal_network': False, 'deny_home_reads_outside_workspace': True, 'read_only_roots': []}}}
+                  'deny_terminal_network': False, 'deny_home_reads_outside_workspace': True, 'read_only_roots': ['/Users/Chris/projects/gus-shared-skills']}}}
     import yaml
     files = {'config.yaml': yaml.safe_dump(config, sort_keys=True),
              'SOUL.md': f'You are {name}, Josh\'s private agent. Purpose: {purpose}\nExecute only a native admitted Josh task in its assigned workspace. No Chris/GUS memory, boards, Vault, credentials or other members\' data. Your terminal runs on Josh\'s own Mac, the same access his Margot has. Do the work there. Never open Chris\'s personal files or settings. Report unavailable connected sources honestly. Preserve external-action approval gates.\n'}
@@ -326,11 +360,50 @@ def _route(done, record, *, repeat):
     return json.dumps(dict(result, **base))
 
 
+def update(args, **kwargs):
+    """Owner edits one of their own sidebar agents: name and/or purpose (role, specialty, instructions)."""
+    ctx = work.current()
+    principal = ctx['principal']
+    if type(args) is not dict or 'agent' not in args or not set(args) <= {'agent', 'name', 'purpose'} or len(args) < 2:
+        raise ValueError('agent plus name and/or purpose required')
+    ident = args['agent']
+    name = args.get('name'); purpose = args.get('purpose')
+    for v, lim in ((name, 60), (purpose, 4000)):
+        if v is not None and (type(v) is not str or not v.strip() or len(v) > lim):
+            raise ValueError('name/purpose must be non-empty text within limits')
+    rows = {r['id']: r for r in work.agents(principal)}
+    if ident not in rows:
+        by_name = [r for r in rows.values() if r['name'].strip().lower() == str(ident).strip().lower()]
+        if len(by_name) != 1:
+            raise PermissionError('Agent is not in your own roster')
+        ident = by_name[0]['id']
+    row = rows[ident]
+    name = (name or row['name']).strip(); purpose = (purpose or row['purpose']).strip()
+    import sqlite3
+    with closing(sqlite3.connect(str(work.ROOT / 'agent-os/owner-agents.sqlite'), timeout=5)) as conn:
+        cur = conn.execute('UPDATE owner_agents SET name=?, purpose=? WHERE owner=? AND id=? AND archivedAt IS NULL', (name, purpose, principal, ident))
+        conn.commit()
+        if cur.rowcount != 1:
+            raise PermissionError('Agent update did not apply')
+    runtime = work.agent_profile_name(principal, ident)
+    soul = work.ROOT / 'profiles' / runtime / 'SOUL.md'
+    if soul.is_file() and not soul.is_symlink():
+        text = soul.read_text()
+        lines = text.split('\n', 1)
+        first = (f"You are {name}, Josh's private agent. Purpose: {purpose}" if principal == 'joshgarcia'
+                 else f'You are {name}, a private agent for {principal}. Purpose: {purpose}')
+        soul.write_text(first + '\n' + (lines[1] if len(lines) > 1 else ''))
+    return json.dumps({'updated': {'id': ident, 'name': name, 'purpose': purpose}})
+
+
 def register():
     from tools.registry import registry, no_cache_check_fn
     check = no_cache_check_fn(work.available)
     properties = {key: {'type': 'string', 'maxLength': limit} for key, limit in [('name', 60), ('purpose', 240), ('title', 140), ('request', 16000)]}
     registry.register(name='own_agent_propose', toolset='owner_delegation', handler=propose, check_fn=check,
         schema={'name': 'own_agent_propose', 'description': 'When no current sidebar agent fits, save a one-line name/purpose suggestion and the work. Does NOT create an agent or task. A clear named creation directive creates immediately. Otherwise ask the returned question once and wait for their reply. If they pick a different name or purpose, propose again.', 'parameters': {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}})
+    registry.register(name='own_agent_update', toolset='owner_delegation', handler=update, check_fn=check,
+        schema={'name': 'own_agent_update', 'description': "Update one of the owner's own existing sidebar agents: rename it and/or rewrite its purpose (role, specialty, standing instructions). Use the id or exact name from own_agents_list. Takes effect on the agent's next task.",
+                'parameters': {'type': 'object', 'properties': {'agent': {'type': 'string', 'maxLength': 64}, 'name': {'type': 'string', 'maxLength': 60}, 'purpose': {'type': 'string', 'maxLength': 4000}}, 'required': ['agent'], 'additionalProperties': False}})
     registry.register(name='own_agent_confirm', toolset='owner_delegation', handler=confirm, check_fn=check,
         schema={'name': 'own_agent_confirm', 'description': 'After the person says yes to the latest proposal in this conversation (own_agents_list shows it as pending_proposal even when this turn has no earlier chat history), create their private agent in their sidebar and automatically route the saved work. Server verifies the actual yes, scope and proposal. If it returns an error, tell the person plainly that the agent was NOT created and why; never claim success.', 'parameters': {'type': 'object', 'properties': {'proposal_id': {'type': 'string'}}, 'required': ['proposal_id'], 'additionalProperties': False}})

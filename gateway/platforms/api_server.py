@@ -1676,12 +1676,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             configured = getattr(cfg, "multiplex_profile_allowlist", None)
             extra_profiles = getattr(self, "_api_profile_allowlist", ())
             api_allowlist = None if configured is None else list(dict.fromkeys([*configured, *extra_profiles]))
-            # v0.21.5 removed the roster keyword. Filter AFTER enumerating so
-            # parked/standalone exclusions and an explicit legacy policy remain.
-            served = {name for name, _ in profiles_to_serve(multiplex=True)
+            try:
+                rows = list(profiles_to_serve(multiplex=True))
+            except Exception:
+                logger.warning("[Api_Server] profile resolve retry in default scope for %r", profile, exc_info=True)
+                with self._profile_scope(None):
+                    rows = list(profiles_to_serve(multiplex=True))
+            served = {name for name, _ in rows
                       if api_allowlist is None or name == "default" or name in api_allowlist}
         except Exception:
+            logger.warning("[Api_Server] profile resolve failed for %r", profile, exc_info=True)
             return _PROFILE_REJECTED
+        if profile not in served:
+            logger.info("[Api_Server] profile %r not in served set (%d)", profile, len(served))
         return profile if profile in served else _PROFILE_REJECTED
 
     @staticmethod

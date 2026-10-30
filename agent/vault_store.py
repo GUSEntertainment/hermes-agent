@@ -22,7 +22,7 @@ import os
 import re
 import threading
 import uuid
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -53,7 +53,7 @@ REQUIRED_FIELDS = {"payment": ("card_number", "exp_month", "exp_year", "cvc"),
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
-_LOCK = threading.RLock()  # re-entrant: a profile save holds root + profile locks together
+_LOCK = threading.Lock()
 
 # fcntl is Unix-only; Windows locks a byte range with msvcrt (same shape as tools/skill_usage.py).
 msvcrt = None
@@ -194,13 +194,10 @@ class VaultItemMeta:
 class VaultStore:
     """Encrypted, profile-scoped vault under ``<HERMES_HOME>/vault/``."""
 
-    def __init__(self, base_dir: Optional[Path] = None, *, share_payments: Optional[bool] = None):
+    def __init__(self, base_dir: Optional[Path] = None):
         self._base = Path(base_dir) if base_dir is not None else (
             Path(get_hermes_home()) / "vault"
         )
-        # Shared payment lookup only for the contextual default store; an explicit base_dir is a
-        # standalone store unless the caller opts in (t_78bb3d31 review).
-        self._share_payments = (base_dir is None) if share_payments is None else bool(share_payments)
         self._vault_path = self._base / "vault.json.enc"
         self._key_path = self._base / "vault.key"
 
@@ -367,211 +364,16 @@ class VaultStore:
             "identifier": identifier,
             "secret": dict(secret),
         }
-        if kind == "payment":
-            return self._add_payment_atomic(record, secret, norm_origin, label)
         with self._locked():
             items = self._read_all()
             items.append(record)
             self._write_all(items)
         return self._meta(record)
 
-    def _add_payment_atomic(self, record: Dict[str, Any], secret: Dict[str, Any],
-                            origin: Optional[str], label: str) -> VaultItemMeta:
-        """Check, merge and insert a payment card as ONE locked transaction (t_78bb3d31 review).
-
-        Lock order is always root vault then profile vault, so concurrent saves across processes
-        cannot interleave between the duplicate check and the append. The root vault is the canonical
-        owner of a shared card; legacy profile-local copies of the same card are brought up to date
-        so no stale handle can resolve old fields.
-        """
-        fp = _card_fingerprint(secret)
-        shared = self._shared_store()
-        with ExitStack() as stack:
-            if shared is not None:
-                stack.enter_context(shared._locked())
-            stack.enter_context(self._locked())
-            own = self._read_all()
-            if shared is not None:
-                root_items = shared._read_all()
-                merged = shared._merge_into(root_items, fp, secret, origin)
-                if merged is not None:
-                    shared._write_all(root_items)
-                    if self._sync_copies(own, fp, merged.get("secret") or {}):
-                        self._write_all(own)
-                    return self._meta(merged)
-            merged = self._merge_into(own, fp, secret, origin)
-            if merged is None:
-                own.append(record)
-                merged = record
-            self._write_all(own)
-            return self._meta(merged)
-
-    @staticmethod
-    def _merge_into(items: List[Dict[str, Any]], fp: str, secret: Dict[str, Any],
-                    origin: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Merge a re-saved card (same number + expiry) into the oldest matching record in ``items``
-        (in place): newly supplied fields replace old ones, the origin is recorded as an approved
-        checkout, and any further same-card records in ``items`` are synced. Caller holds the lock."""
-        dups = [r for r in items if r.get("kind") == "payment"
-                and _card_fingerprint(r.get("secret") or {}) == fp]
-        if not dups:
-            return None
-        dup = min(dups, key=lambda r: str(r.get("created_at", "")))
-        dup["secret"] = {**(dup.get("secret") or {}), **secret}
-        if origin and origin != dup.get("origin"):
-            approved = list(dup.get("approved_origins") or [])
-            if origin not in approved:
-                dup["approved_origins"] = approved + [origin]
-        dup["updated_at"] = datetime.now(timezone.utc).isoformat()
-        for other in dups:
-            if other is not dup:
-                other["secret"] = dict(dup["secret"])
-        return dup
-
-    @staticmethod
-    def _sync_copies(items: List[Dict[str, Any]], fp: str, secret: Dict[str, Any]) -> bool:
-        changed = False
-        for r in items:
-            if r.get("kind") == "payment" and _card_fingerprint(r.get("secret") or {}) == fp \
-                    and r.get("secret") != secret:
-                r["secret"] = dict(secret)
-                r["updated_at"] = datetime.now(timezone.utc).isoformat()
-                changed = True
-        return changed
-
-    def _merge_payment(self, fp: str, secret: Dict[str, Any], origin: Optional[str],
-                       label: str) -> Optional[VaultItemMeta]:
-        """Compat wrapper: merge into this store only. Returns None when no matching card is stored."""
-        with self._locked():
-            items = self._read_all()
-            dup = self._merge_into(items, fp, secret, origin)
-            if dup is None:
-                return None
-            self._write_all(items)
-            return self._meta(dup)
-
-    def dedupe_payments(self) -> Dict[str, Any]:
-        """Collapse duplicate payment cards (same number + expiry) into the oldest item, merging every
-        bound/approved origin. Reports ids and counts only, never card data."""
-        with self._locked():
-            items = self._read_all()
-            keep: Dict[str, Dict[str, Any]] = {}
-            removed: List[str] = []
-            out: List[Dict[str, Any]] = []
-            for rec in sorted(items, key=lambda r: str(r.get("created_at", ""))):
-                if rec.get("kind") != "payment":
-                    out.append(rec)
-                    continue
-                fp = _card_fingerprint(rec.get("secret") or {})
-                if fp not in keep:
-                    keep[fp] = rec
-                    out.append(rec)
-                    continue
-                first = keep[fp]
-                approved = list(first.get("approved_origins") or [])
-                for o in [rec.get("origin"), *(rec.get("approved_origins") or [])]:
-                    if o and o != first.get("origin") and o not in approved:
-                        approved.append(o)
-                first["approved_origins"] = approved
-                removed.append(str(rec.get("id")))
-            if removed:
-                order = {id(r): i for i, r in enumerate(items)}
-                self._write_all(sorted(out, key=lambda r: order[id(r)]))
-        return {"removed": removed, "kept": [str(r.get("id")) for r in keep.values()]}
-
     def list_items(self) -> List[VaultItemMeta]:
-        """Metadata-only listing. Secret payloads are never included.
-
-        Payment cards are not profile-private (t_78bb3d31): a profile vault also lists the payment items
-        of the shared root vault, so a card Chris saved once is visible to every worker. Logins and
-        addresses stay profile-scoped and origin-bound.
-        """
+        """Metadata-only listing. Secret payloads are never included."""
         with self._locked():
-            own = self._read_all()
-        shared = self._shared_payment_records()
-        # Canonical root copy first; a legacy profile-local copy of the same card is hidden so the
-        # list never exposes a stale handle in place of the corrected canonical record.
-        shared_fps = {_card_fingerprint(r.get("secret") or {}) for r in shared}
-        metas = [self._meta(rec) for rec in shared]
-        seen = {m.id for m in metas}
-        for rec in own:
-            if rec.get("id") in seen:
-                continue
-            if rec.get("kind") == "payment" and _card_fingerprint(rec.get("secret") or {}) in shared_fps:
-                continue
-            metas.append(self._meta(rec))
-        return metas
-
-    # -- shared payment cards (t_78bb3d31) -----------------------------------
-
-    def _shared_store(self) -> Optional["VaultStore"]:
-        """The root vault when this store is ``<root>/profiles/<name>/vault`` of a real Hermes root.
-
-        Derived structurally from this store's own path (the active contextual home), never from the
-        process-level default root, so an unrelated home or an explicit standalone store stays isolated.
-        """
-        if not self._share_payments:
-            return None
-        try:
-            base = self._base.resolve()
-            profile_home = base.parent
-            if base.name != "vault" or profile_home.parent.name != "profiles":
-                return None
-            root_home = profile_home.parent.parent
-            root = root_home / "vault"
-            if not (root / "vault.json.enc").exists():
-                return None
-        except OSError:
-            return None
-        return VaultStore(root, share_payments=False)
-
-    def _shared_payment_records(self) -> List[Dict[str, Any]]:
-        shared = self._shared_store()
-        if shared is None:
-            return []
-        try:
-            with shared._locked():
-                return [r for r in shared._read_all() if r.get("kind") == "payment"]
-        except Exception:
-            return []  # an unreadable shared vault never breaks the profile's own items
-
-    def _owner_of(self, item_id: str) -> "VaultStore":
-        """The store that physically holds ``item_id`` (this one, or the shared root for a payment card)."""
-        with self._locked():
-            if any(r.get("id") == item_id for r in self._read_all()):
-                return self
-        shared = self._shared_store()
-        if shared is not None and any(r.get("id") == item_id for r in self._shared_payment_records()):
-            return shared
-        return self
-
-    def allow_payment_origin(self, item_id: str, origin: str) -> List[str]:
-        """Record ``origin`` as a checkout Chris approved for payment card ``item_id`` (rebind/allow).
-
-        This is a record of approval, not a bypass: every fill still asks the user to confirm. Returns
-        the item's approved-origin list. Login and address items are refused (they stay origin-bound).
-        """
-        norm = normalize_origin(origin)
-        store = self._owner_of(item_id)
-        with store._locked():
-            items = store._read_all()
-            for rec in items:
-                if rec.get("id") == item_id:
-                    if rec.get("kind") != "payment":
-                        raise VaultError("only payment items can be approved for other checkouts")
-                    approved = [o for o in (rec.get("approved_origins") or []) if isinstance(o, str)]
-                    if rec.get("origin") and rec["origin"] not in approved:
-                        approved.insert(0, rec["origin"])
-                    if norm not in approved:
-                        approved.append(norm)
-                        rec["approved_origins"] = approved
-                        store._write_all(items)
-                    return approved
-        raise VaultError(f"no vault item with id {item_id!r}")
-
-    def payment_fingerprint(self, item_id: str) -> str:
-        """Non-reversible short digest of a card (number + expiry) for dedupe. Never the card data."""
-        return _card_fingerprint(self.resolve_secret(item_id))
+            return [self._meta(rec) for rec in self._read_all()]
 
     def has_items(self) -> bool:
         try:
@@ -594,9 +396,6 @@ class VaultStore:
             for rec in self._read_all():
                 if rec.get("id") == item_id:
                     return self._meta(rec)
-        for rec in self._shared_payment_records():
-            if rec.get("id") == item_id:
-                return self._meta(rec)
         return None
 
     def resolve_secret(self, item_id: str) -> dict[str, Any]:
@@ -609,9 +408,6 @@ class VaultStore:
             for rec in self._read_all():
                 if rec.get("id") == item_id:
                     return dict(rec.get("secret") or {})
-        for rec in self._shared_payment_records():
-            if rec.get("id") == item_id:
-                return dict(rec.get("secret") or {})
         raise VaultError(f"no vault item with id {item_id!r}")
 
     @staticmethod
@@ -626,24 +422,12 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
-            # Payment cards only: checkouts Chris approved (recorded at confirmed fills / rebind).
-            allowed_origins=tuple(o for o in ([rec.get("origin")] if rec.get("origin") else [])
-                                  + [o for o in (rec.get("approved_origins") or []) if o != rec.get("origin")]
-                                  if isinstance(o, str)) if rec.get("kind") == "payment" else (),
         )
 
 
 def get_vault_store() -> VaultStore:
     """Default profile-scoped vault store."""
     return VaultStore()
-
-
-def _card_fingerprint(secret: Dict[str, Any]) -> str:
-    """Non-reversible digest of card number + expiry, used only to spot duplicate saves."""
-    import hashlib
-    basis = "|".join([re.sub(r"\D", "", str(secret.get("card_number") or "")),
-                      str(secret.get("exp_month") or "").lstrip("0"), str(secret.get("exp_year") or "")[-2:]])
-    return hashlib.sha256(("hermes-vault-card:" + basis).encode()).hexdigest()[:16]
 
 
 def scrub_secret_from_text(text: str, secret: Dict[str, Any]) -> str:

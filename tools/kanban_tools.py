@@ -86,18 +86,8 @@ def _visible(*, to_env_worker: bool) -> bool:
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
-        return to_env_worker or _is_board_coordinator()
+        return to_env_worker
     return _profile_has_kanban_toolset()
-
-
-# Chris 2026-10-09: the board coordinator must be able to act on stuck cards
-# (list, unblock, move, archive), not just read them.
-_BOARD_COORDINATORS = frozenset({"claire", "scarlett", "steven", "riley", "lauren", "grace", "quinn"})
-
-
-def _is_board_coordinator() -> bool:
-    return (os.environ.get("HERMES_PROFILE") in _BOARD_COORDINATORS
-            and not _is_delegated_child_context())
 
 
 @no_cache_check_fn
@@ -391,7 +381,7 @@ def _worker_guard(tool_name: str, args: dict) -> str:
 def _require_orchestrator_tool(tool_name: str) -> None:
     """The check_fn already hides orchestrator tools from workers; this catches
     a stale registration or test harness routing a worker here anyway."""
-    if os.environ.get("HERMES_KANBAN_TASK") and not _is_board_coordinator():
+    if os.environ.get("HERMES_KANBAN_TASK"):
         raise _Reject(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_request_review, kanban_request_changes, kanban_block, "
@@ -1171,6 +1161,7 @@ def _handle_list(args: dict, **kw) -> str:
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     tid = _worker_guard("kanban_complete", args)
+    _retry_change_note_gate(tid, args.get("board"), "kanban_complete", args)
     summary = _redact_opt(args.get("summary"))
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
@@ -1286,10 +1277,47 @@ def _handle_complete(args: dict, **kw) -> str:
                        for a in kb.list_attachments(conn, tid)])
 
 
+def _record_needs(conn, tid, args, *, reason, kind, source):
+    """Best-effort: store the plain 'Needs from Chris' line for this card."""
+    try:
+        from hermes_cli import kanban_needs as _needs
+        explicit = args.get("needs_from_chris")
+        if explicit is not None:
+            explicit = redact_sensitive_text(str(explicit), force=True)
+        return _needs.record(conn, tid, explicit=explicit, reason=reason,
+                             kind=kind, source=source, link=args.get("needs_link"))
+    except Exception:
+        logger.debug("kanban needs_from_chris record failed", exc_info=True)
+        return None
+
+
+def _retry_change_note_gate(tid, board, tool, args=None):
+    """Repeated-failure retry must record a change note first (t_64ae1aaf).
+    Applies only to the dispatched worker acting on its own task. A genuine
+    owner-input / dependency block stays possible (t_b338f418 E)."""
+    if tid != os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if tool == "kanban_block" and (args or {}).get("kind") in ("needs_input", "dependency"):
+        return None
+    try:
+        from hermes_cli.retry_course_correction import gate_error
+        kb, conn = _connect(board=board)
+        try:
+            msg = gate_error(conn, tid, tool)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if msg:
+        raise _Reject(msg)
+    return None
+
+
 @_kanban_handler("kanban_block")
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _worker_guard("kanban_block", args)
+    _retry_change_note_gate(tid, args.get("board"), "kanban_block", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
@@ -1319,6 +1347,7 @@ def _handle_block(args: dict, **kw) -> str:
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        _record_needs(conn, tid, args, reason=reason, kind=kind, source="block")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
@@ -1450,6 +1479,7 @@ def _handle_owner_handoff(args: dict, **kw) -> str:
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     tid = _worker_guard("kanban_request_review", args)
+    _retry_change_note_gate(tid, args.get("board"), "kanban_request_review", args)
     summary = _redact(_require_text(
         args, "summary", "summary is required — describe what was implemented and how it "
         "was verified so the reviewer has context"))
@@ -1503,6 +1533,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 f"kanban_request_review with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
+        _record_needs(conn, tid, args, reason=summary, kind=None, source="review")
         return _ok_landed(kb, conn, tid, "review")
 
 
@@ -1601,6 +1632,13 @@ def _handle_comment(args: dict, **kw) -> str:
         pass
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        if tid == os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                from hermes_cli.retry_course_correction import record_change_note
+                if record_change_note(conn, tid, str(body), author):
+                    return _ok(task_id=tid, comment_id=cid, change_note_recorded=True)
+            except Exception:
+                logger.debug("retry change note record failed", exc_info=True)
         return _ok(task_id=tid, comment_id=cid)
 
 
@@ -1744,6 +1782,20 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # t_64ae1aaf: a nonexistent assignee (e.g. legacy "margot") is silently
+    # never dispatched; route agent-fixable work to a real profile instead.
+    try:
+        from hermes_cli.profiles import profile_exists as _pe
+        from hermes_constants import get_hermes_home as _ghh
+        _root = _ghh()
+        _root = _root.parent if _root.parent.name == "profiles" else _root
+        _pdir = _root / "profiles"
+        _populated = _pdir.is_dir() and any(x.is_dir() for x in _pdir.iterdir())
+        _known = _pe(str(assignee)) or not _populated
+    except Exception:
+        _known = True
+    _check(_known, f"assignee {assignee!r} is not an existing profile and would never be "
+                   "dispatched; assign an existing agent owner/operator profile instead")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing

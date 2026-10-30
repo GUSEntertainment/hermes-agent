@@ -134,8 +134,8 @@ TOOLSETS = {
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
-    "owner_board_control": _ts("Authenticated own-board listing, inspection, comments and lifecycle control.", ["own_work_list", "own_work_show", "own_work_comment", "own_work_manage"]),
-    "owner_delegation": _ts("Authenticated member delegation to agents in that member's enrolled workspace.", ["own_work_create", "own_agents_list", "own_agent_propose", "own_agent_confirm"]),
+    "owner_board_control": _ts("Authenticated own-board listing, inspection, comments and lifecycle control.", ["own_work_list", "own_work_show", "own_work_comment", "own_work_manage", "own_agent_equip"]),
+    "owner_delegation": _ts("Authenticated member delegation to agents in that member's enrolled workspace.", ["own_work_create", "own_agents_list", "own_agent_propose", "own_agent_confirm", "own_agent_update"]),
     "josh_status_pilot": _ts("Existing authenticated own-work pilot with request-scoped tool selection.", includes=["owner_delegation"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
 
@@ -168,7 +168,7 @@ TOOLSETS = {
         "first-class review (request_review — not a block), return review changes, "
         "block for human input, heartbeat during long ops, comment on threads, attach "
         "files, and (for orchestrators) list, unblock, and fan out tasks.",
-        [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")] + ["own_work_show", "own_work_manage", "own_work_comment", "own_work_list"],
+        [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")] + ["own_work_show", "own_work_manage", "own_work_comment", "own_work_list", "own_agent_equip"],
         includes=["owner_delegation"],
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),

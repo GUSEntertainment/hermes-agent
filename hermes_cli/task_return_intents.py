@@ -79,18 +79,19 @@ def _capture_handoff(conn, *, session_id, request):
         request['body'] = {'text': _ROUTING_METADATA_RE.sub('', body or ''),
                            'routing_metadata': metadata}
     digest = hashlib.sha256(_encode(request).encode()).hexdigest()
-    snap = delegation_handoff.consume(digest)
-    if snap is None or session_id != snap['session_id']:
-        raise PermissionError('Delegation handoff session mismatch')
     db = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
     if not db or Path(db).name != 'kanban.db':
         raise PermissionError('Native board database required')
     board = Path(db).parent.name
+    snap = delegation_handoff.consume(digest, board)
+    if snap is None or session_id != snap['session_id']:
+        raise PermissionError('Delegation handoff session mismatch')
     authority = snap['authority']
     if board not in authority.get('allowed_boards', [authority.get('board')]):
         raise PermissionError('Task return outside authenticated board')
     return dict(kind=KIND, profile=snap['profile'], run_id=snap['run_id'], session_id=snap['session_id'],
-                board=board, authority=authority, target=snap['target'], request_sha256=digest)
+                board=board, authority=authority, target=snap['target'], request_sha256=digest,
+                handoff_sha256=snap['handoff_sha256'])
 
 
 def _capture_gateway(conn, *, session_id, request):
@@ -147,6 +148,14 @@ def ensure(conn, task_id, binding, *, replay=False):
     elif old is not None:
         raise PermissionError('Task return intent already exists')
     else:
+        # A delegation handoff authorizes exactly one committed task. Checked
+        # inside the task's IMMEDIATE transaction, so concurrent or replayed
+        # presentations with a changed/absent idempotency key are refused,
+        # while a failed (rolled back) create leaves the token recoverable.
+        if binding.get('handoff_sha256') and conn.execute(
+                "SELECT 1 FROM task_return_intents WHERE json_extract(binding_json,'$.handoff_sha256')=?",
+                (binding['handoff_sha256'],)).fetchone():
+            raise PermissionError('Delegation handoff already bound to a committed task')
         conn.execute('INSERT INTO task_return_intents(task_id,binding_json) VALUES (?,?)', (task_id, raw))
     target = binding['target']
     old_sub = conn.execute('SELECT * FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?',
