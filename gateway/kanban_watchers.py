@@ -270,6 +270,14 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+
+def _pin_first_call(kb, fn):
+    """Run *fn* with env-pin-first board resolution (machine flow over enumerated boards)."""
+    def _wrapped():
+        with kb.pin_first_board_resolution():
+            return fn()
+    return _wrapped
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -679,7 +687,14 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                     return deliveries
 
-                deliveries = await asyncio.to_thread(_collect)
+                def _collect_pinned():
+                    # Board slugs here are list_boards() iteration variables, not caller intent:
+                    # resolve env-pin-first like upstream's _Collector (v0.22.5), or a
+                    # HERMES_KANBAN_DB-pinned gateway reads empty per-slug DBs and never delivers.
+                    with _kb.pin_first_board_resolution():
+                        return _collect()
+
+                deliveries = await asyncio.to_thread(_collect_pinned)
                 for d in deliveries:
                     if "attention" in d:
                         from gateway.owner_attention import deliver as deliver_owner_attention
@@ -688,7 +703,8 @@ class GatewayKanbanWatchersMixin:
                         try:
                             platform = _Platform(source["platform"])
                             adapter = self._authorization_adapter(platform, source.get("notifier_profile") or None)
-                            conn = _kb.connect(board=d["board"])
+                            with _kb.pin_first_board_resolution():
+                                conn = _kb.connect(board=d["board"])
                             try:
                                 await deliver_owner_attention(conn, attention, adapter, _attention_config)
                             finally:
@@ -1002,7 +1018,8 @@ class GatewayKanbanWatchersMixin:
                             _hb = _HELD_DELIVERY_BACKOFF.get(_hk)
                             if _hb and time.monotonic() < _hb[0]:
                                 break
-                            receipt_conn = _kb.connect(board=board_slug)
+                            with _kb.pin_first_board_resolution():
+                                receipt_conn = _kb.connect(board=board_slug)
                             try:
                                 await deliver(receipt_conn, sub, ev.id, msg, adapter, metadata,
                                               allow_artifacts=not d.get("trusted_report_back_enabled"))
@@ -1994,9 +2011,9 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled and periodic_tick:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(_tick_once)
+                    results = await _to_thread_process_service(_pin_first_call(_kb, _tick_once))
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
+                    ready_pending = await _to_thread_process_service(_pin_first_call(_kb, _ready_nonempty))
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
