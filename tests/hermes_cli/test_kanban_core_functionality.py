@@ -410,7 +410,10 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
-        kbd._set_worker_pid(conn, tid, 98765)
+        monkeypatch.setattr(
+            _kb, "_worker_process_identity", lambda pid: (int(pid), 1.0)
+        )
+        kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
 
@@ -1211,8 +1214,15 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     host_prefix = _kb._claimer_id().split(":", 1)[0]
     claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
     assert claimed is not None, "task was not claimable for the next attempt"
-    _kbd._set_worker_pid(conn, tid, fake_pid)
-    _kbd._record_worker_exit(fake_pid, raw_status)
+    original_identity = _kb._worker_process_identity
+    _kb._worker_process_identity = (
+        lambda pid: (pid, 1.0) if pid is not None else None
+    )
+    try:
+        assert _kb._set_worker_pid(conn, tid, fake_pid)
+    finally:
+        _kb._worker_process_identity = original_identity
+    _kb._record_worker_exit(fake_pid, raw_status)
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
@@ -1364,7 +1374,7 @@ def test_dead_worker_reap_surfaces_the_workers_own_last_output(kanban_home, driv
         conn.close()
 
 
-def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
+def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home, monkeypatch):
     """The reap must read the worker log under the board the tick runs for, not the
     ambient "current" board — otherwise every non-default board silently gets the canned
     message (the #88603 review finding)."""
@@ -1381,6 +1391,8 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
         log_path.write_text(_WORKER_LOG_TAIL)
         host_prefix = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
+        # [GUS port] custom guard needs an OS start identity; synthetic PIDs have none.
+        monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (int(pid), 1.0))
         kbd._set_worker_pid(conn, tid, 991101)
         kbd._record_worker_exit(991101, 0)
         original_alive = kb._pid_alive

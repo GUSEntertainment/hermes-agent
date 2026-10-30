@@ -828,12 +828,39 @@ class GatewaySlashCommandsMixin(
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
+
+        # Commands run before the ordinary model-turn session binding.
+        # Retain this authorized original event across the detached task.
+        from gateway.background_document_custody import prepare_origin
+        document_event = await prepare_origin(self, event)
+        source = document_event.source if document_event is not None else dataclasses.replace(event.source)
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
-        self._track_background_task(self._run_background_task(
-            prompt, event.source, task_id, event_message_id=self._reply_anchor_for_event(event),
-            # Forward image/audio attachments so the background agent can see them.
-            media_urls=list(event.media_urls or []), media_types=list(event.media_types or [])))
-        return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)
+
+        delivery_event = document_event.event if document_event is not None else event
+        event_message_id = self._reply_anchor_for_event(delivery_event)
+
+        # Forward image/audio attachments so the background agent can see them.
+        media_urls = list(delivery_event.media_urls) if delivery_event.media_urls else []
+        media_types = list(delivery_event.media_types) if delivery_event.media_types else []
+
+        # Fire-and-forget the background task
+        _task = asyncio.create_task(
+            self._run_background_task(
+                prompt,
+                source,
+                task_id,
+                event_message_id=event_message_id,
+                media_urls=media_urls,
+                media_types=media_types,
+                document_event=document_event,
+            )
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return t("gateway.background.started", preview=preview, task_id=task_id)
+
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:
         """Handle /btw <question> — one-shot auxiliary LLM call on a transcript snapshot; live history

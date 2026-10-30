@@ -217,10 +217,32 @@ def is_legacy_browser_use_cloud_config(browser_cfg: dict) -> bool:
 
 
 def is_browser_use_cli_mode() -> bool:
-    """True when the Browser Use CLI replaces the built-in browser stack. Browser Use mode is the DEFAULT:
-    unset ``browser.backend`` ("") enables it whenever the CLI is runnable (installed binary or uvx);
-    ``browser.backend: off`` keeps the built-in browser_* tools. Camofox always falls back to the built-in
-    tools (Firefox, custom HTTP API, no CDP surface for the harness)."""
+    """True when the Browser Use CLI replaces the built-in browser stack.
+
+    Browser Use mode is the DEFAULT: an unset ``browser.backend`` ("") enables
+    it whenever the browser-use CLI is runnable (installed binary or uvx).
+    Set ``browser.backend: off`` (or ``/browser use off``) for the built-in
+    browser_* tools.
+
+    Camofox always falls back to the built-in tools regardless of
+    ``browser.backend`` — it is Firefox-based with a custom HTTP API and no
+    CDP surface, so the CDP-only browser-use harness cannot drive it.
+    """
+    try:
+        from gateway.member_worker_policy import private_worker_active
+
+        if private_worker_active():
+            # Private owner workers use the isolated built-in browser only.
+            return False
+    except Exception:
+        return False
+    try:
+        from tools.browser_camofox import is_camofox_mode
+
+        if is_camofox_mode():
+            return False
+    except Exception as e:
+        logger.debug("Camofox activity check failed: %s", e)
     if _camofox_active():
         return False
     backend = get_browser_backend()

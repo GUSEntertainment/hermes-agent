@@ -390,7 +390,8 @@ class GatewayNotificationsMixin:
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        from gateway.direct_document_custody import send_selected
+                        await send_selected(adapter, event, media_path, _thread_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 

@@ -392,6 +392,9 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
 
     cache_file = get_hermes_home() / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    install_root = str(Path(__file__).parent.parent.resolve())
+    if not embedded_rev and _resolve_repo_dir() is None:
+        return None
     # Docker images have no working tree (the image excludes `.git`) and set no HERMES_REVISION.
     # None makes both the Rich banner and the Ink badge show nothing, mirroring the dashboard's
     # `/api/hermes/update/check` short-circuit so the surfaces agree.
@@ -409,7 +412,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir) if repo_dir is not None else None
     cached = _read_json(cache_file)
     if cached is not None and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION \
-            and cached.get("head") == head_rev:
+            and cached.get("head") == (head_rev or embedded_rev) \
+            and cached.get("install_root") == install_root:
         ttl = _UPDATE_CHECK_CACHE_SECONDS if cached.get("behind") is not None else _UPDATE_CHECK_FAILURE_CACHE_SECONDS
         if now - cached.get("ts", 0) < ttl:
             return cached.get("behind")
@@ -420,7 +424,7 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
         behind = _check_via_local_git(repo_dir) if repo_dir is not None else None
     _quiet(lambda: cache_file.write_text(
         json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION,
-                    "head": head_rev or embedded_rev, "target": _last_target_rev}),
+                    "head": head_rev or embedded_rev, "target": _last_target_rev, "install_root": install_root}),
         encoding="utf-8"))
     return behind
 
@@ -428,12 +432,10 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
 def _resolve_repo_dir() -> Optional[Path]:
     """The active Hermes git checkout, or None if this isn't a git install.
 
-    Prefers the running code's location: ``$HERMES_HOME/hermes-agent/`` may be a stale copy
-    carried over by ``--clone-all``.
+    The shared data home's ``hermes-agent`` path may point to another install.
+    A release without Git metadata uses its own baked build SHA instead.
     """
     repo_dir = Path(__file__).parent.parent.resolve()
-    if not (repo_dir / ".git").exists():
-        repo_dir = get_hermes_home() / "hermes-agent"
     return repo_dir if (repo_dir / ".git").exists() else None
 
 

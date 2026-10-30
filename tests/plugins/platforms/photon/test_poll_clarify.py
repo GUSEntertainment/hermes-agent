@@ -90,11 +90,13 @@ async def test_poll_vote_dispatched_as_choice_text(
 
 def _stub_sidecar_poll(
     adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch, *, ok: bool = True
-) -> List[Tuple[str, str, list]]:
-    calls: List[Tuple[str, str, list]] = []
+) -> List[Tuple[str, str, list, Optional[str]]]:
+    calls: List[Tuple[str, str, list, Optional[str]]] = []
 
-    async def fake_send_poll(space_id: str, title: str, options: list):
-        calls.append((space_id, title, list(options)))
+    async def fake_send_poll(
+        space_id: str, title: str, options: list, *, logical_message_id: str | None = None,
+    ):
+        calls.append((space_id, title, list(options), logical_message_id))
         return SendResult(
             success=ok,
             message_id="spc-msg-poll" if ok else None,
@@ -140,11 +142,37 @@ async def test_send_clarify_with_choices_sends_native_poll(
 
     assert result.success
     assert len(poll_calls) == 1
-    space_id, title, options = poll_calls[0]
+    space_id, title, options, logical_message_id = poll_calls[0]
     assert space_id == "+155****4567"
     assert title == "Pick one"
     assert options == ["A", "B", "C"]
+    assert logical_message_id == "clar-1"
     # The vote returns as text, so text-capture must be enabled.
     assert marked == ["clar-1"]
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_clarify_does_not_send_numbered_text_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reported failure can be an ambiguous acknowledgement after delivery."""
+    adapter = _make_adapter(monkeypatch)
+    poll_calls = _stub_sidecar_poll(adapter, monkeypatch, ok=False)
+    text_calls = _stub_sidecar_text(adapter, monkeypatch)
+
+    import tools.clarify_gateway as cg
+
+    monkeypatch.setattr(cg, "mark_awaiting_text", lambda _cid: None)
+    result = await adapter.send_clarify(
+        chat_id="+155****4567",
+        question="Pick one",
+        choices=["A", "B"],
+        clarify_id="clar-ambiguous",
+        session_key="sess-1",
+    )
+
+    assert not result.success
+    assert len(poll_calls) == 1
+    assert text_calls == []
 
 

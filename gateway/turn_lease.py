@@ -24,6 +24,13 @@ DEFAULT_MAX_LEASES = 512
 # never pin a sequential platform updater for minutes.
 DEFAULT_LEASE_WAIT = 5.0
 
+# Messages accepted and queued during a gateway startup restore were already
+# promised processing. When drained they wait (still serialized) behind any
+# resumed turn on the same session instead of being bounced after the short
+# live-contention budget (t_4d40d61d). Bounded so a wedged holder cannot pin a
+# drained message forever.
+STARTUP_RESTORE_REPLAY_LEASE_WAIT = 1800.0
+
 
 def _holder_desc(holder: Optional["TurnLeaseToken"]) -> tuple:
     return (holder.owner_key, holder.generation) if holder else ("?", "?")

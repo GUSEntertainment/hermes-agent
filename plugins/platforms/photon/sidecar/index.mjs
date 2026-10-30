@@ -62,11 +62,21 @@
 //   PHOTON_TELEMETRY       enable Spectrum SDK telemetry ("true"/"1"/"on"/"yes";
 //                          default off — toggle with `hermes photon telemetry`)
 
+import { normalizeContent, reactionTargetText } from "./inbound-content.mjs";
+import { sendText, resolveReplyTarget } from "./threaded-send.mjs";
 import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
+import {
+  attachmentPayload,
+  claimOutboundIntent,
+  normalizeOutboundText,
+  OutboundIntentBlocked,
+  outboundGuardSnapshot,
+} from "./outbound-send-guard.mjs";
+import { buildAttachmentContent } from "./voice-attachment.mjs";
 import {
   classifyProbeRejection,
   createProbeMessageId,
@@ -304,6 +314,7 @@ let Spectrum,
   voice,
   spectrumText,
   spectrumMarkdown,
+  spectrumReply,
   spectrumRichlink,
   spectrumTyping,
   spectrumPoll,
@@ -316,6 +327,7 @@ try {
     poll: spectrumPoll,
     text: spectrumText,
     markdown: spectrumMarkdown,
+    reply: spectrumReply,
     richlink: spectrumRichlink,
     typing: spectrumTyping,
   } = await import("spectrum-ts"));
@@ -488,116 +500,6 @@ async function normalizeBinaryContent(content) {
 // hydrated here — no extra round trip. Handles plain text and our patched mixed
 // text+attachment groups (first text child); null for attachment/voice-only
 // targets. Capped so one long bubble can't balloon the NDJSON line.
-const REACTION_TARGET_TEXT_CAP = 2000;
-function reactionTargetText(target) {
-  const c = target && typeof target === "object" ? target.content : null;
-  if (!c || typeof c !== "object") return null;
-  let text = null;
-  if (c.type === "text") {
-    text = c.text;
-  } else if (c.type === "richlink") {
-    text = c.url;
-  } else if (c.type === "group") {
-    for (const item of Array.isArray(c.items) ? c.items : []) {
-      const ic = item && typeof item === "object" ? item.content : null;
-      if (ic && ic.type === "text" && ic.text) {
-        text = ic.text;
-        break;
-      }
-      if (ic && ic.type === "richlink" && ic.url) {
-        text = ic.url;
-        break;
-      }
-    }
-  }
-  if (typeof text !== "string" || !text) return null;
-  return text.length > REACTION_TARGET_TEXT_CAP
-    ? text.slice(0, REACTION_TARGET_TEXT_CAP)
-    : text;
-}
-
-async function normalizeContent(content) {
-  if (!content || typeof content !== "object") {
-    return { type: "unknown" };
-  }
-  if (content.type === "text") {
-    return { type: "text", text: content.text || "" };
-  }
-  if (content.type === "richlink") {
-    const out = { type: "richlink", url: content.url || "" };
-    if (typeof content.title === "string") {
-      out.title = content.title;
-    }
-    if (typeof content.summary === "string") {
-      out.summary = content.summary;
-    }
-    return out;
-  }
-  if (content.type === "attachment" || content.type === "voice") {
-    return await normalizeBinaryContent(content);
-  }
-  if (content.type === "group") {
-    const items = [];
-    for (const item of Array.isArray(content.items) ? content.items : []) {
-      items.push({
-        id: item && typeof item === "object" ? item.id ?? null : null,
-        content: await normalizeContent(item?.content),
-      });
-    }
-    return { type: "group", items };
-  }
-  if (content.type === "read") {
-    // spectrum-ts v12.5+ surfaces an inbound read receipt only after it has
-    // verified that the target is one of our outbound messages. Keep the
-    // receipt lightweight: Python records it as telemetry, never as an agent
-    // prompt.
-    return {
-      type: "read",
-      targetMessageId: content.target?.id ?? null,
-      targetDirection: content.target?.direction ?? null,
-    };
-  }
-  if (content.type === "reaction") {
-    const target = content.target;
-    return {
-      type: "reaction",
-      emoji: content.emoji || "",
-      targetMessageId: target?.id ?? null,
-      // Lets Python gate "is this a reaction to one of MY messages" without
-      // tracking every outbound id. May be null if the provider doesn't
-      // hydrate the target — Python falls back to its own sent-id cache.
-      targetDirection: target?.direction ?? null,
-      // Text of the reacted-to message, so Python can correlate the tapback to
-      // the gateway's reply_to_text. Null for attachment/voice-only targets.
-      targetText: reactionTargetText(target),
-    };
-  }
-  // A user tapping a poll choice arrives as `poll_option` carrying the chosen
-  // option title + whether it was selected (true) or deselected (false). This
-  // is how a native iMessage poll's vote streams back — Python turns a
-  // selection into the answer that resolves a pending `clarify`.
-  if (content.type === "poll_option") {
-    return {
-      type: "poll_option",
-      title: content.option?.title ?? content.title ?? "",
-      selected: content.selected !== false,
-      pollTitle: content.poll?.title ?? null,
-    };
-  }
-  // The poll message itself (its creation) — surfaced for completeness so the
-  // agent isn't told "content type not handled" if it sees the echo.
-  if (content.type === "poll") {
-    return {
-      type: "poll",
-      title: content.title ?? "",
-      options: Array.isArray(content.options)
-        ? content.options.map((o) => o?.title ?? "")
-        : [],
-    };
-  }
-  return { type: content.type || "unknown" };
-}
-
 // The iMessage SDK exposes `message.read()` for inbound messages. Mark after
 // the event has crossed the sidecar boundary: this means the gateway has
 // actually received it, while a transient agent/tool delay does not leave the
@@ -621,6 +523,29 @@ async function acknowledgeInboundRead(message) {
   }
 }
 
+// Replies often arrive with an unhydrated target (id only), leaving the
+// gateway's reply_to_text empty so Margot can't tell what was replied to.
+// Fetch the quoted bubble by id from the same space when text is missing.
+async function hydrateReplyTarget(space, content) {
+  try {
+    let c = content;
+    for (let i = 0; i < 4 && c && c.type === "reply"; i++) {
+      if (!c.targetText && c.targetMessageId && typeof space?.getMessage === "function") {
+        const t = await Promise.race([space.getMessage(c.targetMessageId), new Promise(r => setTimeout(() => r(null), 3000))]);
+        if (t && (!t.space?.id || t.space.id === space.id)) {
+          c.targetText = reactionTargetText(t);
+          if (!c.targetSpaceId) c.targetSpaceId = t.space?.id ?? space.id ?? null;
+          if (!c.targetDirection) c.targetDirection = t.direction ?? null;
+        }
+      }
+      c = c.content;
+    }
+  } catch (e) {
+    console.warn("photon-sidecar: reply target hydrate failed: " + (e?.message || String(e)));
+  }
+  return content;
+}
+
 async function normalizeEvent(space, message) {
   try {
     const msgSpace = message.space || {};
@@ -635,7 +560,7 @@ async function normalizeEvent(space, message) {
         phone: space.phone ?? msgSpace.phone ?? null,
       },
       sender: { id: message.sender ? message.sender.id : null },
-      content: await normalizeContent(message.content),
+      content: await hydrateReplyTarget(space, await normalizeContent(message.content, normalizeBinaryContent)),
       timestamp:
         ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
     };
@@ -841,6 +766,12 @@ function badRequest(res, msg) {
   res.end(JSON.stringify({ ok: false, error: msg }));
 }
 
+function conflict(res, msg) {
+  res.statusCode = 409;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ ok: false, error: msg, error_class: "duplicate_intent", retryable: false }));
+}
+
 function classifySidecarError(err) {
   const message = String(err && err.message ? err.message : err || "");
   const lowered = message.toLowerCase();
@@ -899,6 +830,27 @@ function serverError(res, err) {
     error: "internal sidecar error",
     error_class: classified.errorClass,
     retryable: classified.retryable,
+  }));
+}
+
+function compositeCaptionError(res, err) {
+  const classified = classifySidecarError(err);
+  const ambiguous = classified.errorClass === "upstream_transient";
+  res.statusCode = 502;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({
+    ok: false,
+    error: "attachment sent but caption delivery did not complete",
+    error_class: ambiguous
+      ? "composite_caption_ambiguous"
+      : "composite_caption_rejected",
+    // The attachment transport call already completed and the durable intent
+    // covers the whole attachment+caption composite.  Retrying either part
+    // automatically could duplicate visible content.
+    retryable: false,
+    delivery_state: ambiguous ? "ambiguous" : "failed",
+    attachment_sent: true,
+    automatic_retry_safe: false,
   }));
 }
 
@@ -1017,7 +969,7 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (req.url === "/healthz") {
-      return ok(res, { stream: streamHealthSnapshot() });
+      return ok(res, { stream: streamHealthSnapshot(), outboundGuard: outboundGuardSnapshot() });
     }
     if (req.url === "/probe") {
       // Upstream liveness probe. Drives a cheap unary read over the SAME gRPC
@@ -1047,69 +999,76 @@ const server = http.createServer(async (req, res) => {
     }
     const body = await readBody(req);
     if (req.url === "/send") {
-      const { spaceId, text, format = "text" } = body || {};
-      if (!spaceId || typeof text !== "string") {
-        return badRequest(res, "spaceId and text are required");
+      try {
+        const result = await sendText(body, {
+          resolveSpace, claimOutboundIntent, normalizeOutboundText,
+          chooseSendFormat, text: spectrumText, markdown: spectrumMarkdown,
+          reply: spectrumReply,
+          richlink: spectrumRichlink,
+        });
+        return ok(res, { messageId: result?.id || null });
+      } catch (error) {
+        if (error instanceof OutboundIntentBlocked) return conflict(res, error.message);
+        if (error instanceof TypeError) return badRequest(res, error.message);
+        throw error;
       }
-      if (format !== "text" && format !== "markdown") {
-        return badRequest(res, "format must be text or markdown");
-      }
-      const space = await resolveSpace(spaceId);
-      // iMessage renders markdown natively; spectrum-ts degrades it to
-      // readable plain text on platforms that don't.
-      // spectrumMarkdown() enables enableDataDetection in the underlying
-      // iMessage API, which can 500 on messages containing raw URLs.
-      // Plain-text URLs are auto-linked by iMessage, so route markdown
-      // messages that contain URLs through spectrumText while preserving
-      // spectrumMarkdown for URL-free markdown. The decision lives in
-      // send-format.mjs so tests can exercise it directly.
-      const builder =
-        chooseSendFormat(format, text) === "markdown"
-          ? spectrumMarkdown(text)
-          : spectrumText(text);
-      const result = await space.send(builder);
-      return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-richlink") {
-      const { spaceId, url } = body || {};
+      const { spaceId, url, logicalMessageId = null } = body || {};
       if (!spaceId || !isHttpUrl(url)) {
         return badRequest(res, "spaceId and http(s) url are required");
       }
       const space = await resolveSpace(spaceId);
+      try {
+        claimOutboundIntent({ kind: "richlink", target: spaceId, payload: normalizeOutboundText(url.trim()), logicalMessageId });
+      } catch (error) {
+        if (error instanceof OutboundIntentBlocked) return conflict(res, error.message);
+        throw error;
+      }
       const result = await space.send(spectrumRichlink(url.trim()));
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
-      const { spaceId, path, name, mimeType, caption, kind } =
+      const { spaceId, path, name, mimeType, caption, kind, logicalMessageId = null, replyTo = null } =
         body || {};
       if (!spaceId || typeof path !== "string" || !path) {
         return badRequest(res, "spaceId and path are required");
       }
       const space = await resolveSpace(spaceId);
+      let replyTarget;
+      try { replyTarget = await resolveReplyTarget(space, replyTo); }
+      catch (error) { if (error instanceof TypeError) return badRequest(res, error.message); throw error; }
+      try {
+        claimOutboundIntent({ kind: kind === "voice" ? "voice" : "attachment", target: spaceId, payload: replyTo ? JSON.stringify({ replyTo, attachment: attachmentPayload(path, caption) }) : attachmentPayload(path, caption), logicalMessageId });
+      } catch (error) {
+        if (error instanceof OutboundIntentBlocked) return conflict(res, error.message);
+        throw error;
+      }
 
       // spectrum-ts infers name + MIME from the file extension; pass
       // overrides only when Hermes supplied them so a known-good
       // inference isn't clobbered with an empty string.
-      const opts = {};
-      if (name) opts.name = name;
-      if (mimeType) opts.mimeType = mimeType;
-      const builder =
-        kind === "voice"
-          ? voice(path, Object.keys(opts).length ? opts : undefined)
-          : attachment(path, Object.keys(opts).length ? opts : undefined);
+      let builder = buildAttachmentContent(
+        { path, name, mimeType, kind },
+        { attachment, voice },
+      );
 
+      if (replyTarget) builder = spectrumReply(builder, replyTarget);
       const result = await space.send(builder);
+      if (replyTarget && !result?.id) throw new Error("Attachment reply delivery was not acknowledged");
 
       // iMessage delivers the caption as a separate bubble; send it
       // after the media so the attachment renders first.
       if (caption && typeof caption === "string") {
         try {
-          await space.send(spectrumText(caption));
+          const captionBuilder = spectrumText(caption);
+          await space.send(replyTarget ? spectrumReply(captionBuilder, replyTarget) : captionBuilder);
         } catch (e) {
           console.error(
             "photon-sidecar: attachment sent but caption failed: " +
               (e && e.stack ? e.stack : String(e))
           );
+          return compositeCaptionError(res, e);
         }
       }
       return ok(res, { messageId: result?.id || null });
@@ -1173,7 +1132,7 @@ const server = http.createServer(async (req, res) => {
       return badRequest(res, "no tracked reaction for message");
     }
     if (req.url === "/send-poll") {
-      const { spaceId, title, options } = body || {};
+      const { spaceId, title, options, logicalMessageId = null } = body || {};
       const choices = Array.isArray(options)
         ? options.map((option) => String(option || "").trim()).filter(Boolean)
         : [];
@@ -1184,11 +1143,17 @@ const server = http.createServer(async (req, res) => {
         return badRequest(res, "options must contain at least two choices");
       }
       const space = await resolveSpace(spaceId);
+      try {
+        claimOutboundIntent({ kind: "poll", target: spaceId, payload: JSON.stringify({ title: title.trim(), choices }), logicalMessageId });
+      } catch (error) {
+        if (error instanceof OutboundIntentBlocked) return conflict(res, error.message);
+        throw error;
+      }
       const result = await space.send(spectrumPoll(title.trim(), choices));
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-effect") {
-      const { spaceId, text, effect } = body || {};
+      const { spaceId, text, effect, logicalMessageId = null } = body || {};
       const effectName = String(effect || "").trim();
       const effectId = MESSAGE_EFFECTS[effectName];
       if (!spaceId || typeof text !== "string" || !text.trim()) {
@@ -1198,6 +1163,12 @@ const server = http.createServer(async (req, res) => {
         return badRequest(res, "unsupported effect");
       }
       const space = await resolveSpace(spaceId);
+      try {
+        claimOutboundIntent({ kind: "effect", target: spaceId, payload: `${effectName}\0${normalizeOutboundText(text)}`, logicalMessageId });
+      } catch (error) {
+        if (error instanceof OutboundIntentBlocked) return conflict(res, error.message);
+        throw error;
+      }
       const result = await space.send(
         imessageEffect(spectrumText(text.trim()), effectId)
       );

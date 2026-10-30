@@ -1,0 +1,2208 @@
+version: 1
+updated_at: '2026-08-24T00:49:13Z'
+source: t_d5674bf1+t_75196447+t_3d465f26+t_766cbf23+t_5a129c0e+t_9ec788c2+t_f5a012d5+t_51cd455a+t_05c89a90+t_6da0d4c3+t_a1e5673e
+roles:
+- id: chief_of_staff
+  name: Margot · Chief of Staff
+  scope: Margot is Chris's chief of staff and owns outcomes. Stay with Chris for brainstorming, strategy, critique,
+    decision support and extended discussion, however intellectually difficult. Complete small bounded actions directly
+    when that is the best use of time. Choose direct work, a focused specialist consultation, or structured delegation
+    by weighing scope, expertise, sustained execution, risk, and handoff overhead. A tool call or an important topic
+    alone does not require delegation. Delegate larger builds and important execution tasks when specialist ownership
+    or sustained capacity adds value. Give the relevant Astra department head the outcome, context, constraints,
+    acceptance criteria and return destination. That head directs the named Sol worker and accepts or returns the
+    exact work for same-card correction. Start with one worker; add workers only for independent deliverables. Do
+    not insert Claire when another department is clearly responsible; use Claire for cross-department coordination.
+    Stay available to Chris while departments work, track progress, resolve blockers, inspect evidence and close
+    the loop with a reviewed result. A consultation can answer one question without transferring the whole conversation.
+    Preserve all existing privacy boundaries, specialist reviews and human-action approval gates. Only claim work
+    is running with a real accepted task handle, and only claim completion with verified evidence. Routine scripts
+    and monitoring keep their existing lightweight lanes. Do not turn QA or routine reversible work into an extra
+    human approval gate.
+  does_not_own:
+  - Deep specialist execution when another runtime is better
+  - Final approvals — Chris decides
+  default_runtimes:
+  - agent: Margot
+    profile: default
+    notes: Primary Hermes hub runtime
+    spawnable: true
+    kanban_assignee: default
+  - agent: Roxy
+    profile: roxy
+    notes: Peer CEO/Grok Bot orchestrator. Prefer for Grok-side work; use typed Agent-Shared handoff + Telegram
+      -5297983914. See role ceo_grok_roxy.
+    spawnable: true
+    kanban_assignee: roxy
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  - finance
+  - legal
+  - personnel
+  - family
+  - creator_only
+  approval_gates:
+  - destructive
+  - config
+  - external_send
+  - financial
+  - legal
+  - personnel
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - mission_control
+  - wearable
+  - phone
+  - cron
+  - manual
+  example_task_templates:
+  - title: Triage a new founder request and route it
+    when: A request arrives without a clear specialist owner yet
+    next_action: Classify the request and dispatch to the best runtime or hold for approval
+    privacy_tier: team
+  - title: Prepare Chris approval queue
+    when: A task hits a gate that needs Chris before action
+    next_action: Summarize the decision and hold the task at needs_approval
+    privacy_tier: founders
+    approval_gate: external_send
+  pod:
+    display_name: Margot Hub Pod
+    slug: margot-hub
+    named_owner: Margot
+    default_owner_role: Chief of Staff
+    verifier_role: Margot / Chris Approval Gate
+    member_roles:
+    - name: Chief of Staff
+      slug: chief-of-staff
+      named_subagent: Margot
+      owns: Intake, triage, routing, prioritization, and status ownership across pods.
+      kanban_assignee: default
+      status: active
+    - name: Source Capture
+      slug: source-capture
+      named_subagent: Margot
+      owns: Preserves provenance/source surface before synthesis or delegation.
+      kanban_assignee: default
+      status: active
+    - name: Router
+      slug: router
+      named_subagent: Margot
+      owns: Maps requests to department owner, runtime assignee, verifier, privacy tier, and return surface.
+      kanban_assignee: default
+      status: active
+    - name: Approval Queue Owner
+      slug: approval-queue-owner
+      named_subagent: Margot
+      owns: Packages destructive/config/external/financial/legal/personnel gates for Chris.
+      kanban_assignee: default
+      status: active
+    - name: Result Verifier
+      slug: result-verifier
+      named_subagent: Margot
+      owns: Checks that outputs satisfy the request before returning them to the source surface.
+      kanban_assignee: default
+      status: active
+- id: assistant_ops
+  name: Lauren · Assistant Ops
+  scope: Calendar, reminders, inboxes, scheduling, admin follow-ups, and task hygiene. Keeps loose threads from
+    piling up.
+  does_not_own:
+  - Financial decisions
+  - Legal commitments
+  - Production engineering
+  default_runtimes:
+  - agent: Lauren / Astra — Accountable department head
+    profile: lauren
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Rowan — Operations Maker / Sol — Persistent maker
+    profile: ops-rowan
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  - personnel
+  approval_gates:
+  - external_send
+  - external_calendar_invite
+  - sensitive_personal_data
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - wearable
+  - phone
+  - manual
+  example_task_templates:
+  - title: Schedule a shoot and reminders
+    when: Chris needs logistics coordinated across people and dates
+    next_action: Confirm availability, lock the slot, and queue reminders
+    privacy_tier: team
+  pod:
+    display_name: Lauren Assistant Ops Pod
+    slug: lauren-assistant-ops
+    named_owner: Lauren
+    default_owner_role: Assistant Ops Lead
+    verifier_role: Admin Follow-through Verifier
+    member_roles:
+    - name: Assistant Ops Lead
+      slug: assistant-ops-lead
+      named_subagent: Lauren
+      owns: Owns admin/logistics flow and keeps loose personal/team follow-ups moving.
+      kanban_assignee: lauren
+      status: active
+    - name: Calendar Coordinator
+      slug: calendar-coordinator
+      named_subagent: Lauren
+      owns: Prepares scheduling plans, holds invites at approval gates when external.
+      kanban_assignee: lauren
+      status: active
+    - name: Reminder Tracker
+      slug: reminder-tracker
+      named_subagent: Lauren
+      owns: Sets up and verifies reminders and recurring admin follow-ups.
+      kanban_assignee: lauren
+      status: active
+    - name: Inbox/Admin Follow-up
+      slug: inbox-admin-follow-up
+      named_subagent: Lauren
+      owns: Drafts or queues admin follow-up work without sending externally unless approved.
+      kanban_assignee: lauren
+      status: active
+    - name: Task Hygiene Support
+      slug: task-hygiene-support
+      named_subagent: Lauren
+      owns: Keeps admin task lists organized and routes non-admin work back to Margot/Claire.
+      kanban_assignee: lauren
+      status: active
+  owner_of_record:
+    accountable_owner_profile: lauren
+    default_maker_profile: ops-rowan
+    default_maker_display_name: Rowan — Operations Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+    support_profiles: []
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: ops_control
+  name: Claire · Operations Control
+  scope: 'Keeps active work moving after intake: task shaping, queue control, dependency chasing, approval packaging,
+    cross-pod handoffs, and cockpit-ready status reporting. Claire is flow control, not logistics/admin.'
+  does_not_own:
+  - Final strategic prioritization
+  - Specialist execution
+  - External sends or commitments without approval
+  - Financial, legal, personnel, production deploy, restart, or config decisions
+  default_runtimes:
+  - agent: Claire
+    profile: claire
+    notes: Dedicated Claire operations-control profile; verified on disk. Use for queue shaping, dependency chasing,
+      approval packaging, and board flow control.
+    spawnable: true
+    kanban_assignee: claire
+  - agent: Claire
+    profile: default
+    notes: Command-layer fallback and approval gate owner; use only when Claire lane is not appropriate.
+    spawnable: true
+    kanban_assignee: default
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - external_send
+  - financial
+  - legal
+  - personnel
+  - deploy
+  - restart
+  - config
+  - destructive
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - cron
+  - manual
+  pod:
+    display_name: Claire Ops Pod
+    slug: claire-ops
+    named_owner: Claire
+    default_owner_role: Operations Lead
+    verifier_role: Workflow Verifier
+    member_roles:
+    - name: Operations Lead
+      slug: operations-lead
+      named_subagent: Claire
+      owns: Owns queue flow, dependency visibility, and operational handoffs.
+      kanban_assignee: claire
+      status: active
+    - name: Intake Shaper
+      slug: intake-shaper
+      named_subagent: Claire
+      owns: Turns loose asks into executable, owner-tagged cards or approval packets.
+      kanban_assignee: claire
+      status: active
+    - name: Queue Controller
+      slug: queue-controller
+      named_subagent: Claire
+      owns: Audits active boards for stale, duplicate, blocked, or misrouted work.
+      kanban_assignee: claire
+      status: active
+    - name: Dependency Chaser
+      slug: dependency-chaser
+      named_subagent: Claire
+      owns: Finds missing upstream outputs and routes follow-up to the right owner.
+      kanban_assignee: claire
+      status: active
+    - name: Approval Packager
+      slug: approval-packager
+      named_subagent: Claire
+      owns: Summarizes gates, recommended choices, consequences, and next action for Chris.
+      kanban_assignee: claire
+      status: active
+    - name: Workflow Verifier
+      slug: workflow-verifier
+      named_subagent: Claire
+      owns: Confirms board metadata, assignees, dependencies, and handoff completeness.
+      kanban_assignee: claire
+      status: active
+  example_task_templates:
+  - title: Audit chris-home for stale or misrouted cards
+    when: The shared command queue has loose follow-ups, unclear owners, or board visibility gaps
+    next_action: Identify stale/misrouted cards on chris-home, add explicit owner/verifier/return surface metadata,
+      and spawn specialist follow-ups only when needed
+    privacy_tier: team
+  - title: Prepare Chris approval queue for current blockers
+    when: Blocked items need a clean decision packet before action
+    next_action: Package each decision with context, recommended choice, and consequence, then hold for approval
+    privacy_tier: founders
+- id: accountant_finance
+  name: Finance / Accounting · Maya
+  scope: 'Maya owns finance/accounting ops packet preparation and approval-gated follow-through: invoices, expenses,
+    payment reminders, budget/books prep, and bookkeeping support. Financial visibility stays gated; money movement,
+    banking, tax claims, full-financial disclosure, and external sends stop at approval gates. Fable review is required
+    on a compact, redacted packet after Maya exact-artifact review and before final finance reporting.'
+  does_not_own:
+  - Executing payments without approval
+  - Banking or tax actions without approval
+  - Sharing full financials beyond Chris/Connor unless Chris explicitly expands access
+  - Legal advice or legal commitments
+  default_runtimes:
+  - agent: Maya / Astra — Accountable department head
+    profile: maya
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Ellis — Finance Maker / Sol — Persistent maker
+    profile: finance-ellis
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - finance
+  - founders
+  approval_gates:
+  - payment
+  - banking
+  - tax_claim
+  - share_full_financials
+  - external_send
+  - fable_review_required
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - manual
+  example_task_templates:
+  - title: Follow up on an overdue invoice
+    when: A client payment is late but terms may have changed
+    next_action: Confirm latest payment terms, then send or queue the reminder
+    privacy_tier: finance
+    approval_gate: external_send
+  pod:
+    display_name: Maya Finance / Accounting Pod
+    slug: maya-finance-accounting
+    named_owner: Maya
+    default_owner_role: Finance / Accounting Ops Owner
+    verifier_role: Maya/Astra acceptance + required Fable redacted review + Chris/Connor approval gate
+    member_roles:
+    - name: Finance / Accounting Ops Owner
+      slug: finance-accounting-ops-owner
+      named_subagent: Maya
+      owns: Owns finance/accounting packet preparation and stops at approval gates.
+      kanban_assignee: maya
+      status: active
+    - name: Invoice/Expense Packet Prep
+      slug: invoice-expense-packet-prep
+      named_subagent: Maya
+      owns: Prepares invoice, expense, payment-reminder, and bookkeeping support packets.
+      kanban_assignee: maya
+      status: active
+    - name: Budget/Books Prep
+      slug: budget-books-prep
+      named_subagent: Maya
+      owns: Drafts budget, reconciliation, and accounting-support summaries without executing payments.
+      kanban_assignee: maya
+      status: active
+    - name: Fable Finance Review
+      slug: fable-finance-review
+      named_subagent: Fable Review
+      owns: Required independent review of compact, redacted finance packets after Maya exact-artifact review and
+        before final return.
+      kanban_assignee: fable-review
+      status: required_review
+    - name: Chris/Connor Approval Gate
+      slug: chris-connor-approval-gate
+      named_subagent: Chris/Connor/Margot
+      owns: Holds payments, banking, tax claims, external sends, and full-financial-sharing decisions.
+      kanban_assignee: default
+      status: active
+  owner_of_record:
+    department_owner: Maya
+    runtime_status: profile_installed_hardened_launch_allowlist
+    runtime_assignee_policy: New finance work routes Maya/Astra to Ellis/Sol in owner-acceptance mode. Maya inspects
+      the exact artifact; compact redacted finance packets then require Fable review before final reporting. Payments,
+      banking, tax, external sends, and full-financial sharing remain human approval gates.
+    default_executor: finance-ellis
+    secondary_review: fable-review required on compact redacted finance packets after Maya review and before final
+      reporting
+    verifier: Chris/Connor/Margot
+    return_surface_required: true
+    accountable_owner_profile: maya
+    default_maker_profile: finance-ellis
+    default_maker_display_name: Ellis — Finance Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+    required_secondary_reviewer_profile: fable-review
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+    required_secondary_reviewer_profile: fable-review
+    secondary_review_stage: after_owner_exact_artifact_review_before_final_report
+- id: legal_compliance
+  name: Legal / Counsel Ops · Legal Drafter + Steven
+  scope: Steven/Astra owns canonical inbound legal-topic intake, source containment, package framing, and consequential
+    legal/counsel-ops gates. Legal Drafter owns the dependency-gated first-pass draft only after Steven creates
+    the package; Steven/Astra then performs exact-artifact senior review. Chris/external counsel owns legal commitments,
+    signatures, counsel/client sends, and external sends. A compact, redacted Fable review is required after Steven
+    exact-artifact review and before final legal reporting; it does not replace Steven or Chris/counsel gates.
+  does_not_own:
+  - Final legal conclusions or legal advice
+  - Signing or committing on Chris's behalf
+  - Counsel/client/third-party sends without approval
+  - Raw privileged material sharing without approval
+  - Logged-in legal/account/e-signature/payment portal actions without approval
+  default_runtimes:
+  - agent: Steven / Astra — Accountable department head
+    profile: steven
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Avery — Legal Drafter / Sol — Persistent maker
+    profile: legal-drafter
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - legal
+  - founders
+  approval_gates:
+  - steven_review_required
+  - legal_commitment
+  - signature
+  - counsel_send
+  - external_send
+  - raw_privileged_disclosure
+  - fable_review_required
+  source_surfaces:
+  - telegram_topic
+  - wearable
+  - manual
+  example_task_templates:
+  - title: Draft an NDA/release/SOW packet for Steven review
+    when: A production, partnership, contractor, or client workflow needs first-pass legal paperwork or clause comparison
+      before review
+    next_action: Steven/Astra creates the source-contained package; Legal Drafter prepares a dependency-gated draft-only
+      packet; Steven/Astra performs exact-artifact review before Chris/counsel gates
+    privacy_tier: legal
+    approval_gate: steven_review_required
+  - title: Review a junior legal draft
+    when: A Legal Drafter packet affects rights, obligations, signatures, sends, or legal commitments
+    next_action: Steven reviews/edits/returns the packet and identifies unresolved decisions for Chris/counsel
+    privacy_tier: legal
+    approval_gate: legal_commitment
+  pod:
+    display_name: Steven Legal / Counsel Ops Pod
+    slug: steven-legal-counsel
+    named_owner: Steven
+    default_owner_role: Steven Senior Legal Owner
+    verifier_role: Steven/Astra required senior review + required Fable redacted review + Chris/Counsel approval
+      gate
+    member_roles:
+    - name: Junior Legal Drafter
+      slug: junior-legal-drafter
+      named_subagent: Legal Drafter
+      owns: First-pass legal-operations drafts, clause inventories, summaries, issue lists, redlines/change logs,
+        and Steven-ready handoff packets. Draft-only; no legal advice.
+      kanban_assignee: legal-drafter
+      status: active
+    - name: Steven Senior Legal Reviewer
+      slug: steven-senior-legal-reviewer
+      named_subagent: Steven
+      owns: Required Astra/high senior legal/counsel-ops review for consequential legal drafts; edits/returns drafts
+        and identifies unresolved decisions.
+      kanban_assignee: steven
+      status: required_review
+    - name: Terms/Risk Notes
+      slug: terms-risk-notes
+      named_subagent: Legal Drafter → Steven
+      owns: Flags terms, rights, payment, IP, confidentiality, termination, signature, counsel, and legal-commitment
+        risks for Steven review and Chris/counsel approval.
+      kanban_assignee: legal-drafter
+      status: active
+    - name: Fable Required Independent Review
+      slug: fable-required-independent-review
+      named_subagent: Fable Review
+      owns: Required independent review of compact, redacted legal packets after Steven exact-artifact review; cannot
+        replace Steven or Chris/counsel approval.
+      kanban_assignee: fable-review
+      status: required_review
+    - name: Chris/Counsel Approval Gate
+      slug: chris-counsel-approval-gate
+      named_subagent: Chris/Counsel/Margot
+      owns: Holds signatures, legal commitments, counsel/client sends, external sends, and raw privileged disclosure
+        decisions.
+      kanban_assignee: default
+      status: approval_gate
+  owner_of_record:
+    department_owner: Steven
+    runtime_status: legal_drafter_profile_installed_under_required_steven_review
+    runtime_assignee_policy: New legal draft work routes Steven/Astra to Avery/legal-drafter in owner-acceptance
+      mode. Steven performs exact-artifact senior review; a compact redacted Fable review is then required before
+      final reporting. Chris/counsel retains commitments, signatures, and external sends.
+    default_executor: legal-drafter
+    required_senior_reviewer: steven
+    verifier: Steven/Astra + Chris/Counsel
+    return_surface_required: true
+    accountable_owner_profile: steven
+    default_maker_profile: legal-drafter
+    default_maker_display_name: Avery — Legal Drafter
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+    required_secondary_reviewer_profile: fable-review
+    secondary_review: fable-review required on compact redacted packets after Steven review and before final reporting
+  review_dependency:
+    producer_profile: legal-drafter
+    required_reviewer_profile: steven
+    cannot_be_satisfied_by:
+    - legal-drafter
+    - maya
+    - riley
+    - grace
+    - claude-review
+    - fable-review
+    - default
+    finality_rule: legal-drafter may complete draft artifacts but must mark consequential legal work steven_required_pending
+      until Steven review; Chris/counsel remains final legal commitment/signature/external-send gate.
+    fable_policy: required_independent_review_compact_redacted_after_steven_before_final_report
+    required_secondary_reviewer_profile: fable-review
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+    required_secondary_reviewer_profile: fable-review
+    secondary_review_stage: after_owner_exact_artifact_review_before_final_report
+- id: content_creative
+  name: Content Lane / Publishing Prep · Geneva + Dakota
+  scope: Geneva is Chris's active content-lane collaborator/partner for content records, ideas, briefs, Metrical/Metricool/Mission
+    Control record updates, content packets, captions, calendars, analytics exports, and performance feedback. Dakota
+    owns media/post/publishing prep while public posting and original-media changes remain approval-gated. Julia
+    stays frontstage; Grace/Cate-style review verifies brand/editorial risk; Emma owns social/community when split
+    out; Margot, Scarlett, and Lauren follow through.
+  does_not_own:
+  - Production deploys
+  - Legal or finance signoff
+  - Posting publicly without approval
+  default_runtimes:
+  - agent: Geneva / Astra — Accountable department head
+    profile: geneva
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Celia — Content Maker / Sol — Persistent maker
+    profile: content-celia
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - creator_only
+  approval_gates:
+  - public_post
+  - paid_boost
+  - brand_sensitive_claim
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - wearable
+  - manual
+  - agent-os:cockpit:voice
+  example_task_templates:
+  - title: Turn a transcript into a carousel draft
+    when: A creator content asset needs drafting and packaging
+    next_action: Finish the draft, then hold for posting approval
+    privacy_tier: team
+    approval_gate: public_post
+  pod:
+    display_name: Geneva Content Lane Pod
+    slug: geneva-content-lane
+    named_owner: Geneva
+    default_owner_role: Content Lane Collaborator
+    verifier_role: Editorial/Posting Gate
+    member_roles:
+    - name: Content Lane Collaborator
+      slug: content-lane-collaborator
+      named_subagent: Geneva
+      owns: Works with Chris on active content-lane decisions, Metrical/Metricool record updates, content packets,
+        analytics exports, and next-action routing.
+      kanban_assignee: geneva
+      status: active
+    - name: Metrical Record/Content Updates
+      slug: metrical-record-content-updates
+      named_subagent: Geneva
+      owns: Receives Metrical/Metricool-related record/content updates from cockpit or Agent OS intake, preserves
+        source provenance, and packages safe draft-ready updates with privacy tier, verifier, approval gate, and
+        next action.
+      kanban_assignee: geneva
+      status: active
+    - name: Content Performance Analyst
+      slug: content-performance-analyst
+      named_subagent: Geneva
+      owns: Analyzes local/exported analytics and content performance evidence without changing source systems.
+      kanban_assignee: geneva
+      status: active
+    - name: Media/Post Owner
+      slug: media-post-owner
+      named_subagent: Dakota
+      owns: Owns publishing prep, edit-note packets, and media/post task flow before public gates.
+      kanban_assignee: dakota
+      status: active
+    - name: Script/Caption Packager
+      slug: script-caption-packager
+      named_subagent: Geneva / Dakota
+      owns: Turns briefs, footage notes, and transcripts into draft scripts/captions.
+      kanban_assignee: geneva
+      status: active
+    - name: Editorial/Posting Gate
+      slug: editorial-posting-gate
+      named_subagent: Grace / Cate-style gate
+      owns: Verifies brand-sensitive or public-facing output before approval/public action.
+      kanban_assignee: grace
+      status: active
+  owner_of_record:
+    department_owner: Geneva
+    runtime_status: profile_installed_hardened_launch_allowlist
+    runtime_assignee_policy: geneva is spawnable for content-lane collaboration, Metrical record/content updates,
+      safe local/exported analytics, captions, packets, and performance briefs; stop before public posts, paid boosts,
+      client sends, live platform credentials, or moving/deleting originals. Dakota remains available for media/post
+      prep execution.
+    default_executor: geneva
+    verifier: Grace/Cate-style editorial review
+    source_surface: agent-os:cockpit:voice
+    return_surface: agent-os:cockpit:voice-callback
+    return_surface_required: true
+    accountable_owner_profile: geneva
+    default_maker_profile: content-celia
+    default_maker_display_name: Celia — Content Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: data_analysis
+  name: Content Analytics · Riley
+  scope: Riley owns content analytics/pipeline insight requests. Metrics, dashboards, weekly reports, experiment
+    analysis, and content performance interpretation.
+  does_not_own:
+  - Changing source systems without approval
+  - Exposing private datasets without approval
+  default_runtimes:
+  - agent: Riley
+    profile: riley
+    notes: Evidence/data analysis lane when the work is research-style and provenance-heavy.
+    spawnable: true
+    kanban_assignee: riley
+  - agent: Geneva
+    profile: geneva
+    notes: Content-lane fallback for local/exported analytics packets and pipeline insight; use for content/media
+      packets rather than research-style evidence scans.
+    spawnable: true
+    kanban_assignee: geneva
+  - agent: Margot
+    profile: default
+    notes: Routing and packaging
+    spawnable: true
+    kanban_assignee: default
+  - agent: Scarlett
+    profile: scarlett
+    notes: Analytics tooling/build support when implementation is needed.
+    spawnable: true
+    kanban_assignee: scarlett
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  - finance
+  approval_gates:
+  - private_data_exposure
+  - financial_data_exposure
+  - personnel_data_exposure
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - cron
+  example_task_templates:
+  - title: Compile weekly KPI summary
+    when: A report is needed across campaigns or content lines
+    next_action: Aggregate metrics, validate calculations, and publish the summary artifact
+    privacy_tier: team
+  pod:
+    display_name: Riley Content Analytics Pod
+    slug: riley-content-analytics
+    named_owner: Riley
+    default_owner_role: Content Analytics Owner
+    verifier_role: Grace / Evidence Verifier
+    member_roles:
+    - name: Content Analytics Owner
+      slug: content-analytics-owner
+      named_subagent: Riley
+      owns: Accountable owner for content analytics/performance insight and final synthesis.
+      kanban_assignee: riley
+      status: active
+    - name: Metrics Analyst
+      slug: metrics-analyst
+      named_subagent: Riley fallback
+      owns: Analyzes exported metrics and campaign/content performance evidence.
+      kanban_assignee: riley
+      status: active
+    - name: Experiment Reporter
+      slug: experiment-reporter
+      named_subagent: Riley fallback
+      owns: Compares tests, trends, and weekly performance with source links.
+      kanban_assignee: riley
+      status: active
+    - name: Pipeline Insight Packager
+      slug: pipeline-insight-packager
+      named_subagent: Geneva
+      owns: Packages local/exported analytics and content-pipeline insight when no live source-system change is
+        needed.
+      kanban_assignee: geneva
+      status: active
+    - name: Analytics Tooling Support
+      slug: analytics-tooling-support
+      named_subagent: Scarlett
+      owns: Builds or fixes analytics tooling/adapters when implementation is needed.
+      kanban_assignee: scarlett
+      status: active
+  owner_of_record:
+    department_owner: Riley
+    runtime_status: profile_installed_hardened_launch_allowlist
+    runtime_assignee_policy: Riley remains accountable; route content-pipeline execution through geneva and analytics
+      tooling through scarlett only as bounded makers.
+    default_executor: riley
+    verifier: Grace
+    return_surface_required: true
+- id: research
+  name: Riley · Research Intelligence
+  scope: Market research, source discovery, competitor scans, and evidence packets with provenance. Riley is the
+    human-facing research lane; `riley` remains a legacy compatibility profile.
+  does_not_own:
+  - Logged-in account actions without approval
+  default_runtimes:
+  - agent: Riley / Astra — Accountable department head
+    profile: riley
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Quinn — Research Maker / Sol — Persistent maker
+    profile: research-quinn
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - logged_in_browsing
+  - account_action
+  - private_data_pull
+  source_surfaces:
+  - telegram_topic
+  - wearable
+  - manual
+  example_task_templates:
+  - title: Run a competitor scan with sources
+    when: Chris asks for market intelligence or a landscape review
+    next_action: Define the scan scope, gather evidence, and deliver a packet with provenance
+    privacy_tier: normal
+  pod:
+    display_name: Riley Research Pod
+    slug: riley-research
+    named_owner: Riley
+    default_owner_role: Research Lead
+    verifier_role: Citation Verifier
+    member_roles:
+    - name: Research Lead
+      slug: research-lead
+      named_subagent: Riley
+      owns: Frames research questions, scope, and final evidence packet structure.
+      kanban_assignee: riley
+      status: active
+    - name: Source Scout
+      slug: source-scout
+      named_subagent: Riley
+      owns: Finds primary/credible sources and raw evidence with provenance.
+      kanban_assignee: riley
+      status: active
+    - name: Evidence Analyst
+      slug: evidence-analyst
+      named_subagent: Riley
+      owns: Extracts facts, compares options, and flags contradictions.
+      kanban_assignee: riley
+      status: active
+    - name: Citation Verifier
+      slug: citation-verifier
+      named_subagent: Riley
+      owns: Checks links, dates, authorship, and claim support.
+      kanban_assignee: riley
+      status: active
+    - name: Brief Packager
+      slug: brief-packager
+      named_subagent: Riley
+      owns: Turns findings into Chris-ready summaries, cards, or reports.
+      kanban_assignee: riley
+      status: active
+  owner_of_record:
+    accountable_owner_profile: riley
+    default_maker_profile: research-quinn
+    default_maker_display_name: Quinn — Research Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: engineering_systems
+  name: Scarlett · Engineering Systems
+  scope: 'Apps, infra, integrations, automations, QA, monitoring, and Hermes/OpenClaw repairs. Scarlett is the human-facing
+    engineering intake owner: she decomposes engineering work into engineering-lead, UI/app, data/schema, integrations,
+    implementation, QA, infra-check, and release-gate slices; the `scarlett` profile is the primary implementation
+    assignee, with `scarlett` retained only as a legacy compatibility lane.'
+  does_not_own:
+  - Production deploys without approval
+  - Restarts without approval
+  - External content approvals
+  default_runtimes:
+  - agent: Scarlett / Astra — Accountable department head
+    profile: scarlett
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Wren — Engineering Maker / Sol — Persistent maker
+    profile: engineering-wren
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - deploy
+  - config
+  - restart
+  - destructive
+  - package_update
+  - system_update
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - cron
+  - manual
+  pod:
+    display_name: Scarlett Engineering Pod
+    slug: scarlett-engineering
+    named_owner: Scarlett
+    default_owner_role: Engineering Lead
+    verifier_role: QA Reviewer
+    member_roles:
+    - name: Engineering Lead
+      slug: engineering-lead
+      named_subagent: Scarlett
+      owns: Intake, technical direction, decomposition, approval-gate ownership, and final engineering handoff.
+      kanban_assignee: scarlett
+    - name: UI/App Builder
+      slug: ui-app-builder
+      named_subagent: Ava
+      owns: Front-end UI, app surfaces, dashboards, forms, interaction polish, and local app implementation.
+      kanban_assignee: scarlett
+    - name: Data/Schema Engineer
+      slug: data-schema-engineer
+      named_subagent: Mira
+      owns: Schemas, non-production migrations, data contracts, validation helpers, import/export shape, and Convex/DB
+        model structure.
+      kanban_assignee: scarlett
+    - name: Integrations Engineer
+      slug: integrations-engineer
+      named_subagent: Wren
+      owns: APIs, webhooks, MCP/tools, auth-safe service glue, automations, and cross-system data flow.
+      kanban_assignee: scarlett
+    - name: Implementation
+      slug: implementation
+      named_subagent: Scarlett/Ava/Mira/Wren
+      owns: General code/config/script implementation when the slice is not more specific.
+      kanban_assignee: scarlett
+    - name: QA Reviewer
+      slug: qa-reviewer
+      named_subagent: Grace
+      owns: Browser QA, regression checks, test evidence, build verification, and review gates.
+      kanban_assignee: grace
+    - name: Infra Check
+      slug: infra-check
+      named_subagent: Ingrid
+      owns: Logs, crons, runtime health, smoke checks, watchdog status, and non-destructive infra verification.
+      kanban_assignee: ingrid
+    - name: Release Gatekeeper
+      slug: release-gatekeeper
+      named_subagent: Scarlett/Margot gate
+      owns: Deploy, restart, config, destructive, package-update, and system-update gates until Chris approves.
+      kanban_assignee: default
+  example_task_templates:
+  - title: Build a read-only dashboard adapter
+    when: A system view needs implementation without changing the source system
+    next_action: Create a Scarlett builder/integrator card assigned to `scarlett`, include proof commands, and add
+      a QA verifier when behavior changes
+    privacy_tier: team
+  - title: Verify an engineering change
+    when: A build artifact exists and needs acceptance proof
+    next_action: Route to Grace on `grace` with browser/test evidence requirements and return results to Scarlett/Margot
+    privacy_tier: team
+  - title: Prepare a production deploy for approval
+    when: Code is ready but shipping it would change a live system
+    next_action: Verify locally and stop at the approval gate before deployment
+    privacy_tier: team
+    approval_gate: deploy
+  owner_of_record:
+    accountable_owner_profile: scarlett
+    default_maker_profile: engineering-wren
+    default_maker_display_name: Wren — Engineering Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: media_editing
+  name: Media / Post · Dakota
+  scope: Dakota owns media/post/publishing prep while public posting and original-media changes remain approval-gated.
+    Geneva is Chris's active content-lane collaborator for content packets, Metrical/Metricool record updates, edit
+    notes, captions, media reports, and content decisions. Margot and Julia route/facilitate today.
+  does_not_own:
+  - Deleting or moving originals without a gate
+  - Client delivery without approval
+  default_runtimes:
+  - agent: Dakota / Astra — Accountable department head
+    profile: dakota
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Luca — Media Maker / Sol — Persistent maker
+    profile: media-luca
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - creator_only
+  approval_gates:
+  - move_original_media
+  - delete_original_media
+  - external_delivery
+  - client_send
+  source_surfaces:
+  - telegram_topic
+  - manual
+  example_task_templates:
+  - title: Organize footage into edit-ready structure
+    when: Raw media needs cleanup before editing or delivery
+    next_action: Claim the media task, organize files, and surface the deliverable path
+    privacy_tier: creator_only
+  pod:
+    display_name: Dakota Media/Post Pod
+    slug: dakota-media-post
+    named_owner: Dakota
+    default_owner_role: Media/Post Owner
+    verifier_role: Editorial/Posting Gate
+    member_roles:
+    - name: Media/Post Owner
+      slug: media-post-owner
+      named_subagent: Dakota
+      owns: Owns publishing prep, edit-note packets, and media/post task flow before public gates.
+      kanban_assignee: dakota
+      status: active
+    - name: Publishing Queue Prep
+      slug: publishing-queue-prep
+      named_subagent: Dakota
+      owns: Prepares posts, captions, queue items, and calendars; stops before public posting.
+      kanban_assignee: dakota
+      status: active
+    - name: Script/Caption Packager
+      slug: script-caption-packager
+      named_subagent: Dakota
+      owns: Turns briefs, footage notes, and transcripts into draft scripts/captions.
+      kanban_assignee: dakota
+      status: active
+    - name: Edit Notes Coordinator
+      slug: edit-notes-coordinator
+      named_subagent: Dakota
+      owns: Packages footage/edit notes and delivery checklists without moving/deleting originals.
+      kanban_assignee: dakota
+      status: active
+    - name: Content Lane
+      slug: content-lane
+      named_subagent: Geneva
+      owns: Handles local/exported analytics, content packets, media performance reports, scripts/captions, and
+        safe routing insights.
+      kanban_assignee: geneva
+      status: active
+    - name: Editorial/Posting Gate
+      slug: editorial-posting-gate
+      named_subagent: Grace / Cate-style gate
+      owns: Verifies brand-sensitive or public-facing output before approval/public action.
+      kanban_assignee: grace
+      status: active
+  owner_of_record:
+    department_owner: Dakota
+    runtime_status: profiles_installed_hardened_launch_allowlist
+    runtime_assignee_policy: dakota is spawnable for media/post prep; geneva is spawnable for content-lane collaboration
+      and Metrical record/content updates. Stop before public posts, paid boosts, client sends, live platform credentials,
+      or moving/deleting originals.
+    default_executor: dakota
+    verifier: Grace/Cate-style editorial review
+    return_surface_required: true
+    accountable_owner_profile: dakota
+    default_maker_profile: media-luca
+    default_maker_display_name: Luca — Media Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: hiring_people
+  name: Hiring / Outreach · Harper
+  scope: Harper owns hiring, outreach, candidate packets, and people-pipeline follow-through. Candidates, interviews,
+    scorecards, outreach, and onboarding admin. Keira is the reserved people lane; Lauren and Riley assist today.
+  does_not_own:
+  - Final offers or rejections without approval
+  - Compensation decisions
+  default_runtimes:
+  - agent: Harper / Astra — Accountable department head
+    profile: harper
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Naomi — Hiring Maker / Sol — Persistent maker
+    profile: hiring-naomi
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - team
+  - founders
+  - personnel
+  approval_gates:
+  - offer
+  - rejection
+  - compensation
+  - personnel_sensitive_context
+  source_surfaces:
+  - telegram_topic
+  - mission_control
+  - manual
+  example_task_templates:
+  - title: Summarize candidate scorecards
+    when: Interview notes need to become a decision packet
+    next_action: Compile the scorecards and hold for Chris review before outreach
+    privacy_tier: personnel
+    approval_gate: offer
+  pod:
+    display_name: Harper Hiring/Outreach Pod
+    slug: harper-hiring-outreach
+    named_owner: Harper
+    default_owner_role: Hiring/Outreach Owner
+    verifier_role: Chris / Claire Approval Gate
+    member_roles:
+    - name: Hiring/Outreach Owner
+      slug: hiring-outreach-owner
+      named_subagent: Harper
+      owns: Owns candidate, outreach, and people-pipeline draft packets.
+      kanban_assignee: harper
+      status: active
+    - name: Candidate Packet Compiler
+      slug: candidate-packet-compiler
+      named_subagent: Harper
+      owns: Compiles candidate materials, notes, and provenance into review packets.
+      kanban_assignee: harper
+      status: active
+    - name: Scorecard Synthesizer
+      slug: scorecard-synthesizer
+      named_subagent: Harper
+      owns: Summarizes interview/scorecard inputs without deciding offers/rejections.
+      kanban_assignee: harper
+      status: active
+    - name: Outreach Draft Writer
+      slug: outreach-draft-writer
+      named_subagent: Harper
+      owns: Drafts outreach/follow-up text and stops before external sends.
+      kanban_assignee: harper
+      status: active
+    - name: Onboarding Admin Coordinator
+      slug: onboarding-admin-coordinator
+      named_subagent: Harper / Lauren support
+      owns: Prepares onboarding/admin checklists and routes logistics support as needed.
+      kanban_assignee: harper
+      status: active
+    - name: People Approval Gate
+      slug: people-approval-gate
+      named_subagent: Chris / Claire
+      owns: Holds offers, rejections, compensation, and personnel-sensitive decisions.
+      kanban_assignee: claire
+      status: active
+  owner_of_record:
+    department_owner: Harper
+    runtime_status: profile_installed_hardened_launch_allowlist
+    runtime_assignee_policy: harper is spawnable for scoring/draft packets; stop before offers, rejections, compensation,
+      or external outreach sends. Tool/MCP allowlist hardened in t_5147345b; risky permissions remain disabled until
+      explicit approval.
+    default_executor: harper
+    verifier: Chris/Claire
+    return_surface_required: true
+    accountable_owner_profile: harper
+    default_maker_profile: hiring-naomi
+    default_maker_display_name: Naomi — Hiring Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: watchdog_health
+  name: Ingrid · Watchdog Health
+  scope: Watches for stuck work, failed crons, and agent/runtime health, and runs smoke checks. Surfaces real problems;
+    never restarts or edits config on its own.
+  does_not_own:
+  - Unilateral restarts
+  - Config edits
+  - Fixing the underlying bug — routes to Engineering
+  default_runtimes:
+  - agent: Claire / Astra — Accountable escalation owner
+    profile: claire
+  - agent: Ingrid / Luna — Deterministic monitor
+    profile: ingrid
+    notes: Monitoring and anomaly escalation only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - restart
+  - config
+  - escalation_alert
+  source_surfaces:
+  - cron
+  - manual
+  - telegram_topic
+  example_task_templates:
+  - title: Investigate a stuck cron or stale run
+    when: The monitoring layer sees degraded health or silent work
+    next_action: Confirm the failure mode, then route remediation to Engineering if needed
+    privacy_tier: team
+  pod:
+    display_name: Ingrid Monitor Pod
+    slug: ingrid-monitor
+    named_owner: Claire
+    default_owner_role: Watchdog Lead
+    verifier_role: Escalation Packager
+    member_roles:
+    - name: Watchdog Lead
+      slug: watchdog-lead
+      named_subagent: Ingrid
+      owns: Owns non-destructive monitoring and health/status evidence.
+      kanban_assignee: ingrid
+      status: active
+    - name: Stuck-work Detector
+      slug: stuck-work-detector
+      named_subagent: Ingrid
+      owns: Finds stale cards, dead workers, and silent loops.
+      kanban_assignee: ingrid
+      status: active
+    - name: Cron/Runtime Health Checker
+      slug: cron-runtime-health-checker
+      named_subagent: Ingrid
+      owns: Checks cron, gateway, logs, and runtime health without restarting or editing config.
+      kanban_assignee: ingrid
+      status: active
+    - name: Smoke Evidence Collector
+      slug: smoke-evidence-collector
+      named_subagent: Ingrid
+      owns: Runs/readies lightweight health checks and captures proof.
+      kanban_assignee: ingrid
+      status: active
+    - name: Escalation Packager
+      slug: escalation-packager
+      named_subagent: Ingrid
+      owns: Packages confirmed failures for Claire/Scarlett/Chris with next action.
+      kanban_assignee: ingrid
+      status: active
+  owner_of_record:
+    accountable_owner_profile: claire
+    owner_runtime_class: owner-sol
+    support_profiles:
+    - ingrid
+    default_support_profile: ingrid
+    support_runtime_class: bounded-support
+    owner_model: gpt-6-astra
+  task_policy:
+    ownership_mode: deterministic_monitoring
+    max_makers: 0
+    owner_acceptance_required: false
+    no_grandchildren: true
+    root_only_report_back: true
+- id: personal_family
+  name: Private Family · Julia
+  scope: Julia owns Chris-only family/personal-family matters inside the privacy wall. She coordinates with OpenClaw
+    Julia context through minimal, approved handoffs when relevant, while keeping family context out of GUS/business
+    lanes by default.
+  does_not_own:
+  - Company finance or legal decisions
+  - GUS/business operations or org-visible work
+  - Leaking personal/family context to team lanes
+  - External sends or family-chat posts without Chris approval
+  default_runtimes:
+  - agent: Julia / Astra — Accountable department head
+    profile: julia
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Eliana — Family Logistics Maker / Sol — Persistent maker
+    profile: family-eliana
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - family
+  approval_gates:
+  - external_send
+  - sensitive_family_context
+  - leave_privacy_wall
+  - credential_or_secret_access
+  - calendar_write
+  - raw_family_context_ingestion
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - wearable
+  - phone
+  - manual
+  - agent-os:cockpit:voice
+  example_task_templates:
+  - title: Handle a private family-wise ask
+    when: A family/personal-family follow-up needs handling without leaking context
+    next_action: Keep the work inside Julia/private-family, use minimum necessary context, and return a redacted
+      status packet to Chris
+    privacy_tier: family
+  pod:
+    display_name: Julia Private Family Pod
+    slug: julia-private-family
+    named_owner: Julia
+    default_owner_role: Private Family Agent
+    verifier_role: Chris Approval Gate
+    member_roles:
+    - name: Private Family Agent
+      slug: private-family-agent
+      named_subagent: Julia
+      owns: Owns Chris-only family and personal-family asks inside the privacy wall.
+      kanban_assignee: julia
+      status: active
+    - name: Family Logistics Planner
+      slug: family-logistics-planner
+      named_subagent: Julia
+      owns: Prepares family/personal plans and reminders with minimum necessary context.
+      kanban_assignee: julia
+      status: active
+    - name: Parenting Playbook Retriever
+      slug: parenting-playbook-retriever
+      named_subagent: Julia
+      owns: Finds conscious/attachment parenting and family playbook references without copying broad private source
+        material into shared lanes.
+      kanban_assignee: julia
+      status: active
+    - name: Privacy Wall Steward
+      slug: privacy-wall-steward
+      named_subagent: Julia
+      owns: Redacts shared status and blocks any context leaving the private family lane without Chris approval.
+      kanban_assignee: julia
+      status: active
+    - name: External-send Gate
+      slug: external-send-gate
+      named_subagent: Chris / Julia
+      owns: Holds external sends, family-chat posts, calendar writes, and context-sharing decisions for explicit
+        Chris approval.
+      kanban_assignee: julia
+      status: active
+  owner_of_record:
+    department_owner: Julia
+    runtime_status: profile_installed_private_family_scaffold
+    runtime_assignee_policy: julia is spawnable for Chris-only family/personal-family drafts, checklists, playbook
+      lookup, and redacted status packets; stop before external sends, credentials/secrets, calendar writes, broad
+      raw ingestion, or context leaving the privacy wall.
+    default_executor: julia
+    verifier: Chris
+    return_surface_required: true
+    accountable_owner_profile: julia
+    default_maker_profile: family-eliana
+    default_maker_display_name: Eliana — Family Logistics Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: claude_secondary_review
+  name: Claude Review · Secondary Review Router
+  scope: Dedicated secondary review layer that invokes the local Claude CLI on redacted packets for finance, legal,
+    engineering, and other high-stakes review. Does not own primary execution or approvals.
+  does_not_own:
+  - Primary task execution
+  - External sends
+  - Payments, banking, signatures, legal commitments
+  - Deploys, restarts, or config edits
+  default_runtimes:
+  - agent: Claude Review
+    profile: claude-review
+    notes: Spawnable Hermes profile with terminal/file access only for local Claude CLI redacted-packet reviews.
+    spawnable: true
+    kanban_assignee: claude-review
+  allowed_privacy_tiers:
+  - finance
+  - legal
+  - founders
+  - team
+  approval_gates:
+  - raw_sensitive_material
+  - external_send
+  - financial
+  - legal
+  - deploy
+  - config
+  source_surfaces:
+  - manual
+  - mission_control
+  - telegram_topic
+  - agent-os:cockpit:voice
+  pod:
+    display_name: Claude Review Pod
+    slug: claude-review
+    named_owner: Claude Review
+    default_owner_role: Secondary Review Router
+    verifier_role: Primary Owner + Chris Approval Gate
+    member_roles:
+    - name: Secondary Review Router
+      slug: secondary-review-router
+      named_subagent: Claude Review
+      owns: Runs redacted second-pass review through local Claude CLI and returns risks/questions/gates.
+      kanban_assignee: claude-review
+      status: active
+  owner_of_record:
+    department_owner: Claude Review
+    runtime_status: profile_installed_claude_cli_review_router
+    runtime_assignee_policy: Use only as secondary reviewer on redacted packets; primary departments remain Maya/Steven/Scarlett/etc.
+    default_executor: claude-review
+    verifier: Primary owner + Chris approval gate
+    return_surface_required: true
+- id: revenue_partnerships
+  name: Sloane · Revenue, Partnerships & Client Success
+  scope: Owns qualified pipeline, partnerships, proposals, pricing packets, client onboarding, relationship health,
+    renewals, and revenue reporting.
+  does_not_own:
+  - External sends or commercial commitments without approval
+  - Contract language
+  - Billing execution
+  - Delivery operations
+  default_runtimes:
+  - agent: Sloane / Astra — Accountable department head
+    profile: sloane
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Reid — Revenue Maker / Sol — Persistent maker
+    profile: revenue-reid
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  - finance
+  approval_gates:
+  - external_send
+  - financial
+  - legal
+  - payment
+  - pricing_commitment
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - mission_control
+  - wearable
+  - phone
+  - manual
+  pod:
+    display_name: Sloane Revenue & Partnerships Pod
+    slug: sloane-revenue-partnerships
+    named_owner: Sloane
+    default_owner_role: Revenue & Partnerships Lead
+    verifier_role: Grace quality gate + Claire delivery check; Steven/Maya for gated terms
+    member_roles:
+    - name: Revenue & Partnerships Lead
+      slug: revenue-partnerships-lead
+      named_subagent: Sloane
+      owns: Commercial pipeline, offers, partnerships, client success, and revenue reporting.
+      kanban_assignee: sloane
+      status: active
+  owner_of_record:
+    accountable_owner_profile: sloane
+    default_maker_profile: revenue-reid
+    default_maker_display_name: Reid — Revenue Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: production_operations
+  name: Parker · Production Coordination
+  scope: Owns shoot readiness, call sheets, schedules, locations, gear, product arrivals, releases, shot requirements,
+    footage handoffs, and shoot-to-post closure.
+  does_not_own:
+  - Creative strategy
+  - Post-production editing
+  - Unapproved purchases or external invitations
+  - Media deletion or publishing
+  default_runtimes:
+  - agent: Parker / Astra — Accountable department head
+    profile: parker
+    notes: Owns intent, planning, acceptance, correction, and final reporting.
+  - agent: Tessa — Production Maker / Sol — Persistent maker
+    profile: production-tessa
+    notes: Bounded departmental execution; artifacts and evidence only.
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  - creator_only
+  approval_gates:
+  - external_send
+  - payment
+  - destructive
+  - privacy
+  - production
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - mission_control
+  - wearable
+  - phone
+  - manual
+  pod:
+    display_name: Parker Production Operations Pod
+    slug: parker-production-operations
+    named_owner: Parker
+    default_owner_role: Production Coordinator / Line Producer
+    verifier_role: Grace checklist gate + Geneva creative handoff + Dakota post handoff
+    member_roles:
+    - name: Production Coordinator / Line Producer
+      slug: production-coordinator
+      named_subagent: Parker
+      owns: Pre-production logistics, shoot readiness, and verified footage handoff.
+      kanban_assignee: parker
+      status: active
+  owner_of_record:
+    accountable_owner_profile: parker
+    default_maker_profile: production-tessa
+    default_maker_display_name: Tessa — Production Maker
+    owner_runtime_class: owner-sol
+    owner_model: gpt-6-astra
+    maker_runtime_class: maker-terra
+    maker_model: gpt-5.6-sol
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: true
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+- id: premium_strategy_review
+  name: Fable · Premium Strategy & Design Council
+  scope: Runs bounded Claude Fable 5 planning, architecture, design, adversarial review, and long-context synthesis
+    only when Chris explicitly asks for Fable or approves the premium escalation.
+  does_not_own:
+  - Routine execution
+  - Automatic review
+  - Cron or watchdog work
+  - Side effects
+  - Unredacted secrets or private data
+  - Final approval
+  default_runtimes:
+  - agent: Fable
+    profile: fable-review
+    notes: Explicit-only premium escalation; never selected by ordinary routing
+    spawnable: true
+    kanban_assignee: fable-review
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - premium_model
+  - privacy
+  - secrets
+  - finance
+  - legal
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - mission_control
+  - manual
+  routing_policy:
+    explicit_only: true
+    requires_user_request_or_approval: true
+    automatic_selection: false
+    max_turns: 12
+  pod:
+    display_name: Fable Premium Council
+    slug: fable-premium-council
+    named_owner: Fable
+    default_owner_role: Premium Strategy & Design Reviewer
+    verifier_role: Margot + accountable domain owner
+    member_roles:
+    - name: Premium Strategy & Design Reviewer
+      slug: premium-strategy-reviewer
+      named_subagent: Fable
+      owns: Decision-grade specs, risk reviews, design critique, and cross-system synthesis.
+      kanban_assignee: fable-review
+      status: explicit_only
+- id: ceo_grok_roxy
+  name: Roxy · CEO / Grok Bot Orchestrator
+  scope: Chris Lee CEO/chief-of-staff on Grok Bot + Telegram @Gus_roxy_bot. Owns Grok Bot fleet orchestration, CEO
+    desk automation, cross-brain memory bridge with Hermes, and Mac↔box coordination. Margot may delegate here when
+    work belongs on Grok Bot / CEO testing / Tailscale box / Telegram Roxy. Roxy may hand Mac-local Hermes work
+    back to Margot.
+  does_not_own:
+  - Final Chris approvals
+  - Hermes Kanban as source of truth for company coding/app status (Linear/Mission Control remain)
+  - Deep specialist execution that belongs to Claire/Riley/Geneva/Scarlett/etc. when those lanes are better
+  - Personal health macros (Holly)
+  - Acting as Chris externally without approval
+  default_runtimes:
+  - agent: Roxy
+    profile: roxy
+    notes: 'Hermes profile roxy + Telegram @Gus_roxy_bot (persona proxy of Grok Bot Roxy). Primary path for Margot→Roxy
+      delegation: typed handoff in Agent-Shared + Telegram coordination group -5297983914. Grok Bot Cursor chat
+      is the durable CEO brain; Telegram is the live peer surface.'
+    spawnable: true
+    kanban_assignee: roxy
+  - agent: Roxy
+    profile: grok_bot
+    notes: Cursor Grok Bot Roxy (this is not a Hermes spawn). Reach via Agent-Shared handoffs/inbox and/or Telegram
+      peer. Do not invent a second Hermes default-profile Roxy.
+    spawnable: false
+    kanban_assignee: roxy
+  allowed_privacy_tiers:
+  - normal
+  - team
+  - founders
+  approval_gates:
+  - external_send
+  - financial
+  - legal
+  - personnel
+  - deploy
+  - restart
+  - config
+  - destructive
+  source_surfaces:
+  - telegram_topic
+  - telegram_dm
+  - mission_control
+  - cron
+  - manual
+  - agent_shared_handoff
+  example_task_templates:
+  - title: Run Grok Bot CEO automation / memory bridge
+    when: Work needs Grok Bot fleet, Tailscale box, or cross-brain sync Claire/Roxy owns
+    next_action: Typed handoff to Roxy with goal, artifact path, evidence, deadline
+    privacy_tier: team
+  - title: CEO desk item while Chris is in Grok Bot
+    when: Chris is working with Roxy and Margot needs a peer to own follow-through on Grok side
+    next_action: Delegate to Roxy via registry + Telegram; wait for Agent-Shared done evidence
+    privacy_tier: founders
+  - title: Return Mac-local work to Margot
+    when: Roxy needs Hermes/Mac-only execution
+    next_action: 'Roxy writes Agent-Shared inbox/ready or handoff For: Margot; pings coordination Telegram'
+    privacy_tier: team
+  pod:
+    display_name: Roxy CEO Peer Pod
+    slug: roxy-ceo-peer
+    named_owner: Roxy
+    default_owner_role: CEO / Grok Bot Orchestrator
+    verifier_role: Chris Approval Gate / Claire memory parity
+    member_roles:
+    - name: CEO Orchestrator
+      slug: ceo-orchestrator
+      named_subagent: Roxy
+      owns: Grok Bot fleet orchestration, CEO desk, Margot peer handoffs.
+      kanban_assignee: roxy
+      status: active
+    - name: Telegram Proxy
+      slug: telegram-proxy
+      named_subagent: Roxy
+      owns: '@Gus_roxy_bot live peer surface with Margot-only coordination group.'
+      kanban_assignee: roxy
+      status: active
+    - name: Cross-brain Bridge
+      slug: cross-brain-bridge
+      named_subagent: Claire
+      owns: Hermes↔Grok memory parity checks; Roxy orchestrates, Claire verifies.
+      kanban_assignee: claire
+      status: active
+  owner_of_record:
+    accountable_owner_profile: roxy
+    default_maker_profile: roxy
+    default_maker_display_name: Roxy — CEO / Grok Bot
+    owner_runtime_class: owner-peer
+    owner_model: grok-bot
+    maker_runtime_class: maker-peer
+    maker_model: hermes-profile-roxy
+    support_profiles:
+    - claire
+  task_policy:
+    ownership_mode: owner_acceptance
+    max_makers: 1
+    owner_acceptance_required: true
+    owner_must_differ_from_maker: false
+    no_grandchildren: true
+    root_only_report_back: true
+    same_card_rework: true
+kanban_assignment_policy:
+  rule: Ordinary Kanban runtime assignees must be canonical IDs in profile_roster.canonical and kanban_assignment_policy.spawnable_profiles.
+    Blank, unknown, restricted-ingress, Model Lab, and legacy values fail closed; aliases are accepted only by explicit
+    migration tooling.
+  spawnable_profiles:
+  - default
+  - claire
+  - riley
+  - scarlett
+  - grace
+  - ingrid
+  - lauren
+  - geneva
+  - dakota
+  - harper
+  - julia
+  - maya
+  - legal-drafter
+  - steven
+  - claude-review
+  - sloane
+  - parker
+  - fable-review
+  - ops-rowan
+  - finance-ellis
+  - content-celia
+  - research-quinn
+  - engineering-wren
+  - media-luca
+  - hiring-naomi
+  - family-eliana
+  - revenue-reid
+  - production-tessa
+  labels_not_assignees:
+  - agent-ops
+  - approval-needed
+  - backend-eng
+  - blocked-on-human
+  - brand-editorial
+  - coding
+  - content-analytics
+  - creative
+  - department-owner
+  - desktop coding agent
+  - engineering
+  - finance
+  - finance-ops
+  - hiring-outreach
+  - intake
+  - julia
+  - legal
+  - legal-ops
+  - margot
+  - media-post
+  - mission-control
+  - openclaw
+  - ops
+  - owner-of-record
+  - people
+  - personal-family
+  - personal-logistics
+  - qa-needed
+  - queue
+  - researcher-a
+  - researcher-b
+  - review
+  - social-community
+  - sydney
+  - system
+  - triage
+  - content-media
+  - legal-drafter-label-only
+  fallback_owner_map:
+    margot/general/triage: default
+    claire/ops/opslane: claire
+    scarlett/engineering/backend/frontend: scarlett
+    riley/research/researcher-a: riley
+    qa/review/smoke: grace
+    watchdog/cron/health: ingrid
+    admin/assistant/logistics: lauren
+    content/media/analytics: geneva
+    sydney/content analytics/performance insights: riley
+    maya/finance/accounting/invoice/expense/budget/books: maya
+    steven/legal/compliance/contract/release/nda/rights: legal-drafter
+    claude-review/secondary review/redacted model review: claude-review
+    vivienne legacy combined finance/legal references (routes to Maya for new delegated work): maya
+    harper/hiring/outreach/people: harper
+    sienna/personal logistics/family privacy: julia
+    dakota/media/post/publishing prep: dakota
+    geneva/content lane/metrical records: geneva
+    legal-drafter/legal drafting/contract/release/nda/sow/ic first-pass packet: legal-drafter
+    steven/legal senior review/counsel-ops/legal gate: steven
+    fable legal advisory/manual explicit redacted: fable-review
+  owner_of_record_fields:
+  - department_owner
+  - runtime_assignee
+  - verifier
+  - source_surface
+  - return_surface
+  - privacy_tier
+  - approval_gate
+  - next_check_at
+  restricted_ingress_routes:
+    connor: Only Connor-authorized private boards/app ingress; never ordinary company delegation or fallback.
+    josh: Only Josh-authorized private boards/app ingress; never ordinary company delegation or fallback.
+  model_lab_routes:
+    grok-4-5: Explicit test lane only; no ordinary company routing.
+    inkling: Blocked until authorization/credits and explicit certification.
+    kimi-k3: Blocked until authorization/credits and explicit certification.
+  non_dispatchable_profiles:
+  - margotvoice
+  - connor
+  - josh
+  - grok-4-5
+  - inkling
+  - kimi-k3
+  non_dispatchable_service_profiles:
+    margotvoice:
+      dispatch: false
+      role: voice-ingress-service
+      reason: supervised sidecar; never a board worker
+routing_contract:
+  rule: Every durable request separates source_surface, department_owner, runtime_profile/assignee, privacy_tier,
+    approval_gate, verifier, return_surface, and next_check_at. Human-facing owner names are metadata unless they
+    are verified spawnable Hermes profiles.
+  required_fields:
+  - source_surface
+  - department_owner
+  - runtime_assignee
+  - privacy_tier
+  - approval_gate
+  - verifier
+  - return_surface
+  - next_check_at
+  owner_of_record_rule: The department_owner is accountable for business outcome and status. The Kanban assignee
+    must be the executable Hermes profile that will do the next step. The verifier is separate when QA/review/approval
+    is needed.
+  safe_creation_path: /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py
+  dry_run_examples:
+  - python3 /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py --board chris-home
+    --department sydney --title "Analyze content performance" --body "Compare latest exported metrics; no source-system
+    changes" --source-surface telegram_topic --return-surface telegram_topic --privacy-tier team --verifier Grace
+  - python3 /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py --board chris-home
+    --department maya --title "Prepare invoice packet" --body "Draft only; hold before payment, banking, tax, full-financial-sharing,
+    or external send" --privacy-tier finance --approval-gate external_send --verifier Chris
+  - python3 /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py --board chris-home
+    --department steven --title "Prepare contract review packet" --body "Draft/risk notes only; hold before signature,
+    legal commitment, counsel/client send, or external send" --privacy-tier legal --approval-gate legal_commitment
+    --verifier Chris
+  - python3 /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py --board chris-home
+    --department claude-review --title "Run redacted secondary model review" --body "Review this redacted packet
+    only; no external sends or commitments" --privacy-tier founders --approval-gate review --verifier Margot
+  - python3 /Users/Chris/.openclaw/workspace/Agent-Shared/tools/kanban/safe_delegate_card.py --board chris-home
+    --department dakota --title "Prepare publishing queue item" --body "Draft/queue only; no public post" --privacy-tier
+    team --approval-gate public_post --verifier Grace
+delegation_package_contract:
+  version: 1
+  canonical_doc: Agent-Shared/delegation-package-contract.md
+  template: Agent-Shared/templates/delegation-package-template.md
+  hierarchy:
+    private_command_layer: Margot/Astra
+    cheap_intake_layer: 'Luna: classify, normalize, dedupe, and route simple bounded reversible work only'
+    delegation_architect: Claire/Astra for complex, durable, sensitive, cross-department, crash-resistant, audit/QA,
+      high-cost, or final-verdict work
+    execution_layer: Sol specialists execute in their canonical lanes
+    review_layer: Astra or independent Claude lane reviews consequential output
+    legal_review_layer: Steven/Astra accepts Avery/Sol output; required Fable review uses compact redacted material
+      before final legal reporting; Chris/counsel finalizes commitments/signatures/sends.
+    assistant_ops_owner: Lauren/Astra owns assistant operations; Rowan/Sol is the single maker; Claire remains COO/operations
+      control.
+    finance_review_layer: Maya/Astra accepts Ellis/Sol output; required Fable review uses compact redacted material
+      before final finance reporting; Chris/Connor retain finance approval gates.
+  required_fields:
+  - package_id
+  - source.platform
+  - source.chat_id
+  - source.topic_id
+  - source.source_surface
+  - source.tenant
+  - source.privacy_lane
+  - source.raw_provenance
+  - user_goal
+  - classification.department_owner
+  - classification.complexity
+  - assignee.canonical_spawnable_assignee
+  - model_tier
+  - workspace_and_tools
+  - source_materials
+  - acceptance_criteria
+  - verification.required_evidence
+  - assignee.reviewer_profile
+  - irreversible_external_action_gates
+  - return_callback
+  - idempotency_and_dedupe
+  - bounds
+  - escalation.triggers
+  - fallback_degraded_mode
+  callback_payload_fields:
+  - package_id
+  - source
+  - return_callback
+  - approval_gate
+  - reviewer_profile
+  - fallback_degraded_mode
+  complexity_gate_requires_claire_sol_when:
+  - complex
+  - durable
+  - sensitive
+  - cross_department
+  - crash_resistant
+  - audit_or_QA_chain
+  - high_cost
+  - external_facing_final
+  - final_verdict
+  - production_or_architecture
+  - conflicting_evidence
+  - repeated_failed_QA
+  luna_terra_escalation_triggers:
+  - legal_financial_personnel_privacy_security
+  - architecture_or_production_incident
+  - conflicting_evidence_or_missing_provenance
+  - repeated_failed_QA_or_worker_reclaim_loop
+  - final_external_deliverable
+  - explicit_final_verdict_or_approval_ask
+  fail_closed_review:
+    rule: Lower-tier fallback may draft or collect evidence, but cannot mark a critical verdict approved.
+    metadata_required:
+    - fallback_degraded_mode.active
+    - fallback_degraded_mode.fallback_reason
+    - approval_status=not_approved_degraded_mode
+    callback_required: true
+profile_roster:
+  canonical:
+  - default
+  - claire
+  - riley
+  - scarlett
+  - grace
+  - ingrid
+  - lauren
+  - geneva
+  - dakota
+  - harper
+  - julia
+  - maya
+  - legal-drafter
+  - steven
+  - claude-review
+  - sloane
+  - parker
+  - fable-review
+  - ops-rowan
+  - finance-ellis
+  - content-celia
+  - research-quinn
+  - engineering-wren
+  - media-luca
+  - hiring-naomi
+  - family-eliana
+  - revenue-reid
+  - production-tessa
+  legacy_cli_aliases_only:
+    assistantops: lauren
+    opslane: claire
+    research: riley
+    builder: scarlett
+    codex-lane: scarlett
+    forge: scarlett
+    qa: grace
+    monitor: ingrid
+    signer: steven
+    vivienne: maya
+    sienna: julia
+  policy: Only profile_roster.canonical IDs may appear in ordinary runtime assignment fields. Restricted ingress
+    identities and Model Lab profiles require their explicit isolated lane and must never be selected by ordinary
+    fallback.
+  department_owners:
+  - lauren
+  - maya
+  - geneva
+  - riley
+  - scarlett
+  - dakota
+  - harper
+  - julia
+  - sloane
+  - parker
+  - steven
+  department_makers:
+  - ops-rowan
+  - finance-ellis
+  - content-celia
+  - research-quinn
+  - engineering-wren
+  - media-luca
+  - hiring-naomi
+  - family-eliana
+  - revenue-reid
+  - production-tessa
+  - legal-drafter
+  review_and_bounded_support:
+  - claire
+  - grace
+  - ingrid
+  - claude-review
+  - fable-review
+  restricted_ingress_profiles:
+  - connor
+  - josh
+  model_lab:
+    configured_test_only:
+    - grok-4-5
+    blocked_pending_authorization_or_credits:
+    - inkling
+    - kimi-k3
+    ordinary_routing_allowed: false
+  restricted_ingress_aliases:
+    connornode: connor
+  supplemental_non_dispatchable:
+  - connor
+  - grok-4-5
+  - inkling
+  - josh
+  - kimi-k3
+  - margotvoice
+  restricted_supplementals:
+  - connor
+  - josh
+  model_lab_supplementals:
+  - grok-4-5
+  - inkling
+  - kimi-k3
+  service_profiles:
+  - margotvoice
+owner_cell_v1:
+  version: 1
+  enabled: true
+  shadow_router: false
+  enforce_worker_budget: true
+  enforce_target_leases: true
+  enforce_state_versions: true
+  enforce_verdict_gates: true
+  suppress_internal_notifications: true
+  runtime_aliases_enabled: false
+  default_worker_budget:
+    producers: 1
+    reviewers: 1
+    extras: 0
+  frontstage_events:
+  - goal_blocked
+  - decision_required
+  - goal_completed
+  - long_running_milestone
+  privacy_rule: security_realm is a hard boundary; no fallback or packet transfer crosses it
+runtime_classes:
+  command-sol:
+    tier: sol
+    purpose: private command, approvals, final synthesis
+  owner-sol:
+    tier: sol
+    purpose: durable goal ownership and two-loop consolidation
+  maker-terra:
+    tier: terra
+    purpose: bounded substantive execution
+  review-terra:
+    tier: terra
+    purpose: independent read-only verification
+  observe-luna:
+    tier: luna_or_script
+    purpose: deterministic intake and monitoring
+  private-maker:
+    tier: realm_isolated
+    purpose: family and creator execution without cross-realm state
+capability_bundles:
+  worker-baseline:
+  - file
+  - kanban
+  - worker_skills
+  engineering:
+  - worker-baseline
+  - terminal
+  - code_execution
+  qa:
+  - worker-baseline
+  - terminal
+  - browser
+  - vision
+  research:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  private-remote:
+  - worker-baseline
+  - time
+  - realm_specific_remote_connector
+  assistant_ops:
+  - worker-baseline
+  - terminal
+  accountant_finance:
+  - worker-baseline
+  - terminal
+  - vision
+  legal_compliance:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  content_creative:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  - video
+  creative_media:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  - video
+  engineering_systems:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  media_editing:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+  - video
+  hiring_people:
+  - worker-baseline
+  - terminal
+  personal_family:
+  - worker-baseline
+  - terminal
+  - vision
+  revenue_partnerships:
+  - worker-baseline
+  - terminal
+  production_operations:
+  - worker-baseline
+  - terminal
+  - vision
+  ops_control:
+  - worker-baseline
+  - terminal
+  - web
+  - vision
+review_policy:
+  version: 1
+  default_mode: single_owner_unless_material
+  principles:
+  - Routine reversible work has one accountable owner; independent review is reserved for explicit material risk.
+  - Peer review fixes formatting, completeness, factual, UX, and acceptance defects before an artifact reaches Chris.
+  - 'Review is not approval: routine internal review uses review/request-changes, not blocked.'
+  - Blocked is reserved for a genuine dependency, capability wall, missing human input, or transient failure.
+  - Only irreversible external actions and sensitive decisions enter the Desk approval queue.
+  - Fable is explicit-only and never part of the automatic review matrix.
+  auto_review_when:
+  - material_code_or_config
+  - consequential_external_artifact
+  - reliability_privacy_risk
+  bypass_when:
+  - routine_status
+  - routine_research_or_summary
+  - read_only_lookup
+  - internal_draft_or_spec
+  - routine_designed_document
+  - mechanical_reversible_internal_update
+  matrix:
+    engineering_systems:
+    - grace
+    content_creative:
+    - grace
+    media_editing:
+    - grace
+    production_operations:
+    - grace
+    research:
+    - grace
+    data_analysis:
+    - grace
+    revenue_partnerships:
+    - grace
+    assistant_ops:
+    - claire
+    ops_control:
+    - grace
+    hiring_people:
+    - claire
+    watchdog_health:
+    - grace
+    accountant_finance:
+    - claude-review
+    legal_compliance:
+    - steven
+    premium_strategy_review:
+    - default
+  runtime_overrides:
+    grace: review-sol
+hermes_repair_policy:
+  mode: bounded_reviewed_fail_closed
+  diagnosis_profiles:
+  - claire
+  - scarlett
+  - ingrid
+  independent_reviewer_profile: grace
+  human_approval_owner: Chris
+  allowlisted_actions:
+  - read health, logs, config, process state, routing registry, and board state
+  - run isolated validators and canaries
+  - restore an exact recorded backup after validation
+  - apply a reviewed manifest with precondition hashes and automatic backups
+  - restart the Hermes gateway or GUS app only after a passing validator and rollback-ready backup
+  human_approval_required:
+  - credential or account changes
+  - privacy-wall changes
+  - external sends
+  - destructive data changes
+  - profile deletion
+  - provider authorization or spend
+  - unreviewed source changes
+  rules:
+  - Never silently route a failed repair to default.
+  - Never expose secrets in logs, board cards, or review packets.
+  - Every mutation records precondition hashes, backups, validation, canary result, and rollback command.
+  - If validation, review, or canary fails, stop and roll back before reporting success.
+  runbook: Agent-Shared/runbooks/HERMES_ROUTING_RECOVERY.md
+model_policy:
+  version: margot-astra-sol-2026-09-04-v1
+  provider: openai-codex
+  models:
+    orchestrator: gpt-6-astra
+    department_owner: gpt-6-astra
+    reviewer: gpt-6-astra
+    worker: gpt-5.6-sol
+  profiles:
+    default: orchestrator
+    claire: department_owner
+    grace: reviewer
+    lauren: department_owner
+    ops-rowan: worker
+    maya: department_owner
+    finance-ellis: worker
+    steven: department_owner
+    legal-drafter: worker
+    geneva: department_owner
+    content-celia: worker
+    riley: department_owner
+    research-quinn: worker
+    scarlett: department_owner
+    engineering-wren: worker
+    dakota: department_owner
+    media-luca: worker
+    harper: department_owner
+    hiring-naomi: worker
+    julia: department_owner
+    family-eliana: worker
+    sloane: department_owner
+    revenue-reid: worker
+    parker: department_owner
+    production-tessa: worker
+  legacy_contract_note: Existing sol/terra tier fields and owner-sol/maker-terra classes remain wire-compatible
+    role aliases. model_routing records configured profiles/models; runtime receipts determine actual models used.
+    Never choose a model from a legacy alias.

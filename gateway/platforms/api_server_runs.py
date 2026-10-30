@@ -1,4 +1,6 @@
 """Durable ``/v1/runs`` admission, status, events, and control handlers."""
+from hermes_cli.direct_turn_timing import run_scope
+from hermes_cli.constructor_profile import profile_constructor
 
 import asyncio
 import hashlib
@@ -108,6 +110,102 @@ def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., st
     return preview if len(preview) <= limit else preview[: limit - 3] + "..."
 
 
+_DURABLE_RUN_EVENT_TYPES = {
+    "task.created",
+    "approval.request",
+    "run.cancelled",
+    "run.completed",
+    "run.failed",
+    "run.interrupted",
+    "subagent.start",
+    "subagent.complete",
+}
+_CLIENT_CONTEXT_KEYS = (
+    "conversation_id",
+    "message_id",
+    "destination",
+    "human",
+    "agent",
+    "profile",
+    "scopeContract",
+)
+
+
+def _bounded_scalar(value: Any, *, limit: int = 256) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _run_client_context(body: Dict[str, Any]) -> Dict[str, str]:
+    """Extract a small, non-secret app correlation envelope from request metadata."""
+    metadata = body.get("metadata") if isinstance(body, dict) else None
+    if not isinstance(metadata, dict):
+        return {}
+    context: Dict[str, str] = {}
+    for key in _CLIENT_CONTEXT_KEYS:
+        value = _bounded_scalar(metadata.get(key))
+        if value is not None:
+            context[key] = value
+    return context
+
+
+def _event_replay_cursor(request: "web.Request") -> int:
+    try:
+        return max(0, int(request.query.get("after") or request.query.get("after_cursor") or 0))
+    except Exception:
+        return 0
+
+
+def _event_replay_limit(request: "web.Request") -> int:
+    try:
+        return max(1, min(int(request.query.get("limit") or 100), 500))
+    except Exception:
+        return 100
+
+
+def _wants_event_json_replay(request: "web.Request") -> bool:
+    replay = str(request.query.get("replay") or "").strip().lower()
+    if replay in {"1", "true", "yes", "json"}:
+        return True
+    accept = str(request.headers.get("Accept") or "").lower()
+    return "application/json" in accept and "text/event-stream" not in accept
+
+
+def _normalize_durable_run_event(run_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a replay-safe lifecycle event or None for malformed child events.
+
+    Child session ids are truthful: early failures before child construction get
+    a stable server subagent id and explicit pre-session terminal fields, never a
+    fabricated session id.
+    """
+    if not isinstance(event, dict):
+        return None
+    normalized = dict(event)
+    normalized.setdefault("run_id", run_id)
+    event_type = str(normalized.get("event") or "")
+    if event_type in {"subagent.start", "subagent.complete"}:
+        subagent_id = _bounded_scalar(normalized.get("subagent_id"), limit=128)
+        if not subagent_id:
+            return None
+        normalized["subagent_id"] = subagent_id
+        child_session_id = _bounded_scalar(normalized.get("child_session_id"), limit=256)
+        if child_session_id:
+            normalized["child_session_id"] = child_session_id
+            normalized.setdefault("child_session_state", "available")
+        else:
+            normalized.pop("child_session_id", None)
+            if event_type == "subagent.complete":
+                normalized["child_session_state"] = "not_started"
+                normalized["pre_session_terminal"] = True
+            else:
+                normalized["child_session_state"] = "pending"
+    return normalized
+
+
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
@@ -189,7 +287,8 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
-        ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
+        ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+        ("POST", "/v1/runs/{run_id}/delegation-handoff", self._handle_delegation_handoff)]
 
 
 def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
@@ -197,6 +296,42 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
         "supported": True,
         "durable": self._run_idempotency_store.durable,
         "retention_seconds": store_type.RETENTION_SECONDS}
+
+
+def _run_events_replay_capabilities(self, *, store_type) -> dict[str, Any]:
+    """Advertise the durable run-event replay contract for external UIs."""
+    durable = bool(getattr(self._run_idempotency_store, "durable", False))
+    return {
+        "supported": True,
+        "durable": durable,
+        "version": 1,
+        "retention_seconds": store_type.RETENTION_SECONDS,
+        "response_schema": {
+            "object": "list",
+            "run_id": "string",
+            "events": "array<hermes.run_event>",
+            "next_cursor": "integer",
+            "has_more": "boolean",
+        },
+        "child_event_schema": {
+            "stable_identity": "subagent_id is required for persisted subagent lifecycle events",
+            "session_available": "child_session_id is present only after a real child session exists",
+            "pre_session_terminal": (
+                "subagent.complete without a real child_session_id carries "
+                "child_session_state='not_started' and pre_session_terminal=true"
+            ),
+        },
+        "cursor": {
+            "request_query": "after",
+            "response_field": "next_cursor",
+            "ordering": "durable insertion cursor ascending",
+        },
+        "terminal_child_completion": (
+            "subagent.complete events are replayable after parent run terminal "
+            "status and idempotency-store restart while the run remains inside "
+            "retention. Events expire with the parent run idempotency record."
+        ),
+    }
 
 
 def _close_run_state(self) -> None:
@@ -264,11 +399,101 @@ def _mark_shutdown_requested(self) -> int:
     return marked
 
 
+def _restore_durable_run_owner(self, run_id: str) -> Optional[str]:
+    """Restore owner scope/status for a retained idempotent run after restart."""
+    owner = self._run_owners.get(run_id)
+    if owner:
+        self._run_idempotency_ids.add(run_id)
+        return owner
+    try:
+        record = self._run_idempotency_store.run_owner_record(run_id)
+    except Exception:
+        logger.exception("[api_server] failed to restore durable run owner %s", run_id)
+        return None
+    if not isinstance(record, dict):
+        return None
+    scope = str(record.get("scope") or "")
+    if not scope:
+        return None
+    self._run_owners[run_id] = scope
+    self._run_idempotency_ids.add(run_id)
+    status = record.get("status")
+    if isinstance(status, dict) and run_id not in self._run_statuses:
+        self._run_statuses[run_id] = dict(status)
+    return scope
+
+
+def _decorate_durable_run_event(self, run_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach bounded app correlation fields already accepted on the run."""
+    decorated = dict(event)
+    decorated.setdefault("run_id", run_id)
+    _restore_durable_run_owner(self, run_id)
+    status = self._run_statuses.get(run_id) or {}
+    session_id = status.get("session_id")
+    if session_id and "session_id" not in decorated:
+        decorated["session_id"] = str(session_id)
+    model = status.get("model")
+    if model and "model" not in decorated:
+        decorated["model"] = str(model)
+    client_context = status.get("client_context")
+    if isinstance(client_context, dict) and client_context:
+        clean = {k: v for k, v in client_context.items() if isinstance(k, str) and isinstance(v, str)}
+        if clean:
+            decorated["client_context"] = clean
+    return decorated
+
+
+def _persist_durable_run_event(self, run_id: str, event: Dict[str, Any]) -> Optional[int]:
+    """Persist replayable lifecycle events for idempotent, owned runs only."""
+    normalized = _normalize_durable_run_event(run_id, event)
+    if normalized is None:
+        return None
+    if str(normalized.get("event") or "") not in _DURABLE_RUN_EVENT_TYPES:
+        return None
+    scope = _restore_durable_run_owner(self, run_id)
+    if not scope:
+        return None
+    try:
+        return self._run_idempotency_store.append_event(scope, run_id, normalized)
+    except Exception:
+        logger.exception("[api_server] failed to persist durable run event %s", run_id)
+        return None
+
+
+def _list_durable_run_events(
+    self,
+    request: "web.Request",
+    run_id: str,
+    *,
+    after_cursor: int = 0,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    scope = self._run_idempotency_scope(request)
+    try:
+        return self._run_idempotency_store.list_events(
+            scope,
+            run_id,
+            after_cursor=after_cursor,
+            limit=limit,
+            retention_until=_room_retention_until(request),
+        )
+    except Exception:
+        logger.exception("[api_server] failed to list durable run events %s", run_id)
+        return []
+
+
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: Dict[str, Any]) -> None:
+        normalized = _normalize_durable_run_event(run_id, event)
+        if normalized is None:
+            return
+        event = _decorate_durable_run_event(self, run_id, normalized)
+        cursor = _persist_durable_run_event(self, run_id, event)
+        if cursor is not None:
+            event.setdefault("cursor", cursor)
         self._set_run_status(
             run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
         q = self._run_streams.get(run_id)
@@ -370,6 +595,143 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     return status
 
 
+async def _handle_runs(
+    self,
+    request: "web.Request",
+    *,
+    _api_server,
+) -> "web.Response":
+    """POST /v1/runs — start an agent run, return run_id immediately."""
+    _ProviderAuthResolutionError = _api_server._ProviderAuthResolutionError
+    _api_request_browser_control_principal = (
+        _api_server._api_request_browser_control_principal
+    )
+    _api_request_browser_control_transport_family = (
+        _api_server._api_request_browser_control_transport_family
+    )
+    _api_request_profile = _api_server._api_request_profile
+    _approval_event_choices = _api_server._approval_event_choices
+    _clear_turn_process_ownership = _api_server._clear_turn_process_ownership
+    _openai_error = _api_server._openai_error
+    _publish_turn_process_ownership = _api_server._publish_turn_process_ownership
+    _redact_api_error_text = _api_server._redact_api_error_text
+    _request_agent_overrides = _api_server._request_agent_overrides
+
+    # Long-term memory scope header (see chat_completions for details).
+    gateway_session_key, key_err = self._parse_session_key_header(request)
+    if key_err is not None:
+        return key_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+    body, room_error = await self._normalize_room_dispatch(request, body)
+    if room_error is not None:
+        return room_error
+    cockpit_lane, cockpit_error = self._bind_cockpit_request(
+        request, body, gateway_session_key
+    )
+    if cockpit_error is not None:
+        return cockpit_error
+    if cockpit_lane is not None:
+        gateway_session_key = cockpit_lane.session_key
+    room_dispatch = (
+        body.get("hosted_room_dispatch")
+        if isinstance(body, dict)
+        and isinstance(body.get("hosted_room_dispatch"), dict)
+        else None
+    )
+    room_execution_policy = (
+        body.get("_room_execution_policy")
+        if isinstance(body, dict)
+        and isinstance(body.get("_room_execution_policy"), dict)
+        else None
+    )
+
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    if idempotency_key and (
+        len(idempotency_key) > 255
+        or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key)
+    ):
+        return web.json_response(
+            _openai_error(
+                "Idempotency-Key must be 1-255 visible ASCII characters",
+                code="invalid_idempotency_key",
+            ),
+            status=400,
+        )
+    idempotency_scope = (
+        self._run_idempotency_scope(request) if idempotency_key else ""
+    )
+    idempotency_fingerprint = (
+        hashlib.sha256(
+            json.dumps(
+                {
+                    "body": body,
+                    "gateway_session_key": gateway_session_key or "",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+        if idempotency_key
+        else ""
+    )
+
+    raw_input = body.get("input")
+    if not raw_input:
+        return web.json_response(_openai_error("Missing 'input' field"), status=400)
+
+    user_message = (
+        raw_input
+        if isinstance(raw_input, str)
+        else (
+            raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+        )
+    )
+    if not user_message:
+        return web.json_response(
+            _openai_error("No user message found in input"), status=400
+        )
+
+    instructions = body.get("instructions")
+    previous_response_id = body.get("previous_response_id")
+    conversation_history: List[Dict[str, str]] = []
+    raw_history = body.get("conversation_history")
+    if raw_history:
+        if not isinstance(raw_history, list):
+            return [], instructions, None, _json_error(
+                _openai_error, "'conversation_history' must be an array of message objects", status=400)
+        for i, entry in enumerate(raw_history):
+            if not isinstance(entry, dict) or {"role", "content"} - set(entry):
+                return [], instructions, None, _json_error(
+                    _openai_error, f"conversation_history[{i}] must have 'role' and 'content' fields",
+                    status=400)
+            conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+        if previous_response_id:
+            logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+    stored_session_id = None
+    if not conversation_history and previous_response_id:
+        stored = self._current_response_store().get(previous_response_id)
+        if stored:
+            conversation_history = list(stored.get("conversation_history", []))
+            stored_session_id = stored.get("session_id")
+            if instructions is None:
+                instructions = stored.get("instructions")
+    if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        for msg in raw_input[:-1]:
+            if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
+                content = msg["content"]
+                if isinstance(content, list):  # flatten multi-part content blocks to text
+                    content = " ".join(p.get("text", "") for p in content
+                                       if isinstance(p, dict) and p.get("type") == "text")
+                conversation_history.append({"role": msg["role"], "content": str(content)})
+    return conversation_history, instructions, stored_session_id, None
+
+
 def _resolve_conversation_history(
     self, body: dict, raw_input: Any, *, _openai_error
 ) -> "tuple[List[Dict[str, str]], Any, Any, web.Response | None]":
@@ -453,6 +815,8 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    authenticated_principal: Any = None
+    native_request: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -460,7 +824,12 @@ class _RunLaunch:
         return self.run_id
 
     def put_event(self, event: Optional[Dict]) -> None:
-        """Enqueue only while this run still owns live transport state."""
+        """Persist owned events and enqueue only while live transport is active."""
+        if event is not None:
+            event = self.owner._decorate_durable_run_event(self.run_id, event)
+            cursor = self.owner._persist_durable_run_event(self.run_id, event)
+            if cursor is not None:
+                event.setdefault("cursor", cursor)
         if self.owner._run_streams.get(self.run_id) is self.queue:
             self.queue.put_nowait(event)
 
@@ -663,7 +1032,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
-        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
+        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name), client_context=_run_client_context(body))
     if idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
@@ -685,7 +1054,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author, authenticated_principal=request.get("hermes.authenticated_principal"),
+        native_request=request)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -728,6 +1098,9 @@ def _served_runtime(agent) -> Dict[str, str]:
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage, served_runtime)``."""
     from gateway.session_context import clear_session_vars
+    from gateway.josh_board_authority import execution_scope
+    from gateway.owner_api_intake import native_scope
+    from gateway.native_task_receipts import bind as bind_task_receipts
     from gateway.hosted_room_execution_policy import (
         RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy)
     # No eager slash-worker pre-warm: slash.exec spawns one on demand (its error path already relies on that
@@ -742,7 +1115,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
-    with self._profile_scope(run.request_profile):
+    with self._profile_scope(run.request_profile), execution_scope(run.request_profile, run.authenticated_principal), native_scope(self, run.native_request, run.request_profile, run.session_id, run.run_id, run.user_message), bind_task_receipts(authenticated=True, profile=run.request_profile, principal=run.authenticated_principal, run_id=run.run_id, session_id=run.session_id, persist=lambda event: self._persist_durable_run_event(run.run_id, self._decorate_durable_run_event(run.run_id, event))):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
@@ -777,6 +1150,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
+            try:
+                from gateway import delegation_handoff
+                delegation_handoff.snapshot(run.authenticated_principal)
+            except Exception as exc:  # never fail the turn over the return registry
+                logger.warning("delegation handoff snapshot failed run=%s: %s", run.run_id, exc)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
@@ -813,7 +1191,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             allow_permanent=event.get("allow_permanent") is not False)))
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            loop.call_soon_threadsafe(run.put_event, event)
 
     return _approval_notify
 
@@ -911,10 +1289,29 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+        from gateway.josh_board_authority import execution_scope
+        from gateway.owner_api_intake import native_scope
+        @run_scope(run_id, "constructor")
+        @profile_constructor(run_id)
+        def _create_native_agent():
+            with self._profile_scope(run.request_profile), execution_scope(run.request_profile, run.authenticated_principal), native_scope(self, run.native_request, run.request_profile, run.session_id, run_id, run.user_message):
+                return self._create_agent(
+                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                    interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+        agent = await asyncio.to_thread(_create_native_agent)
+        if run_id in self._stopping_run_ids:
+            _finish("cancelled")
+            def _close_unstarted():
+                from gateway.josh_board_authority import execution_scope
+                with self._profile_scope(run.request_profile), execution_scope(run.request_profile, run.authenticated_principal):
+                    close = getattr(agent, "close", None)
+                    if callable(close):
+                        close()
+            try:
+                await asyncio.to_thread(_close_unstarted)
+            except Exception:
+                logger.warning("[api_server] unstarted agent cleanup failed for run=%s", run_id)
+            return
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -1013,6 +1410,27 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
     return err or web.json_response(status)
 
 
+async def _handle_delegation_handoff(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """POST /v1/runs/{run_id}/delegation-handoff — single-use return handoff for the run owner."""
+    run_id, status, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="status", active_fallback=False)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    session_id = body.get("session_id") if isinstance(body, dict) else None
+    if not isinstance(session_id, str) or (status.get("session_id") and status.get("session_id") != session_id):
+        return web.json_response({"error": "session_mismatch"}, status=403)
+    from gateway import delegation_handoff
+    try:
+        token = delegation_handoff.mint(run_id, session_id)
+    except PermissionError:
+        return web.json_response({"error": "no_verified_binding"}, status=403)
+    return web.json_response({"token": token, "expires_in": delegation_handoff.TTL})
+
+
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
     auth_err = self._check_auth(request)
@@ -1021,6 +1439,26 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     run_id = request.match_info["run_id"]
     if not self._request_owns_run(request, run_id):
         return _run_not_found(_api_server._openai_error, run_id)
+    after_cursor = _event_replay_cursor(request)
+    limit = _event_replay_limit(request)
+    replay_events = self._list_durable_run_events(
+        request,
+        run_id,
+        after_cursor=after_cursor,
+        limit=limit,
+    )
+    if _wants_event_json_replay(request):
+        next_cursor = replay_events[-1].get("cursor", after_cursor) if replay_events else after_cursor
+        return web.json_response({
+            "object": "list",
+            "run_id": run_id,
+            "events": replay_events,
+            "next_cursor": next_cursor,
+            "has_more": len(replay_events) >= limit,
+        })
+
+    # Allow subscribing slightly before the run is registered (race condition window).
+    # If the live stream is gone but durable events exist, stream the replay and close.
     # Allow subscribing slightly before the run is registered (race window).
     # Confirm the force-kill actually reaped the process before we clear its PID file / scoped locks.
     # SIGKILL can fail to take (e.g. an uninterruptible-sleep or zombie-reaping parent), and if we blindly
@@ -1030,14 +1468,28 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         if run_id in self._run_streams:
             break
         await asyncio.sleep(0.05)
-    else:
+    q = self._run_streams.get(run_id)
+    if q is None and not replay_events:
         return _run_not_found(_api_server._openai_error, run_id)
-    q = self._run_streams[run_id]
-    self._run_stream_subscribers.add(run_id)
-    response = web.StreamResponse(status=200, headers={
-        "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    if q is not None:
+        self._run_stream_subscribers.add(run_id)
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
     await response.prepare(request)
     try:
+        for event in replay_events:
+            await response.write(_api_server._sse_frame(event))
+        if q is None:
+            await response.write(b": stream closed\n\n")
+            return response
         while True:
             try:
                 event = await asyncio.wait_for(
@@ -1053,7 +1505,8 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
         self._run_stream_subscribers.discard(run_id)
-        _drop_run_transport(self, run_id)
+        if q is not None:
+            _drop_run_transport(self, run_id)
     return response
 
 

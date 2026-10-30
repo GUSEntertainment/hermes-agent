@@ -426,7 +426,7 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed, mark_delivery_unknown
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -436,6 +436,17 @@ class GatewayStartupMixin:
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
+            # Photon sends are non-idempotent; an ambiguous attempt must not create a second bubble.
+            if row.get("suppress_send"):
+                logger.warning("obligation %s: suppressing ambiguous Photon redelivery", row["obligation_id"])
+                try:
+                    await asyncio.to_thread(
+                        mark_delivery_unknown, row["obligation_id"],
+                        "ambiguous_photon_send_suppressed",
+                    )
+                except Exception:
+                    logger.debug("failed to reconcile ambiguous Photon obligation %s", row["obligation_id"], exc_info=True)
+                continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
@@ -443,6 +454,10 @@ class GatewayStartupMixin:
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            if row["platform"] == "photon":
+                metadata = dict(metadata or {})
+                metadata["delivery_obligation_id"] = row["obligation_id"]
+                metadata["logical_message_id"] = row.get("logical_message_id") or row["obligation_id"]
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
@@ -785,7 +800,7 @@ class GatewayStartupMixin:
                 if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
                     return ""
         if is_intentional_silence_response(last["content"]):
-            return "" if machinery else _UNEXPECTED_SILENCE_REPLY
+            return ""  # Chris: never post the silence warning
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod

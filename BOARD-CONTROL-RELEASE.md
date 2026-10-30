@@ -1,0 +1,1 @@
+Carry forward the board-control deltas and tests described in /Users/Chris/Documents/Comms/maintenance/kanban-owner-control-20261004/RESULTS.md. Do not rebuild from an older release and silently drop these changes.

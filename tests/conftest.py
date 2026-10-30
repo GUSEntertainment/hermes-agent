@@ -1422,6 +1422,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     _relocate_basetemp_outside_operator_home(config)
     config.addinivalue_line(
         "markers",
+        "fake_control_plane: service-manager tests confined to temp fakes/fixtures; "
+        "selected by the canonical runner before collection.",
+    )
+    config.addinivalue_line(
+        "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
         "(only for tests that genuinely need real os.kill / subprocess "
         "behaviour — e.g. PTY tests that signal their own child).",
@@ -2075,3 +2080,10 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_accounts_vault(monkeypatch, tmp_path_factory):
+    """Keep the real Margot Accounts vault out of tests (t_23001aff); its tests pass root explicitly."""
+    import agent.vault_backends.accounts as _acct
+    monkeypatch.setattr(_acct, "DEFAULT_ROOT", str(tmp_path_factory.getbasetemp() / "no-accounts-vault"))

@@ -2026,17 +2026,45 @@ def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_conten
 
 
 def load_config() -> Dict[str, Any]:
-    """Load the merged configuration (DEFAULT_CONFIG + config.yaml + managed scope, env-expanded).
-    Cached on the file signature; returns a deepcopy since most call sites mutate the result.
-    Read-only hot paths should use ``load_config_readonly()`` to skip the deepcopy."""
-    return _load_config_impl(want_deepcopy=True)
+    """Load configuration from ~/.hermes/config.yaml.
+
+    Cached on the config file's (mtime_ns, size). Returns a deepcopy of
+    the cached value when unchanged, since most call sites mutate the
+    result (e.g. ``cfg["model"]["default"] = ...`` before ``save_config``).
+    The cache is keyed on ``str(config_path)`` so profile switches
+    (which change ``HERMES_HOME`` and therefore ``get_config_path()``)
+    don't collide.
+
+    Read-only callers should use ``load_config_readonly()`` to skip the
+    defensive deepcopy — that path matters in agent-loop hot spots like
+    ``get_provider_request_timeout`` which is called once per API turn.
+    """
+    from gateway.member_worker_policy import runtime_config
+    return runtime_config(_load_config_impl(want_deepcopy=True))
 
 
 def load_config_readonly() -> Dict[str, Any]:
-    """``load_config()`` without the defensive deepcopy (~half of the 265us cache-hit cost).
-    **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
-    every subsequent caller** — only for code paths that never write to the result."""
-    return _load_config_impl(want_deepcopy=False)
+    """Fast-path variant of ``load_config()`` for callers that ONLY READ.
+
+    Returns the cached config dict directly without the defensive deepcopy
+    that ``load_config()`` applies. **Mutating the returned dict (or any
+    nested structure) corrupts the in-process cache for every subsequent
+    caller** — only use this when you are absolutely sure your code path
+    will not write to the result. If you need to mutate or pass to
+    ``save_config``, call ``load_config()`` instead.
+
+    Why this exists: ``load_config()`` cache-hit cost is ~265us per call,
+    half of which (~135us) is the defensive deepcopy. The agent loop calls
+    into config reads (timeouts, thresholds, feature flags) ~20-50x per
+    conversation; skipping deepcopy here removes a measurable allocation
+    source and the GC pressure that comes with it.
+
+    Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
+    existing ``isinstance(x, dict)`` guards downstream keep working. The
+    safety guarantee is purely documented, not enforced — be careful.
+    """
+    from gateway.member_worker_policy import runtime_config
+    return runtime_config(_load_config_impl(want_deepcopy=False))
 
 
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -2063,17 +2091,40 @@ def write_platform_config_field(
 # except ``backend`` (historically ``TERMINAL_ENV``).
 TERMINAL_CONFIG_ENV_MAP = {
     "backend": "TERMINAL_ENV",
-    **{
-        key: f"TERMINAL_{key.upper()}"
-        for key in (
-            "modal_mode", "degraded_mode", "cwd", "temp_dir", "timeout", "lifetime_seconds",
-            "docker_image", "docker_forward_env", "singularity_image", "modal_image",
-            "daytona_image", "vercel_runtime", "ssh_host", "ssh_user", "ssh_port", "ssh_key",
-            "container_cpu", "container_memory", "container_disk", "container_persistent",
-            "docker_volumes", "docker_env", "docker_mount_cwd_to_workspace", "docker_network",
-            "docker_extra_args", "docker_shm_size", "docker_run_as_host_user", "docker_snap_compat",
-            "docker_persist_across_processes", "docker_shared_container_key",
-            "docker_orphan_reaper", "sandbox_dir", "persistent_shell")}}
+    "modal_mode": "TERMINAL_MODAL_MODE",
+    "degraded_mode": "TERMINAL_DEGRADED_MODE",
+    "cwd": "TERMINAL_CWD",
+    "temp_dir": "TERMINAL_TEMP_DIR",
+    "timeout": "TERMINAL_TIMEOUT",
+    "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+    "docker_image": "TERMINAL_DOCKER_IMAGE",
+    "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+    "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+    "modal_image": "TERMINAL_MODAL_IMAGE",
+    "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+    "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+    "ssh_host": "TERMINAL_SSH_HOST",
+    "ssh_user": "TERMINAL_SSH_USER",
+    "ssh_port": "TERMINAL_SSH_PORT",
+    "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_sync_files": "TERMINAL_SSH_SYNC_FILES",
+    "container_cpu": "TERMINAL_CONTAINER_CPU",
+    "container_memory": "TERMINAL_CONTAINER_MEMORY",
+    "container_disk": "TERMINAL_CONTAINER_DISK",
+    "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+    "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+    "docker_env": "TERMINAL_DOCKER_ENV",
+    "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+    "docker_network": "TERMINAL_DOCKER_NETWORK",
+    "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+    "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
+    "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+    "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+    "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
+    "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
+    "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+    "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+}
 
 
 def _terminal_env_value(value: Any) -> str:

@@ -236,6 +236,7 @@ def specify_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    # Only initial triage: loop-stopped, held, resumed or already-specified
+    # cards are never auto-rewritten (t_4359056c).
     with kbc.connect_closing() as conn:
-        tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        return kb.list_initial_triage_ids(conn, tenant=tenant)

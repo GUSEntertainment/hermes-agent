@@ -32,7 +32,7 @@ from gateway.session import (
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
-from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+from gateway.turn_lease import DEFAULT_LEASE_WAIT, STARTUP_RESTORE_REPLAY_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -451,6 +451,33 @@ class GatewayTurnMixin:
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+        if not strict_session and not bool(getattr(event, "internal", False)):
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                from gateway.session_rotation import build_pickup_brief_messages, rotation_enabled, should_rotate_session
+                from gateway.run import _load_gateway_config
+                cfg = _load_gateway_config()
+                history = await self.async_session_store.load_transcript(session_entry.session_id) if rotation_enabled(cfg) else []
+                decision = should_rotate_session(
+                    source=source, session_key=session_key, history=history,
+                    last_prompt_tokens=session_entry.last_prompt_tokens,
+                    estimated_tokens=estimate_messages_tokens_rough(history), config=cfg,
+                )
+                if decision.rotate:
+                    old_id = session_entry.session_id
+                    rotated = await self.async_session_store.reset_session_with_transcript(
+                        session_key, lambda new_id: build_pickup_brief_messages(
+                            old_session_id=old_id, new_session_id=new_id, decision=decision, source=source,
+                        ),
+                    )
+                    if rotated is not None:
+                        session_entry = rotated
+                        self._clear_conversation_scope(session_key, reason="session_rotation")
+                        self._evict_cached_agent(session_key)
+                        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+                            await asyncio.to_thread(self._sync_telegram_topic_binding, source, session_entry, reason="session-rotation")
+            except Exception:
+                logger.warning("Fresh-session rotation check failed closed", exc_info=True)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
@@ -602,7 +629,7 @@ class GatewayTurnMixin:
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
         a resend notice). Released in _handle_message's finally, granted per (routing key, run
@@ -611,10 +638,15 @@ class GatewayTurnMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
+        _lease_wait = _float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT)
+        if getattr(event, "_hermes_startup_restore_replay", False):
+            _lease_wait = max(_lease_wait, _float_env(
+                "HERMES_RESTORE_REPLAY_LEASE_TIMEOUT", STARTUP_RESTORE_REPLAY_LEASE_WAIT,
+            ))
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
-                timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                timeout=_lease_wait,
             )
         except TurnLeaseTimeoutError:
             # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
@@ -899,10 +931,18 @@ class GatewayTurnMixin:
         from gateway.run import _stamp_hygiene_compression_provenance
         _stamp_hygiene_compression_provenance(agent, desc, getattr(ActivityProvenance, provenance_name), debug_label)
 
-    async def _hmwa_hygiene_notify(self, source, meta, message, what):
-        """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
+    async def _hmwa_hygiene_notify(self, source, meta, message, what, *, progress_notice=False):
+        """Best-effort user notice on the hygiene thread; failure is logged, never raised.
+
+        [GUS] Only progress notices (turn-hold deferral) are gated on
+        ``compression.progress_notices`` (live behavior); failure/timeout warnings
+        follow ``display.suppress_warning_notifications`` via ``emit_warning``."""
         try:
             _adapter = self._delivery_adapter_for(source)
+            if progress_notice:
+                from gateway.run import _gateway_compression_progress_notices_enabled
+                if not _gateway_compression_progress_notices_enabled():
+                    return
             if _adapter and source.chat_id:
                 await _adapter.emit_warning(source.chat_id, message, metadata=meta,
                                             logical_platform=source.platform)
@@ -998,6 +1038,7 @@ class GatewayTurnMixin:
         )
         await self._hmwa_hygiene_notify(
             source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            progress_notice=True,
         )
         raise
 
@@ -1534,13 +1575,12 @@ class GatewayTurnMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up may go silent, a human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
-        if _intentional_silence and not is_machinery_display_kind(_silence_kind):
+        if False and _intentional_silence and not is_machinery_display_kind(_silence_kind):  # Chris: never post the silence warning
             logger.warning(
-                "silence marker rejected on a user turn: platform=%s chat=%s",
+                "silence marker on a user turn honored (warning disabled): platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
-            _intentional_silence = False
-            response = _UNEXPECTED_SILENCE_REPLY
+            # Chris: never post the silence warning; honor the silence instead.
 
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
@@ -1941,7 +1981,25 @@ class GatewayTurnMixin:
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            _voice_deferred = False
+            if not agent_result.get("already_sent") and adapter is not None and getattr(
+                type(adapter), "register_post_delivery_callback", None
+            ) is not None:
+                try:
+                    async def _deferred_voice_reply():
+                        task = asyncio.create_task(self._send_voice_reply(event, response))
+                        background = getattr(self, "_background_tasks", None)
+                        if isinstance(background, set):
+                            background.add(task)
+                            task.add_done_callback(background.discard)
+                    adapter.register_post_delivery_callback(
+                        session_key, _deferred_voice_reply, generation=run_generation,
+                    )
+                    _voice_deferred = True
+                except Exception as exc:
+                    logger.debug("deferred voice registration failed: %s", exc)
+            if not _voice_deferred:
+                await self._send_voice_reply(event, response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
@@ -2057,6 +2115,10 @@ class GatewayTurnMixin:
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
         from gateway.run import _load_gateway_config
+        from gateway.direct_document_custody import bind_event as bind_document_event
+        bind_document_event(event)
+        from plugins.platforms.photon.secure_intake.composition import bind as bind_secure_intake
+        bind_secure_intake(event)
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
@@ -2083,7 +2145,7 @@ class GatewayTurnMixin:
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
@@ -2123,6 +2185,10 @@ class GatewayTurnMixin:
             self._hmwa_apply_message_timestamp(event, message_text)
         )
 
+        from gbrain_corrections.native_runtime import gateway_note
+        _correction_note = await asyncio.to_thread(gateway_note, event)
+        if _correction_note:
+            turn_sidecar_notes.append(_correction_note)
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
         if turn_sidecar_notes and session_key:
@@ -2147,14 +2213,62 @@ class GatewayTurnMixin:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        from gateway.run import _gateway_platform_value, _load_gateway_config
+        is_margot_os_topic = (
+            _gateway_platform_value(getattr(source, "platform", None)) == "telegram"
+            and str(getattr(source, "chat_id", "")) == "-1004479003480"
+            and bool(getattr(source, "thread_id", None))
+        )
+        _msg_preview = "<department-topic content redacted>" if is_margot_os_topic else (event.text or "")[:80].replace("\n", " ")
+        _reply_txt = "<department-topic reply redacted>" if is_margot_os_topic else (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", (event.text or "")[:80].replace("\n", " "),
-            getattr(event, "reply_to_message_id", None),
-            (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
+            source.chat_id or "unknown", _msg_preview,
+            getattr(event, "reply_to_message_id", None), _reply_txt,
         )
 
+        # [GUS v0.21.5 port] Department-topic gate runs BEFORE session resolution
+        # (live ordering): a Margot OS topic message never creates/touches a session
+        # entry or runs topic recovery unless it may default-execute.
+        # External route metadata is never authority: resolve the pinned topic policy.
+        if is_margot_os_topic:
+            from gateway.department_topic_router import resolve_department_topic
+            routing_cfg = _load_gateway_config()
+            requested = (isinstance(routing_cfg, dict) and isinstance(routing_cfg.get("department_topic_routing"), dict)
+                         and routing_cfg["department_topic_routing"].get("enabled") is True)
+            message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None) or "0"
+            try:
+                decision = resolve_department_topic(chat_id=source.chat_id, thread_id=source.thread_id, message_id=message_id)
+                resolution = decision.status
+            except Exception:
+                logger.warning("Margot OS topic preflight failed closed", exc_info=True)
+                resolution = "policy_error"
+            if not requested and resolution != "command":
+                return "The accountable department routing gate is not active, so I did not default-execute this topic request."
+            if requested:
+                try:
+                    from gateway.department_topic_router import dispatch_department_topic, dispatch_to_safe_delegate, load_department_topic_activation
+                    activation = load_department_topic_activation(routing_cfg)
+                    assert activation is not None
+                    if resolution == "policy_error":
+                        return "The department routing policy is unavailable, so I did not default-execute this topic request."
+                    outcome = await asyncio.to_thread(
+                        dispatch_department_topic, chat_id=source.chat_id, thread_id=source.thread_id,
+                        message_id=message_id, message_text=event.text or "",
+                        create_task=lambda envelope: dispatch_to_safe_delegate(envelope, board=activation.board),
+                    )
+                    replies = {
+                        "delegated": "I’ve routed this to the accountable department workflow and will return the verified result here.",
+                        "duplicate": "This topic update is already in the accountable department workflow; I’ll return the verified result here.",
+                        "unverified_topic": "This candidate topic is not verified for live routing yet, so I did not default-execute the request.",
+                        "unknown_topic": "This topic is not mapped to a specialist workflow, so I did not default-execute the request.",
+                    }
+                    if outcome.status in replies:
+                        return replies[outcome.status]
+                except Exception:
+                    logger.exception("Department-topic handoff failed closed")
+                    return "I couldn’t validate or create the accountable department handoff, so I did not default-execute this topic request."
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
@@ -2366,12 +2480,12 @@ class GatewayTurnMixin:
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
-        media_types: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None, document_event=None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
         with self._profile_scope_for_source(source):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt, source, task_id, event_message_id, media_urls, media_types, document_event,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -2402,7 +2516,7 @@ class GatewayTurnMixin:
     async def _run_background_task_inner(
         self, prompt: str, source: "SessionSource", task_id: str,
         event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
-        media_types: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None, document_event=None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from gateway.run import (
@@ -2410,6 +2524,11 @@ class GatewayTurnMixin:
             _platform_config_key,
         )
         from run_agent import AIAgent
+        from gateway.background_document_custody import require_origin, supported, validate_delivery
+        if document_event is not None or supported(source):
+            require_origin(document_event, source)
+            if not self._is_user_authorized_for_source(source):
+                raise PermissionError("Background source authorization revoked")
         media_urls = media_urls or []
         media_types = media_types or []
         adapter = self._delivery_adapter_for(source)
@@ -2422,6 +2541,7 @@ class GatewayTurnMixin:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(
                     source.chat_id,
                     "❌ The background task couldn't start because no AI model sign-in is "
@@ -2495,20 +2615,24 @@ class GatewayTurnMixin:
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+            label = "Background task result" if document_event is not None else "✅ Background task complete"
+            header = f'{label}\nPrompt: "{preview}"\n\n'
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             elif not images and not media_files:
+                await validate_delivery(self, document_event, source, _thread_metadata)
                 await adapter.send(
                     chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
                 )
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
+                    await validate_delivery(self, document_event, source, _thread_metadata)
                     await adapter.send_image(
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
@@ -2518,7 +2642,8 @@ class GatewayTurnMixin:
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
-                with suppress(Exception):
+                try:
+                    await validate_delivery(self, document_event, source, _thread_metadata)
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                         await adapter.send_voice(
                             chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
@@ -2530,7 +2655,16 @@ class GatewayTurnMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        if key == "file_path" and (document_event is not None or supported(source)):
+                            from gateway.direct_document_custody import send_selected
+                            await send_selected(adapter, document_event.event, media_path, _thread_metadata,
+                                                expected_authority=json.loads(document_event.authority_json))
+                        else:
+                            await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                except PermissionError:
+                    logger.warning("Background document withheld after authorization failure")
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
@@ -3732,7 +3866,7 @@ class GatewayTurnMixin:
                     "Queued follow-up for session %s: replacing a human-turn silence marker.",
                     session_key or "?",
                 )
-                first_response = _UNEXPECTED_SILENCE_REPLY
+                first_response = ""  # Chris: never post the silence warning
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")

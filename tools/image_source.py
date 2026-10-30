@@ -72,10 +72,33 @@ async def resolve_image_source(
     # (a path-shape gate here regressed them once).
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
     p = Path(os.path.expanduser(candidate))
+    try:
+        from tools.workspace_confinement import resolve_confined_path
+        p = resolve_confined_path(
+            p, task_id=ctx.task_id or "default", access="read"
+        )
+    except PermissionError as exc:
+        raise SourceUnsafe(str(exc), src=s, origin="file") from exc
+    # Confinement decision (see module docstring). Under a non-local backend
+    # a path is host-readable ONLY if it lands in a media cache (after
+    # translating a container-visible cache path back to its host mount);
+    # every other path is read inside the sandbox via exec-read, so a host
+    # path outside the caches never yields the host's bytes.
     host_target = _permitted_host_read_target(p, ctx)
     if host_target is not None and host_target.is_file():
         _guard_credential_read(host_target, s)
-        data = await asyncio.to_thread(host_target.read_bytes)
+        try:
+            from tools.workspace_confinement import read_confined_bytes
+
+            data = await asyncio.to_thread(
+                read_confined_bytes,
+                host_target,
+                task_id=ctx.task_id or "default",
+                max_bytes=_MAX_INGEST_BYTES,
+            )
+        except PermissionError as exc:
+            raise SourceUnsafe(str(exc), src=s, origin="file") from exc
+
         return _finalize(data, "", "file", s, permitted)
     if _is_local_terminal_backend():
         # Any path was host-readable, so a miss means the file doesn't exist.

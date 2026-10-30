@@ -86,8 +86,18 @@ def _visible(*, to_env_worker: bool) -> bool:
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
-        return to_env_worker
+        return to_env_worker or _is_board_coordinator()
     return _profile_has_kanban_toolset()
+
+
+# Chris 2026-10-09: the board coordinator must be able to act on stuck cards
+# (list, unblock, move, archive), not just read them.
+_BOARD_COORDINATORS = frozenset({"claire", "scarlett", "steven", "riley", "lauren", "grace", "quinn"})
+
+
+def _is_board_coordinator() -> bool:
+    return (os.environ.get("HERMES_PROFILE") in _BOARD_COORDINATORS
+            and not _is_delegated_child_context())
 
 
 @no_cache_check_fn
@@ -111,6 +121,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 _RUN_LIFECYCLE_TOOLS = frozenset({
     "kanban_complete", "kanban_block",
     "kanban_request_review", "kanban_request_changes",
+    "kanban_handoff", "kanban_rebind_review_artifact",
 })
 
 class _Reject(Exception):
@@ -150,11 +161,29 @@ def _persisted_identity() -> str:
     return current_profile_name("worker") or "worker"
 
 
+def _private_task_boundary(name, handler):
+    from functools import wraps
+    @wraps(handler)
+    def guarded(args, **kw):
+        from gateway.member_worker_policy import authorize_private_kanban
+        policy = authorize_private_kanban(name, args)
+        if policy is not None:
+            args = dict(args, task_id=args.get('task_id') or policy['task'], board=policy['board'])
+        result = handler(args, **kw)
+        if policy is not None and name in {'kanban_show', 'kanban_attachments'}:
+            # Never return a page assembled under authority revoked during I/O.
+            if authorize_private_kanban(name, args) != policy:
+                raise PermissionError('Private task authority changed during read')
+        return result
+    return guarded
+
+
 def _kanban_handler(tool_name: str) -> Callable:
     """Wrap a handler so every failure is a structured tool error. ``ValueError``
     (invalid board slug, DB validation such as cycle/self-link, ``AttachmentTooLarge``)
     is reported without a traceback; anything else is logged with ``logger.exception``."""
     def deco(fn):
+        fn = _private_task_boundary(tool_name, fn)
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
             try:
@@ -189,6 +218,9 @@ def _reject_delegated_child_mutation(tool_name: str) -> None:
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """``task_id`` arg or the dispatcher's env var. A delegate child or an
     in-process cron job must never inherit the worker's task id implicitly."""
+    bound = os.environ.get("HERMES_KANBAN_TASK")
+    if bound and os.environ.get("HERMES_PROFILE") in {"claude-review", "fable-review"} and arg and arg != bound:
+        raise PermissionError("Advisory workers can access only their own redacted packet task")
     if arg:
         return arg
     if _is_delegated_child_context() or not _is_dispatcher_owned_worker():
@@ -222,6 +254,63 @@ def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Op
     return {**(metadata or {}), "worker_session_id": session_id} if session_id else metadata
 
 
+
+
+def _normalize_authorization_metadata(metadata: Optional[dict]) -> tuple[Optional[dict], Optional[str]]:
+    """Normalize versioned authorization-continuity metadata if present."""
+    if metadata is None or "authorization_continuity" not in metadata:
+        return metadata, None
+    from hermes_cli import kanban_db as kb
+
+    normalized = kb.normalize_authorization_continuity(
+        metadata.get("authorization_continuity")
+    )
+    if normalized is None:
+        return None, "metadata.authorization_continuity must be an object"
+    updated = dict(metadata)
+    updated["authorization_continuity"] = normalized
+    return updated, None
+
+
+def _authorization_contract_for_child(
+    kb: Any,
+    conn: Any,
+    *,
+    self_task_id: Optional[str],
+    parents: list[str],
+    requested: Any,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Return the authorization block safe to append to a child task body."""
+    if requested is not None:
+        normalized = kb.normalize_authorization_continuity(requested)
+        if normalized is None:
+            return None, "authorization_continuity must be an object"
+        if not kb.authorization_continuity_allows_inheritance(normalized):
+            return None, (
+                "authorization_continuity cannot mark this child as previously "
+                "authorized because it contains an explicit hold, scope expansion, "
+                "or unresolved Chris decision. Create the card without inherited "
+                "authorization, or make the new decision concrete in the task spec."
+            )
+        return normalized, None
+
+    if not self_task_id or self_task_id not in set(parents):
+        return None, None
+    inherited = kb.authorization_continuity_for_task(
+        conn, self_task_id, include_parents=True
+    )
+    if not kb.authorization_continuity_allows_inheritance(inherited):
+        return None, None
+    inherited = dict(inherited)
+    existing = inherited.get("inherited_from") or []
+    if isinstance(existing, str):
+        existing = [existing]
+    inherited["inherited_from"] = list(dict.fromkeys([self_task_id, *existing]))[:8]
+    inherited.setdefault(
+        "inheritance",
+        "Inherited only for child work that stays inside the parent task scope.",
+    )
+    return inherited, None
 def _enforce_worker_task_ownership(tid: str) -> None:
     """A dispatcher-spawned worker may only mutate its own HERMES_KANBAN_TASK; a
     prompt-injected ``task_id`` must not corrupt sibling/cross-tenant runs.
@@ -276,11 +365,52 @@ def _worker_guard(tool_name: str, args: dict) -> str:
 def _require_orchestrator_tool(tool_name: str) -> None:
     """The check_fn already hides orchestrator tools from workers; this catches
     a stale registration or test harness routing a worker here anyway."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and not _is_board_coordinator():
         raise _Reject(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_request_review, kanban_request_changes, kanban_block, "
             "kanban_heartbeat, or kanban_comment for their assigned task.")
+
+
+def _connect(board: Optional[str] = None):
+    """Authority-checked board open -> ``(kb, conn)``; caller closes ``conn``.
+
+    [GUS v0.21.5 port] Kept as the single admission path (member/administrator/
+    private-worker/advisory board scoping); upstream's ``_board`` context manager
+    delegates here. A failed post-open validation closes the connection."""
+    if (os.environ.get("HERMES_KANBAN_TASK")
+            and os.environ.get("HERMES_PROFILE") in {"claude-review", "fable-review"}
+            and board and board != os.environ.get("HERMES_KANBAN_BOARD")):
+        raise PermissionError("Advisory workers cannot switch boards")
+    from gateway.josh_board_authority import admitted_board, _execution
+    from gateway.member_worker_policy import authenticated_private_policy
+    from hermes_cli.board_owner_manage import (
+        require_owner, member_board, administrator_board, _validate_member_connection,
+    )
+    member = None
+    administrative = None
+    if _execution.get() is not None and authenticated_private_policy() is None:
+        member = require_owner()
+    if member is not None:
+        administrative = administrator_board(member, board)
+        board = administrative or member_board(member, board)
+    else:
+        board = admitted_board(board)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect(board=board)
+    try:
+        if member is not None:
+            _validate_member_connection(conn, {'board': administrative} if administrative else member)
+            if require_owner() != member:
+                raise PermissionError(
+                    'Administrator enrollment changed while opening board' if administrative
+                    else 'Member enrollment changed while opening board')
+            if administrative:
+                administrator_board(member, administrative)
+    except Exception:
+        conn.close()
+        raise
+    return kb, conn
 
 
 @contextmanager
@@ -288,9 +418,7 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
     contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
     overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    conn = kbc.connect(board=board)
+    kb, conn = _connect(board=board)
     try:
         yield kb, conn
     finally:
@@ -396,7 +524,8 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error capability_status "
+    "capability_checked_at".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -458,13 +587,40 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
+def _goal_mode_handoff_rejection(task, evidence: str, *, phase: str = "completion") -> Optional[str]:
+    """[GUS v0.21.5 port] Custom phase-aware judge API (carried from live): returns
+    the judge's rejection reason, or None to allow. ``review`` never consults an
+    auxiliary model (native checks govern review entry); an unknown phase raises
+    so it cannot disable completion judgment. Fails open like ``_goal_gate``."""
+    if phase not in {"completion", "review"}:
+        raise ValueError("unknown goal handoff phase")
+    if phase == "review":
+        return None
+    if not task or not task.goal_mode or not _goal_judge_available():
+        return None
+    from hermes_cli.kanban_judgment import handoff_goal
+    try:
+        verdict, reason, _, _, transport_failed = judge_goal(
+            goal=handoff_goal(task, phase=phase), last_response=evidence.strip())
+    except Exception as judge_exc:
+        logger.warning("goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
+        return None
+    if transport_failed:
+        return None
+    return None if verdict == "done" else reason
+
+
 def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     """Goal-mode pre-handoff judge gate: a worker must not complete / request
     review before acceptance criteria are met. ``blocked`` gets its own
     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
     A broken judge fails open (logged) so it cannot permanently wedge work."""
+    if tool_name == "kanban_request_review":
+        return  # Native maker/reviewer/artifact checks govern entry to review.
     if not task or not task.goal_mode or not _goal_judge_available():
         return
+    from hermes_cli.kanban_judgment import handoff_goal
+    goal = handoff_goal(task, phase="completion")
     try:
         # Headless gate runs outside any agent turn: bind the per-task relay-affinity scope
         # (mirrors kanban_specify) so the relay does not reject the judge call (#113669).
@@ -472,7 +628,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+                goal=goal, last_response=evidence.strip())
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -616,26 +772,314 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+def _owner_board_routes(kb, conn, task, board=None):
+    """Expose supported control paths without changing session authority."""
+    from hermes_cli.board_owner_manage import require_owner, member_board, _validate_member_connection
+    try:
+        member = require_owner()
+    except PermissionError:
+        member = None
+    from hermes_cli.board_owner_manage import administrator_board
+    administrative = administrator_board(member, board) if member is not None else None
+    if administrative:
+        _validate_member_connection(conn, {'board': administrative})
+        member = None
+    if member is None and not administrative and not _check_kanban_orchestrator_mode():
+        return None
+    if member is not None:
+        member_board(member, board)
+        _validate_member_connection(conn, member)
+    import hashlib
+    import shlex
+
+    prefix = ["hermes", "kanban", "--board", board or kb.get_current_board()]
+    command = lambda *args: shlex.join(prefix + [str(x) for x in args])
+    fields = {k: getattr(task, k) for k in ("id", "title", "body", "assignee", "status", "tenant")}
+    snapshot = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    stop = conn.execute(
+        "SELECT id,kind,payload FROM task_events WHERE task_id=? AND kind IN "
+        "('blocked','block_loop_detected','triaged','escalated') ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    latest_comment = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_comments WHERE task_id=?", (task.id,)).fetchone()[0]
+    waiting = []
+    for pid in kb.parent_ids(conn, task.id):
+        parent = kb.get_task(conn, pid)
+        if not kb._task_row_satisfies_dependency(conn, pid):
+            waiting.append({"task_id": pid, "title": parent.title if parent else None,
+                            "status": parent.status if parent else "missing",
+                            "owner": parent.assignee if parent else None})
+    routes = {
+        "show": command("show", task.id, "--json"),
+        "archive": command("archive", task.id, "--reason", "DISPOSITION_AND_EVIDENCE"),
+        "restore": command("restore", task.id, "--reason", "REASON"),
+    }
+    if task.status == "triage" and stop:
+        routes["resume_dry_run"] = command("resume-triage", task.id, "--stop-event", stop["id"],
+            "--auth-comment", "AUTHORIZATION_COMMENT_ID", "--latest-comment", latest_comment,
+            "--task-sha", snapshot, "--reason", "RESOLUTION_EVIDENCE", "--dry-run")
+    native = None
+    try:
+        from hermes_cli.board_owner_manage import require_owner, describe
+        require_owner()
+        native = dict(tool="kanban_manage", **describe(conn, task.id))
+    except PermissionError:
+        pass
+    return {"native": native, "waiting_on": waiting, "latest_stop_event_id": stop["id"] if stop else None,
+            "latest_comment_id": latest_comment, "resume_snapshot_sha256": snapshot,
+            "command_templates": routes,
+            "guidance": "For an authorized request to work on or resume this card, use kanban_manage(action='work', task_id=..., reason='the current instruction'). The controller resolves the current state and recovery bookkeeping. No copied hashes, special approval wording, or exhaustive plan is needed for ordinary work. Use the existing worker and normal tools; an optional plan is only for a genuinely changed brief, worker, requirements or budget. Preserve the original request, real dependencies, private boundaries, action restrictions and review findings. The receipt distinguishes started/queued work from a specific remaining wait. Verify the actual worker and result. Do not repeatedly restart an unchanged failed worker run. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy. For a genuine wait, use kanban_manage(action='block', task_id=..., kind='needs_input'|'capability'|'transient', reason='what is missing and the next step'); this works from triage and starts no worker. Other precise cleanup actions remain available: archive obsolete work reversibly, restore paused, remove a specifically obsolete dependency, recover a held review or repair its exact artifact reference."}
+
+
+def _check_board_owner_mode():
+    if not _check_kanban_orchestrator_mode():
+        return False
+    try:
+        from hermes_cli.board_owner_manage import require_owner
+        require_owner()
+        return True
+    except PermissionError:
+        return False
+
+
+def _invoke_board_controller(args):
+    import subprocess
+    from pathlib import Path
+    from gateway.session_context import get_session_env, get_bound_session_env
+    from hermes_constants import get_hermes_home
+    from hermes_cli.board_owner_manage import require_owner, ROOT
+    member = require_owner()
+    if member is not None:
+        from gateway.app_business_authority import protected
+        from gateway.board_control_transport import issue
+        executable = ROOT / 'scripts' / 'hermes-kanban-guarded'
+        protected(executable, ROOT)
+        session = (get_bound_session_env('HERMES_SESSION_ID')
+                   or get_bound_session_env('HERMES_SESSION_KEY')
+                   or get_bound_session_env('HERMES_SESSION_MESSAGE_ID'))
+        request = issue(args, member, session)
+        # No member-controlled DB, profile HOME, PYTHONPATH or actor env crosses.
+        env = {'PATH':'/usr/bin:/bin:/usr/sbin:/sbin', 'HOME':str(ROOT.parent),
+               'HERMES_HOME':str(ROOT), 'PYTHONIOENCODING':'utf-8',
+               'PYTHONDONTWRITEBYTECODE':'1'}
+    else:
+        executable = Path(get_hermes_home()) / 'scripts' / 'hermes-kanban-guarded'
+        request = args
+        env = os.environ.copy()
+        for name in ('HERMES_SESSION_SOURCE', 'HERMES_SESSION_PROFILE'):
+            env[name] = get_session_env(name)
+    if not executable.is_file():
+        raise ValueError('Installed guarded board controller is unavailable')
+    result = subprocess.run([str(executable), '--owner-tool-json'], input=json.dumps(request),
+                            text=True, capture_output=True, timeout=30, env=env)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        raise ValueError('Board controller did not return a receipt; inspect the task before retrying')
+    return data
+
+
+def _handle_manage(args: dict, **kw) -> str:
+    try:
+        from hermes_cli.board_owner_manage import require_owner, member_board
+        from gateway.josh_board_authority import admitted_board
+        member = require_owner()
+        from hermes_cli.board_owner_manage import administrator_board, requested_board
+        if member is None and not _profile_has_kanban_toolset():
+            raise PermissionError('The owner profile must enable its existing kanban toolset')
+        board = requested_board(member, args.get('board')) if member is not None else admitted_board(args.get('board'))
+        administrative = member is not None and board != member['board']
+        payload = dict(args, board=board)
+        action = args.get('action')
+        if action == 'follow_up':
+            if set(args) - {'action','task_id','reason','board'} or not args.get('reason'):
+                raise ValueError('follow_up needs only task_id and the existing request; routes are never model arguments')
+            with _board(board) as (kb, conn):
+                from gateway.owner_attention_binding import bind_current
+                return json.dumps(bind_current(conn,args.get('task_id'),action=action))
+        receipt = _invoke_board_controller(payload)
+        if not administrative and action in {'work','block'} and not args.get('dry_run') and receipt.get('ok') is not False and not receipt.get('error'):
+            try:
+                with _board(board) as (kb, conn):
+                    from gateway.owner_attention_binding import bind_current
+                    bound = bind_current(conn,args.get('task_id'),action=action)
+                    receipt.update({key:value for key,value in bound.items() if key.startswith('follow_up_')})
+            except Exception:
+                # The work action already succeeded: never imply it should be
+                # repeated because a separate source binding was unavailable.
+                receipt.update(follow_up_bound=False,follow_up_error='No verified current conversation was attached; use follow_up from the owner conversation.')
+        if administrative:
+            receipt.update(follow_up_bound=False, original_owner_preserved=True)
+        return json.dumps(receipt)
+    except Exception as exc:
+        return tool_error(f'kanban_manage: {exc}')
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Read current task contracts and paged history without duplicating worker context."""
     tid = _require_task_id(args)
-    with _board(args.get("board")) as (kb, conn):
+    board = args.get("board")
+    from gateway.member_worker_policy import authenticated_private_policy
+    private_policy = authenticated_private_policy()
+    with _board(board) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        comments = kb.list_comments(conn, tid)
+        events = kb.list_events(conn, tid)
+        runs = kb.list_runs(conn, tid)
+        parents = kb.parent_ids(conn, tid)
+        children = kb.child_ids(conn, tid)
+        if private_policy is not None:
+            readable = {private_policy["task"], private_policy.get("preparation_for")}
+            parents = [value for value in parents if value in readable]
+            children = [value for value in children if value in readable]
+        # A genuine system-generated readiness repair has a strict request
+        # ceiling. Keep the authoritative task and owner contracts, but do
+        # not replay an ever-growing audit trail plus a second formatted
+        # copy of the same contract on every orientation call. A fence or
+        # request ceiling alone is insufficient; bind this to the durable
+        # preparation event and dependency edge. Other prepared workers
+        # use their own current plan and active run binding below.
+        from hermes_cli.kanban_completion import request_token_limit
+        bounded_worker = False
+        readiness_binding = None
+        worker_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if request_token_limit() is not None and worker_id:
+            worker = kb.get_task(conn, worker_id)
+            if worker is not None and worker.created_by == "worker-readiness":
+                binding_row = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? "
+                    "AND kind='readiness_preparation_for' ORDER BY id DESC LIMIT 1",
+                    (worker_id,),
+                ).fetchone()
+                if binding_row is not None:
+                    try:
+                        readiness_binding = json.loads(binding_row[0])
+                    except (TypeError, ValueError):
+                        readiness_binding = None
+                original_id = (
+                    readiness_binding.get("task_id")
+                    if isinstance(readiness_binding, dict) else None
+                )
+                if isinstance(original_id, str) and tid in {worker_id, original_id}:
+                    bounded_worker = conn.execute(
+                        "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=? "
+                        "AND edge_role='dependency'",
+                        (worker_id, original_id),
+                    ).fetchone() is not None
+        # Current state appears once. Only the active task's bound worker
+        # receives the smaller default; explicit pages remain available.
+        from hermes_cli.owner_work_preparation import inspect as inspect_preparation
+        preparation = inspect_preparation(conn, tid)
+        worker_run = _worker_run_id(tid)
+        prepared_worker = bool(
+            preparation.get("current")
+            and worker_id == tid and _is_dispatcher_owned_worker()
+            and task.status == "running" and worker_run is not None
+            and worker_run == task.current_run_id
+            and task.assignee == os.environ.get("HERMES_PROFILE")
+            and any(r.id == worker_run and r.profile == task.assignee
+                    and r.status == "running" and r.ended_at is None for r in runs)
+        )
+        history_limit = args.get("history_limit", 3 if prepared_worker else 8)
+        before_id = args.get("comments_before_id")
+        events_before_id = args.get("events_before_id")
+        include_event_payloads = args.get("include_event_payloads", False)
+        if type(history_limit) is not int or not 1 <= history_limit <= 20:
+            raise ValueError("history_limit must be an integer from 1 to 20")
+        if before_id is not None and (type(before_id) is not int or before_id < 1):
+            raise ValueError("comments_before_id must be a positive comment id")
+        if events_before_id is not None and (type(events_before_id) is not int or events_before_id < 1):
+            raise ValueError("events_before_id must be a positive event id")
+        if type(include_event_payloads) is not bool:
+            raise ValueError("include_event_payloads must be a boolean")
+        eligible_comments = [c for c in comments if before_id is None or c.id < before_id]
+        shown_comments = eligible_comments[-min(history_limit, 3):] if bounded_worker else eligible_comments[-history_limit:]
+        eligible_events = [e for e in events if events_before_id is None or e.id < events_before_id]
+        shown_events = eligible_events[-history_limit:]
+        shown_runs = runs[-2:]
+
+        def _event_dict(event):
+            result = {"id": event.id, "kind": event.kind, "payload": event.payload,
+                      "created_at": event.created_at, "run_id": event.run_id}
+            # The current plan is already present above. Keep its audit
+            # identity, actor, reason and disposition, without replaying
+            # complete prior briefs and readiness inventories by default.
+            # Unknown/malformed events and all holds/findings stay intact.
+            if event.kind == "owner_work_prepared" and not include_event_payloads:
+                payload = event.payload
+                if isinstance(payload, dict) and payload.get("version") == 1 and isinstance(payload.get("plan"), dict):
+                    omitted = [key for key in ("plan", "readiness") if key in payload]
+                    result.update({
+                        "payload": {key: value for key, value in payload.items() if key not in omitted},
+                        "payload_omitted": omitted,
+                        "full_payload_query": {"task_id": tid, **({"board": board} if board else {}),
+                                               "events_before_id": event.id + 1,
+                                               "history_limit": 1, "include_event_payloads": True},
+                    })
+            return result
+
+        event_records = [_event_dict(event) for event in shown_events]
+
+        def _run_dict(r):
+            return {
+                "id": r.id, "profile": r.profile,
+                "status": r.status, "outcome": r.outcome,
+                "summary": r.summary, "error": r.error,
+                "metadata_available": bool(r.metadata),
+                "started_at": r.started_at, "ended_at": r.ended_at,
+            }
+
+        from hermes_cli.owner_workflow import describe as describe_workflow
+        from hermes_cli.owner_work_start import instruction_recovery
+        child_execution = None
+        if os.environ.get("HERMES_KANBAN_TASK") == tid and _is_dispatcher_owned_worker():
+            admission = conn.execute("SELECT worker_admission_contract FROM tasks WHERE id=?", (tid,)).fetchone()
+            if admission and admission[0]:
+                from hermes_cli.child_execution_receipts import current_task
+                child_execution = current_task(conn, tid)
+        delivery = None
+        if private_policy is not None:
+            from gateway.private_action_worker_policy import delivery_instructions
+            delivery = delivery_instructions(conn, private_policy, tid)
         return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
-            "parents": kb.parent_ids(conn, tid),
-            # Non-terminal parents; on a running card this means the dependency
-            # gate is not holding it and kanban_complete will refuse.
+            **({"delivery_instructions": delivery} if private_policy is not None else {}),
+            "child_execution": child_execution,
+            "preparation": preparation,
+            "instruction_recovery": instruction_recovery(conn, tid),
+            "board_administration": _owner_board_routes(kb, conn, task, board),
+            "task": {**_fields(task, _TASK_FIELDS),
+                     "capability_projection": json.loads(task.capability_projection) if task.capability_projection else None},
+            "owner_cell": kb.owner_cell_read_state(conn, tid),
+            "owner_workflow": describe_workflow(conn, tid),
+            "parents": parents,
             "unsatisfied_parents": [
-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
-            "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)
+                if private_policy is None or pid in readable],
+            "children": children,
+            "comments": [
+                {"id": c.id, "author": c.author, "body": c.body,
+                 "created_at": c.created_at}
+                for c in shown_comments
+            ],
+            "events": event_records,
+            "runs": [_run_dict(r) for r in shown_runs],
+            "worker_context": None,
+            "history_window": {
+                "comments": {"shown": len(shown_comments), "total": len(comments)},
+                "events": {"shown": len(shown_events), "total": len(events)},
+                "runs": {"shown": len(shown_runs), "total": len(runs)},
+                "truncated": any((len(shown_comments) < len(comments),
+                                  len(shown_events) < len(events),
+                                  len(shown_runs) < len(runs))),
+                "next_comments_before_id": shown_comments[0].id if shown_comments and len(eligible_comments) > len(shown_comments) else None,
+                "next_events_before_id": shown_events[0].id if shown_events and len(eligible_events) > len(shown_events) else None,
+                "omitted_event_payload_ids": [event["id"] for event in event_records if event.get("payload_omitted")],
+                "prepared_worker": prepared_worker,
+                "full_history": "Use this same show tool with comments_before_id or events_before_id and history_limit for older same-task history. Set include_event_payloads=true to retrieve complete preparation audit payloads; each compact event supplies its exact query. Full run metadata remains in hermes kanban log. Original task, holds and owner review state remain authoritative. Read relevant referenced approvals and findings before recovery; missing from this window does not mean absent.",
+                "readiness_binding": readiness_binding,
+            },
+        })
 
 
 @_kanban_handler("kanban_list")
@@ -685,6 +1129,8 @@ def _handle_complete(args: dict, **kw) -> str:
         metadata = _merge_artifacts(metadata, artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
+    metadata, auth_error = _normalize_authorization_metadata(metadata)
+    _check(auth_error is None, auth_error)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
@@ -692,10 +1138,39 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        # Explicit review-worthy documents cross a human trust boundary.
+        # Stage them before the existing completion transaction so a failed
+        # validation/copy leaves the upstream lifecycle untouched.
+        from tools.kanban_artifact_staging import (
+            review_worthy_requested,
+            stage_review_worthy_artifacts,
+        )
+
+        if review_worthy_requested(metadata):
+            assert isinstance(metadata, dict)
+            declared = metadata.get("artifacts")
+            paths = (
+                [str(path).strip() for path in declared if str(path).strip()]
+                if isinstance(declared, (list, tuple))
+                else []
+            )
+            try:
+                metadata["artifacts"] = stage_review_worthy_artifacts(
+                    kb, task_id=tid, board=args.get("board"), artifacts=paths,
+                )
+            except ValueError as artifact_err:
+                return tool_error(
+                    f"kanban_complete refused the review-worthy artifacts: "
+                    f"{artifact_err}. Your task is still in-flight."
+                )
+
         try:
+            from agent.review_authority import decision_token
+            run_id = _worker_run_id(tid)
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=run_id,
+                review_decision_capability=decision_token(tid, run_id))
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -748,7 +1223,9 @@ def _handle_complete(args: dict, **kw) -> str:
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).
         # Report the card's durable attachment set in the result.
-        return _ok(task_id=tid, run_id=run.id if run else None,
+        from hermes_cli.owner_workflow import describe as describe_workflow
+        return _ok(owner_workflow=describe_workflow(conn, tid),
+                   task_id=tid, run_id=run.id if run else None,
                    attachments=[
                        _fields(a, _ATTACHMENT_FIELDS)
                        for a in kb.list_attachments(conn, tid)])
@@ -775,6 +1252,11 @@ def _handle_block(args: dict, **kw) -> str:
         # worker cannot resolve itself; `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        reason = kb.authorized_block_reason(
+            conn, tid, kind=kind, reason=reason,
+            authorization_checked=args.get("authorization_checked"),
+            new_decision=args.get("new_decision"),
+        )
         _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
@@ -795,6 +1277,99 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
+def _review_handoff_input_error(conn, tid, reviewer, metadata):
+    """Explain correctable payload errors without granting review authority."""
+    goal = conn.execute(
+        "SELECT router_mode, required_reviewer_profile FROM owner_cell_goals WHERE task_id=?",
+        (tid,),
+    ).fetchone()
+    if goal is None or goal["router_mode"] != "reviewed":
+        return None
+    required = goal["required_reviewer_profile"]
+    artifact = (metadata or {}).get("owner_cell_artifact")
+    from hermes_cli import kanban_db as kb
+    reviewer_matches = reviewer and kb._canonical_assignee(reviewer) == required
+    artifact_valid = isinstance(artifact, dict) and all(
+        isinstance(artifact.get(key), str) and artifact[key].strip()
+        for key in ("ref", "digest")
+    )
+    if reviewer_matches and artifact_valid:
+        return None
+    return tool_error(
+        "Review handoff payload needs correction; this is not a missing tool or dependency. "
+        "Read kanban_show for the task contract, use its required reviewer, and supply "
+        "metadata.owner_cell_artifact with ref and digest for the exact verified artifact. "
+        "Correct these arguments and retry on this same task. Do not block solely on this "
+        "validation error, invent approval, or present a plan/brief as the finished deliverable.",
+        code="review_handoff_input_invalid",
+        recoverable=True,
+        required_reviewer_profile=required,
+        required_fields=["reviewer", "metadata.owner_cell_artifact.ref",
+                         "metadata.owner_cell_artifact.digest"],
+    )
+
+
+@_kanban_handler("kanban_handoff")
+def _handle_owner_handoff(args: dict, **kw) -> str:
+    tid = _worker_guard("kanban_handoff", args)
+    from hermes_cli.owner_workflow import handoff
+    from hermes_cli.kanban_db import WorkerAdmissionError
+    try:
+        with _board(args.get("board")) as (kb, conn):
+            if args.get("action", "maker") in {"maker", "owner"}:
+                from hermes_cli.owner_workflow import continue_direct_producer
+                direct = continue_direct_producer(conn, tid, expected_run_id=_worker_run_id(tid),
+                                                  profile=os.environ.get("HERMES_PROFILE"))
+                if direct:
+                    return _ok(**direct)
+            if args.get("action") == "owner":
+                from hermes_cli.owner_workflow import start_owner_completion
+                from agent.review_authority import decision_token
+                run_id = _worker_run_id(tid)
+                return _ok(**start_owner_completion(conn, tid, expected_run_id=run_id,
+                    review_decision_capability=decision_token(tid, run_id),
+                    summary=redact_sensitive_text(str(args.get("summary") or ""), force=True),
+                    acceptance_criteria=json.loads(redact_sensitive_text(
+                        json.dumps(args.get("acceptance_criteria")), force=True))))
+            if args.get("action") == "diagnosed_rework":
+                from hermes_cli.owner_cell import authorize_diagnosed_rework
+                from agent.review_authority import decision_token
+                run_id = _worker_run_id(tid)
+                return _ok(**authorize_diagnosed_rework(conn, tid, expected_run_id=run_id,
+                    review_decision_capability=decision_token(tid, run_id),
+                    brief_ref=args.get('brief_ref'), brief_digest=args.get('brief_digest'),
+                    summary=redact_sensitive_text(str(args.get('summary') or ''), force=True),
+                    acceptance_criteria=json.loads(redact_sensitive_text(
+                        json.dumps(args.get('acceptance_criteria')), force=True))))
+            if args.get("action") == "advisory_waiver":
+                from hermes_cli.owner_workflow import record_advisory_waiver
+                from agent.review_authority import decision_token
+                run_id = _worker_run_id(tid)
+                return _ok(**record_advisory_waiver(conn, tid, expected_run_id=run_id,
+                    review_decision_capability=decision_token(tid, run_id), profile=args.get("profile"),
+                    decision=args.get("waiver_decision"), confirm_manual=args.get("confirm_manual", False),
+                    authorization_ref=args.get("authorization_ref"), authorization_text=args.get("authorization_text"),
+                    summary=args.get("summary")))
+            if args.get("action") == "advisory":
+                from hermes_cli.owner_workflow import request_advisory
+                from agent.review_authority import decision_token
+                run_id = _worker_run_id(tid)
+                return _ok(**request_advisory(conn, tid, expected_run_id=run_id,
+                    review_decision_capability=decision_token(tid, run_id),
+                    profile=args.get("profile"), packet=args.get("packet"), summary=args.get("summary"),
+                    confirm_manual=args.get("confirm_manual", False), board=args.get("board"),
+                    artifact_ref=args.get("brief_ref"), artifact_digest=args.get("brief_digest")))
+            values = {k: args.get(k) for k in ("brief_ref", "brief_digest", "requirements", "acceptance_criteria", "summary", "repair")}
+            values = json.loads(redact_sensitive_text(json.dumps(values), force=True))
+            result = handoff(conn, tid, expected_run_id=_worker_run_id(tid), board=args.get("board"), **values)
+            return _ok(**result)
+    except WorkerAdmissionError as exc:
+        return tool_error("Maker readiness failed; the owner still holds this task. Correct the stated requirements or approved setup, then retry. If network/account/path access is owner-only, use the owner's existing authorized tools to retrieve and stage non-secret same-scope inputs inside this workspace, then hand off offline processing. Do not copy credentials or broaden the maker's permissions.",
+                          code="maker_not_ready", issues=(exc.readiness or {}).get("issues", []))
+    except (ValueError, OSError) as exc:
+        return tool_error(str(exc))
+
+
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
@@ -810,23 +1385,37 @@ def _handle_request_review(args: dict, **kw) -> str:
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
+    metadata, auth_error = _normalize_authorization_metadata(metadata)
+    _check(auth_error is None, auth_error)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
-    if reviewer:
-        from hermes_cli.profiles import list_profile_names, profile_exists
-
-        # A non-profile reviewer would park the card in `review` on an assignee
-        # the dispatcher can never spawn (#106163).
-        _check(profile_exists(reviewer),
-               f"reviewer profile {reviewer!r} is not installed. "
-               f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
-            ok, fail_reason = kb.request_review(
-                conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+            # [GUS] Owner-cell payload correction first (actionable, recoverable code).
+            input_error = _review_handoff_input_error(conn, tid, reviewer, metadata)
+            if input_error is not None:
+                return input_error
+            if reviewer:
+                from hermes_cli.profiles import list_profile_names, profile_exists
+
+                # A non-profile reviewer would park the card in `review` on an assignee
+                # the dispatcher can never spawn (#106163).
+                _check(profile_exists(reviewer),
+                       f"reviewer profile {reviewer!r} is not installed. "
+                       f"Installed profiles: {', '.join(list_profile_names())}")
+            with kb.write_txn(conn):
+                admission = conn.execute(
+                    "SELECT worker_admission_contract FROM tasks WHERE id=?", (tid,),
+                ).fetchone()
+                if admission and admission[0] and _worker_run_id(tid) is not None:
+                    from hermes_cli.child_execution_receipts import capture
+                    capture(conn, tid, server_session_id=kw.get("session_id"))
+                ok, fail_reason = kb.request_review(
+                    conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+                    expected_run_id=_worker_run_id(tid), with_reason=True, _allow_nested=True)
+                _check(ok, f"could not request review: {fail_reason or 'transition refused'}")
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or
@@ -841,6 +1430,31 @@ def _handle_request_review(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "review")
 
 
+@_kanban_handler("kanban_rebind_review_artifact")
+def _handle_rebind_review_artifact(args: dict, **kw) -> str:
+    """Evidence-only reviewer handoff; authority never comes from tool arguments."""
+    tid = _worker_guard("kanban_rebind_review_artifact", args)
+    try:
+        with _board(args.get("board")) as (kb, conn):
+            from agent.review_authority import decision_token
+            run_id = _worker_run_id(tid)
+            kb.rebind_review_artifact_task(
+                conn, tid,
+                **{name: args.get(name) for name in (
+                    "state_version", "expected_artifact_ref", "expected_artifact_digest",
+                    "artifact_ref", "artifact_digest", "reason",
+                )},
+                expected_run_id=run_id,
+                review_decision_capability=decision_token(tid, run_id),
+            )
+            return _ok(task_id=tid, status="review", fresh_review_required=True)
+    except (ValueError, PermissionError) as exc:
+        return tool_error(f"kanban_rebind_review_artifact: {exc}")
+    except Exception:
+        logger.exception("kanban_rebind_review_artifact failed")
+        return tool_error("kanban_rebind_review_artifact failed; state unchanged")
+
+
 @_kanban_handler("kanban_request_changes")
 def _handle_request_changes(args: dict, **kw) -> str:
     """Return a reviewer-owned running task to its implementer."""
@@ -848,10 +1462,19 @@ def _handle_request_changes(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
+        from agent.review_authority import decision_token
+        run_id = _worker_run_id(tid)
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=run_id,
+            review_decision_capability=decision_token(tid, run_id))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
-        return _ok_landed(kb, conn, tid, "ready", implementer=detail)
+        landed = kb.get_task(conn, tid)
+        return _ok_landed(
+            kb, conn, tid, "ready", implementer=detail,
+            continue_work=bool(landed and landed.status == "running"),
+            next_action=("Owner takeover: finish this same run. Read kanban_show.owner_workflow; "
+                         "provide the finished file and criterion evidence, not another maker handoff."
+                         if landed and landed.status == "running" else None))
 
 
 @_kanban_handler("kanban_heartbeat")
@@ -888,6 +1511,13 @@ def _handle_comment(args: dict, **kw) -> str:
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
+    try:
+        from hermes_cli.board_owner_manage import require_owner
+        member = require_owner()
+        if member is not None:
+            author = member['profile']
+    except PermissionError:
+        pass
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
@@ -905,8 +1535,17 @@ def _store_attachment(board, tid, filename, data, content_type) -> str:
 
 @_kanban_handler("kanban_attach")
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task."""
+    """Attach inline bytes or a file from the admitted task workspace."""
+    from gateway.josh_board_authority import admitted_board
+    board = admitted_board(args.get("board"))
     tid = _worker_guard("kanban_attach", args)
+    if args.get("file_path") is not None:
+        _check(args.get("content_base64") is None,
+               "file_path and content_base64 are mutually exclusive")
+        from tools.task_attachment_read import store_workspace_attachment
+        with _board(board) as (kb, conn):
+            return _ok(**store_workspace_attachment(
+                kb, conn, tid, args["file_path"], args.get("filename"), args.get("content_type")))
     filename = _require_text(args, "filename")
     content_b64 = _require_text(args, "content_base64")
     import base64
@@ -915,7 +1554,7 @@ def _handle_attach(args: dict, **kw) -> str:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
         raise _Reject(f"content_base64 is not valid base64: {e}")
-    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+    return _store_attachment(board, tid, filename, data, args.get("content_type"))
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -962,6 +1601,8 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
 @_kanban_handler("kanban_attach_url")
 def _handle_attach_url(args: dict, **kw) -> str:
     """Attach a file fetched server-side from an http(s) URL (shared size cap)."""
+    from gateway.josh_board_authority import admitted_board
+    board = admitted_board(args.get("board"))
     from hermes_cli import kanban_db as kb
     tid = _worker_guard("kanban_attach_url", args)
     url = str(_require_text(args, "url")).strip()
@@ -978,7 +1619,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
     return _store_attachment(
-        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct)
+        board, tid, filename, data, args.get("content_type") or fetched_ct)
 
 
 @_kanban_handler("kanban_attachments")
@@ -987,6 +1628,9 @@ def _handle_attachments(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         _existing_task(kb, conn, tid)
+        if args.get("attachment_id") is not None:
+            from tools.task_attachment_read import read_attachment
+            return json.dumps(read_attachment(kb, conn, tid, args["attachment_id"]))
         return json.dumps({
             "ok": True, "task_id": tid,
             "attachments": [
@@ -1030,11 +1674,15 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    capability_contract = args.get("capability_contract")
+    _check(capability_contract is None or isinstance(capability_contract, dict),
+           f"capability_contract must be an object, got {type(capability_contract).__name__}")
+    body = args.get("body")
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
-    parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids", strip=True)
     with _board(args.get("board")) as (kb, conn):
-        from gateway.session_context import get_session_env
+        from gateway.session_context import get_session_env, get_bound_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
@@ -1046,12 +1694,22 @@ def _handle_create(args: dict, **kw) -> str:
         session_id = (_persisted_session_id(args.get("session_id"))
                       or (self_task.session_id if self_task else None)
                       or _persisted_session_id(_current_origin_session_id())
+                      or _persisted_session_id(get_bound_session_env("HERMES_SESSION_ID"))
                       or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        auth_contract, auth_error = _authorization_contract_for_child(
+            kb, conn, self_task_id=self_tid, parents=parents,
+            requested=args.get("authorization_continuity"))
+        _check(auth_error is None, auth_error)
+        if auth_contract is not None:
+            body = kb.append_authorization_continuity_to_body(body, auth_contract)
+        from gateway.native_task_routing import compose
+        body = compose(conn, title=str(title).strip(), body=body, assignee=str(assignee),
+                       parents=parents, session_id=session_id)
         new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            conn, title=str(title).strip(), body=body, assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
@@ -1065,13 +1723,21 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            capability_contract=capability_contract,
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
-        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+        new_task = kb.get_task(conn, new_tid)
+        from gateway.native_task_receipts import record_created
+        task_receipt_recorded = record_created(conn, new_task)
+        landed = _fields(new_task, _CREATED_FIELDS)
+        landed.update(capability_status=new_task.capability_status if new_task else None,
+                      capability_projection=json.loads(new_task.capability_projection)
+                      if new_task and new_task.capability_projection else None)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid),
+                   task_receipt_recorded=task_receipt_recorded)
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
@@ -1100,6 +1766,10 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
             ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
         ) if v}
+    from gateway.session_context import get_bound_session_env
+    bound_source_key = get_bound_session_env("HERMES_SESSION_KEY")
+    if bound_source_key:
+        delivery_metadata["session_key"] = bound_source_key
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
         delivery_metadata["telegram_dm_topic_reply_fallback"] = True
@@ -1128,6 +1798,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         pass  # unreadable config keeps the user-friendly default (True)
     target = None
     try:
+        # Native creation already committed the exact current return target.
+        if conn.execute("SELECT 1 FROM task_return_intents WHERE task_id=?", (task_id,)).fetchone():
+            return True
         target = _resolve_notify_target()
         if target is None:
             return False  # CLI / cron / test — no persistent channel
@@ -1157,7 +1830,34 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
     with _board(args.get("board")) as (kb, conn):
-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
+        if args.get('recovery') is not None:
+            from hermes_cli.plain_advisory import recover_idle_task
+            recovery = dict(args['recovery'])
+            # Identity comes from this orchestrator session, not the payload.
+            recovery['actor'] = _persisted_identity()
+            return _ok(**recover_idle_task(conn, str(tid), **recovery))
+        ok = kb.unblock_task(conn, str(tid))
+        if not ok:
+            task = kb.get_task(conn, str(tid))
+            if task and task.status == 'triage':
+                routes = _owner_board_routes(kb, conn, task, args.get("board"))
+                if routes and routes.get('native'):
+                    return tool_error(
+                        'Use kanban_manage action=work with this task_id and the current work instruction in reason. It handles initial triage, stopped work and review routing internally. Do not repeat ordinary unblock or create a duplicate cleanup task.',
+                        code='triage_resolution_required', status='triage', task_id=str(tid),
+                        board_administration=routes)
+                from hermes_cli.plain_advisory import snapshot_digest
+                return tool_error('Task is in triage, not ordinary blocked state. Use the board_administration command templates for supported same-card continuation; do not repeat ordinary unblock or create another cleanup task. Inspect the latest block and all remaining holds. '
+                    'If the specific action was already approved, do not ask again: verify successful execution and current capability. '
+                    'For an idle plain capability/transient task, supply recovery with expected_snapshot_digest, '
+                    'evidence_ref, evidence_digest and reason. Evidence JSON must identify task_id and resolved_block_event_id, '
+                    'authorization_verified=true with authorization_ref, execution_succeeded=true with execution_ref, '
+                    'capability_verified=true and unresolved_holds=[]. Denied/unexecuted actions, other unresolved holds and '
+                    'owner-cell reviews require their existing supported route; no blind status flip or reset.',
+                    code='triage_resolution_required', status='triage', task_id=str(tid),
+                    snapshot_digest=snapshot_digest(conn, str(tid)),
+                    board_administration=_owner_board_routes(kb, conn, task, args.get("board")))
+            return tool_error(f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
@@ -1178,6 +1878,261 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+
+
+# Custom contracts extend the upstream schema catalog without mutating its shared objects.
+from copy import deepcopy
+from tools.kanban_tools_schemas import _DESC_TASK_ID_DEFAULT
+
+KANBAN_SHOW_SCHEMA = deepcopy(KANBAN_SHOW_SCHEMA)
+KANBAN_SHOW_SCHEMA['description'] = ('Read current task state once — title, body, assignee, parent task handoffs, your prior attempts '
+ 'on this task if any, comments, and recent events. Use this to (re)orient yourself before '
+ 'starting work, especially on retries. The response includes a current preparation and bounded '
+ 'history; use comments_before_id or events_before_id to read older relevant discussion and '
+ 'include_event_payloads for complete preparation audit payloads. For the admitted independent '
+ 'reviewer, child_execution contains compact native child model/count evidence. Unavailable does '
+ 'not mean zero children or success; ended is not a success verdict. Use recorded fields instead '
+ 'of session_search solely to re-prove them; still independently inspect the actual deliverable.')
+KANBAN_SHOW_SCHEMA['parameters']['properties']['history_limit'] = {'type': 'integer',
+ 'minimum': 1,
+ 'maximum': 20,
+ 'description': 'Comments/events per page: default 3 for the current prepared worker, otherwise 8.'}
+KANBAN_SHOW_SCHEMA['parameters']['properties']['comments_before_id'] = {'type': 'integer',
+ 'minimum': 1,
+ 'description': 'Read older comments on this same task using next_comments_before_id.'}
+KANBAN_SHOW_SCHEMA['parameters']['properties']['events_before_id'] = {'type': 'integer',
+ 'minimum': 1,
+ 'description': 'Read older events on this same task using next_events_before_id.'}
+KANBAN_SHOW_SCHEMA['parameters']['properties']['include_event_payloads'] = {'type': 'boolean',
+ 'description': 'Return full preparation audit payloads on the selected event page; default false '
+                'avoids repeated briefs. Holds and review findings are never compacted.'}
+
+KANBAN_COMPLETE_SCHEMA = deepcopy(KANBAN_COMPLETE_SCHEMA)
+KANBAN_COMPLETE_SCHEMA['parameters']['properties']['metadata']['description'] = ('Free-form dict of structured facts about this attempt — {"changed_files": [...], "tests_run": '
+ '12, "findings": [...]}. To carry prior Chris authorization through child work, include '
+ 'authorization_continuity with authorized=true, scope, allowed_actions, blocked_actions, '
+ 'security_scope/audience_scope, and any explicit_holds or requires_new_decision. It tells '
+ 'downstream workers to keep going only inside the scoped authorization; it does not release '
+ 'operation approvals, deploy/restart holds, external send approvals, or security/audience '
+ 'boundaries.')
+KANBAN_COMPLETE_SCHEMA['parameters']['properties']['metadata']['properties'] = {'owner_cell_verdict': {'type': 'object',
+                        'description': 'Required for native final owner/reviewer acceptance. Copy '
+                                       'the CURRENT state version, artifact ref and digest from '
+                                       'kanban_show.owner_cell after inspecting that exact file. '
+                                       'Review authority comes from your claimed review run, not '
+                                       'this metadata.',
+                        'properties': {'state_version': {'type': 'integer'},
+                                       'artifact_ref': {'type': 'string'},
+                                       'artifact_digest': {'type': 'string'},
+                                       'verdict': {'type': 'string', 'enum': ['PASS']},
+                                       'defects': {'type': 'array', 'items': {'type': 'string'}}},
+                        'required': ['state_version',
+                                     'artifact_ref',
+                                     'artifact_digest',
+                                     'verdict',
+                                     'defects']},
+ 'owner_acceptance_checks': {'type': 'array',
+                             'description': 'For department-owned final review: every exact '
+                                            'acceptance criterion from '
+                                            'kanban_show.owner_workflow.brief, with passed=true '
+                                            'and concrete evidence from inspecting the final '
+                                            'artifact.',
+                             'items': {'type': 'object',
+                                       'properties': {'criterion': {'type': 'string'},
+                                                      'passed': {'type': 'boolean'},
+                                                      'evidence': {'type': 'string'}},
+                                       'required': ['criterion', 'passed', 'evidence']}}}
+
+KANBAN_BLOCK_SCHEMA = deepcopy(KANBAN_BLOCK_SCHEMA)
+KANBAN_BLOCK_SCHEMA['parameters']['properties']['authorization_checked'] = {'type': 'boolean',
+ 'description': 'For needs_input on authorized work: true only after checking existing task and '
+                'parent authorization.'}
+KANBAN_BLOCK_SCHEMA['parameters']['properties']['new_decision'] = {'type': 'string',
+ 'description': 'The exact new decision needed beyond existing authorization; required with '
+                'needs_input on authorized work.'}
+
+KANBAN_HANDOFF_SCHEMA = {
+    "name": "kanban_handoff",
+    "description": "Accountable owner only: delegate a worthwhile bounded job to its maker, request required advisory, or choose action=owner to finish an ordinary task yourself in the same run. Owner mode needs summary and acceptance_criteria, not a separate brief. Independent/specialist review stays required unless a configured explicit user Fable waiver is recorded with action=advisory_waiver for this exact artifact. Maker handoff checks readiness. After exhausting corrections, the current owner-reviewer may use diagnosed_rework once with a hashed workspace JSON diagnosis (root_cause, source_evidence, changed_method, verification), summary and acceptance_criteria; then request changes on the same card. No review or counter is reset.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "board": KANBAN_SHOW_SCHEMA["parameters"]["properties"]["board"],
+        "summary": {"type": "string"},
+        "action": {"type": "string", "enum": ["maker", "advisory", "owner", "advisory_waiver", "diagnosed_rework"], "default": "maker"},
+        "waiver_decision": {"type": "string", "enum": ["waive", "revoke"], "description": "For advisory_waiver only: follow the user's explicit decision for this exact task. Never infer consent from low risk."},
+        "authorization_ref": {"type": "string", "maxLength": 500, "description": "Source message or recorded decision reference for the explicit task-specific user waiver."},
+        "authorization_text": {"type": "string", "maxLength": 1000, "description": "Exact explicit user waiver/revocation instruction; owner attestation, not a claimed Fable PASS. No secrets."},
+        "profile": {"type": "string", "description": "For advisory: a required or configured conditional profile listed in kanban_show.owner_workflow.available_advisory_reviewers. A requested conditional review must finish before acceptance. For advisory_waiver: fable-review only."},
+        "packet": {"type": "string", "maxLength": 12000, "description": "For advisory: compact redacted text, no identifiers, secrets or local paths."},
+        "confirm_manual": {"type": "boolean", "description": "For Fable only: true only with existing explicit Chris authorization."},
+        "brief_ref": {"type": "string", "description": "Exact brief path in this task workspace."},
+        "brief_digest": {"type": "string", "description": "Actual SHA-256 of the brief."},
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "requirements": {"type": "object", "description": "Required existing toolsets, commands, read_paths, write_paths, mcp, terminal_network, localhost_server, browser_session. These declarations grant no new permission."},
+        "repair": {"type": "object", "description": "Required after a blocker: the diagnosed cause, actual change, verification performed and prevention of recurrence.",
+                   "properties": {k: {"type": "string"} for k in ("cause", "change", "verification", "prevention")},
+                   "required": ["cause", "change", "verification", "prevention"]},
+    }, "required": ["summary"], "anyOf": [{"required": ["brief_ref", "brief_digest", "acceptance_criteria", "requirements"]}, {"properties": {"action": {"const": "advisory"}}, "required": ["action", "profile", "packet"]}, {"properties": {"action": {"const": "owner"}}, "required": ["action", "acceptance_criteria"]}, {"properties": {"action": {"const": "diagnosed_rework"}}, "required": ["action", "brief_ref", "brief_digest", "acceptance_criteria"]}, {"properties": {"action": {"const": "advisory_waiver"}}, "required": ["action", "profile", "waiver_decision", "confirm_manual", "authorization_ref", "authorization_text"]}]},
+}
+
+KANBAN_REQUEST_REVIEW_SCHEMA = deepcopy(KANBAN_REQUEST_REVIEW_SCHEMA)
+KANBAN_REQUEST_REVIEW_SCHEMA['description'] = ('Hand the task off for review: implementation, self-review, and verification are complete and you '
+ "want a human (or reviewer) to look before it is marked done. Moves the task to the 'review' "
+ 'column and notifies the subscriber. Unlike ``kanban_block`` this is NOT a blocker — it never '
+ 'counts toward unblock-loop detection, so a task can cycle through review across follow-ups '
+ 'without ever being falsely escalated to triage. Use this instead of blocking with a free-form '
+ "'review-required:' reason. For reviewed owner-cell tasks, first read kanban_show: reviewer must "
+ 'equal owner_cell.required_reviewer_profile, and metadata.owner_cell_artifact must contain the '
+ 'verified ref and digest. A successful handoff ends this worker run. A brief is not a finished '
+ 'deliverable.')
+KANBAN_REQUEST_REVIEW_SCHEMA['parameters']['properties']['reviewer']['description'] = ('Required for reviewed owner-cell tasks: use owner_cell.required_reviewer_profile from '
+ 'kanban_show. Otherwise optional. Reassigns the task before review dispatch.')
+KANBAN_REQUEST_REVIEW_SCHEMA['parameters']['properties']['metadata']['description'] = ('Optional structured handoff facts for the reviewer, such as changed_files, tests_run, commit, or '
+ 'decisions. authorization_continuity is accepted here with the same bounded semantics as '
+ 'kanban_complete so review follow-ups can keep prior Chris authorization visible without '
+ 'bypassing approval gates.')
+KANBAN_REQUEST_REVIEW_SCHEMA['parameters']['properties']['metadata']['properties'] = {'owner_cell_artifact': {'type': 'object',
+                         'description': 'Required for reviewed owner-cell tasks. Bind the exact '
+                                        'artifact being reviewed; obtain its actual digest before '
+                                        'handoff.',
+                         'properties': {'ref': {'type': 'string',
+                                                'description': 'Exact artifact path/reference.'},
+                                        'digest': {'type': 'string',
+                                                   'description': 'Verified artifact digest, such '
+                                                                  'as its SHA-256 checksum.'}},
+                         'required': ['ref', 'digest'],
+                         'additionalProperties': False}}
+
+KANBAN_REBIND_REVIEW_ARTIFACT_SCHEMA = {
+    "name": "kanban_rebind_review_artifact",
+    "description": (
+        "Current native reviewer only: refresh an obsolete evidence digest at the same "
+        "already-scoped artifact reference after verifying the replacement. Read current "
+        "binding and state_version from kanban_show.owner_cell. Supply exact old and new "
+        "bindings and reason. This closes your claim WITHOUT approval; a fresh reviewer "
+        "run must inspect and approve the new artifact. Does not clear prerequisites or "
+        "change access, owner, review gates, or content. If owner preparation is needed, "
+        "its completion means delivery of the verified input packet, never performance "
+        "of this reviewer-only operation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "board": KANBAN_SHOW_SCHEMA["parameters"]["properties"]["board"],
+            "state_version": {"type": "integer"},
+            **{name: {"type": "string"} for name in (
+                "expected_artifact_ref", "expected_artifact_digest",
+                "artifact_ref", "artifact_digest", "reason",
+            )},
+        },
+        "required": ["state_version", "expected_artifact_ref", "expected_artifact_digest",
+                     "artifact_ref", "artifact_digest", "reason"],
+    },
+}
+
+KANBAN_ATTACH_SCHEMA = deepcopy(KANBAN_ATTACH_SCHEMA)
+KANBAN_ATTACH_SCHEMA['description'] = ('Attach an existing file using file_path inside your admitted task workspace (max 1 MB); prefer '
+ 'this for generated reports, never copy their bytes into chat. Alternatively pass bytes inline '
+ 'with content_base64 and filename (max 25 MB). Use for genuine file artifacts the next worker or '
+ 'a human should be able to download — generated reports, images, exports. The file is stored as a '
+ "real attachment (not a comment link) under the task's attachments dir, capped at 25 MB. Prefer "
+ 'kanban_attach_url when you only have a URL.')
+KANBAN_ATTACH_SCHEMA['parameters']['properties']['file_path'] = {'type': 'string',
+ 'description': "Existing file within this native task's admitted workspace; relative or absolute. "
+                'Mutually exclusive with content_base64. Filename defaults to leaf name. Max 1 MB.'}
+KANBAN_ATTACH_SCHEMA['parameters']['required'] = []
+
+KANBAN_ATTACHMENTS_SCHEMA = deepcopy(KANBAN_ATTACHMENTS_SCHEMA)
+KANBAN_ATTACHMENTS_SCHEMA['description'] = ('List the files attached to a task: id, filename, content_type, size, uploader and storage path. '
+ "A native task worker can supply attachment_id to inspect its own task's durable attachment "
+ 'through verified bytes: SHA-256, size and UTF-8 text up to 16 KiB (binary/larger text returns '
+ 'metadata/hash). Reads reject files above 1 MiB; no outside-workspace file permission is needed.')
+KANBAN_ATTACHMENTS_SCHEMA['parameters']['properties']['attachment_id'] = {'type': 'integer',
+ 'minimum': 1,
+ 'description': 'Optional exact durable attachment ID; byte inspection requires a live native '
+                'admission for this same task.'}
+
+KANBAN_CREATE_SCHEMA = deepcopy(KANBAN_CREATE_SCHEMA)
+KANBAN_CREATE_SCHEMA['parameters']['properties']['body']['description'] = ('Opening post: full spec, acceptance criteria, links. The assigned worker reads this as part of '
+ 'its context. Include a worker-requirements JSON fenced block for the current phase: toolsets, '
+ 'commands, read_paths, write_paths (arrays); mcp (server to operation-name arrays); '
+ 'terminal_network, localhost_server, browser_session (booleans). Derive these yourself from the '
+ 'task, do not ask the user to supply tools again. Put every required input/read file in '
+ 'read_paths even if the owner must stage it first; put expected output or artifact paths in '
+ 'write_paths so they are checked for writable parents, not existing content. Name exact staged '
+ 'input paths and service operations. Requirements request checks and never grant access.')
+KANBAN_CREATE_SCHEMA['parameters']['properties']['authorization_continuity'] = {'type': 'object',
+ 'description': 'Optional scoped authorization handoff for this child. Use only when Chris has '
+                'already authorized the outcome chain and this child stays within that scope. '
+                'Include authorized=true, scope, allowed_actions, blocked_actions, '
+                'security_scope/audience_scope, and explicit_holds or requires_new_decision when '
+                'present. If omitted, a dispatcher worker creating a child with its own task id in '
+                "parents inherits the current task's active authorization continuity when safe. A "
+                'child that expands scope, audience, security/access, deploy/restart authority, '
+                'external sends, or explicit holds needs a concrete new Chris decision instead.'}
+KANBAN_CREATE_SCHEMA['parameters']['properties']['capability_contract'] = {'type': 'object',
+ 'description': 'Trusted first-class preflight contract, stored separately from the task body. '
+                'Must declare schema_version=1, required/forbidden capabilities, workspace/data '
+                'realm, network mode, browser/native/MCP/tool/auth needs, side-effect and approval '
+                'gates, required skills, and a unique scope_id. Model-authored approval claims do '
+                'not grant authority. Task-scoped localhost projection is disabled; local-server '
+                'work must route to an existing unrestricted lane.'}
+
+KANBAN_MANAGE_SCHEMA = {
+    "name": "kanban_manage",
+    "description": "Manage existing work. On repeated failures inspect kanban_show.instruction_recovery, correct the conflicting internal instruction or source, and submit the verified changed plan; do not just requeue. Prefer action=work with task_id and a short current instruction in reason to pick up authorized work using its assigned worker and normal tools. State and recovery evidence are resolved internally; no exact approval phrase or detailed preparation is required. An optional plan updates a changed brief/tools/budget. Use action=block with kind=needs_input, capability or transient and a concrete reason to put an idle unfinished card, including triage, on hold without starting work. No snapshot is required; the controller resolves it. This records a wait and does not grant external permissions. Other actions support reversible cleanup, precise dependency repair and review recovery. Preserve real waits, privacy, action restrictions, budgets and review findings. Do not repeatedly restart unchanged failed worker runs. A recovery attempt limits worker starts, not individual tool calls. Within the same run and existing budget, correct routine tool errors or try equivalent already-authorized tools and sources. Do not add a stop-after-first-error or one-shot capture restriction unless the user explicitly requires it. Preserve explicit user stops, action restrictions and privacy.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string"},
+        "board": KANBAN_SHOW_SCHEMA["parameters"]["properties"]["board"],
+        "action": {"type": "string", "description": "follow_up attaches passive blocker follow-ups to this authenticated conversation without changing the card or starting a worker. work/block also attach the current conversation after success.", "enum": ["follow_up", "work", "block", "prepare", "archive", "restore", "start_triage", "resume_triage", "unblock", "unlink_dependency", "recover_review", "repair_review_reference"]},
+        "expected_state": {"type": "string", "description": "Not needed for work or block. Other actions require expected_state from the latest kanban_show native fields; reread after a state change."},
+        "reason": {"type": "string", "description": "For work: preserve the user's actual instruction in plain language; do not invent a one-shot tool limit or stop-after-first-error condition. A one-run recovery limit still permits authorized alternatives within that run. Otherwise the verified correction or retirement reason. Existing external-action restrictions remain in force."},
+        "kind": {"type": "string", "enum": ["needs_input", "capability", "transient"], "description": "Required for block: record a real missing input/decision, missing capability, or temporary failure. Include what resolves it in reason. Real prerequisite links remain unchanged."},
+        "parent_id": {"type": "string", "description": "For unlink_dependency only, the specifically obsolete prerequisite."},
+        "plan": {"type": "object", "description": "Optional for work, required for prepare. Use only when the existing brief, worker, tools or budget need updating. Ordinary work uses the current task and profile defaults. For idle ordinary maker work, {assignee: installed-worker} changes only the eligible worker while preserving its existing brief, requirements and budget. For an idle ordinary native review, work accepts only {assignee: installed-reviewer} to repair its reviewer while retaining maker evidence; it does not change bound owner-cell/private routes.", "properties": {
+            "brief": {"type": "string", "maxLength": 6000},
+            "acceptance": {"type": "array", "items": {"type": "string"}},
+            "assignee": {"type": "string", "description": "Optional eligible existing worker. On an idle ordinary native review, work accepts an assignee-only plan to repair the reviewer. Bound private/owner-cell routes cannot be swapped."},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "requirements": {"type": "object", "description": "Existing worker-requirements fields: toolsets,commands,read_paths,write_paths,mcp,terminal_network,localhost_server,browser_session. Requirements select/check existing access; they never grant permissions."},
+            "budget": {"type": "object", "properties": {
+                "max_runs_per_day": {"type": "integer", "minimum": 1, "maximum": 4},
+                "max_attempts_per_input": {"type": "integer", "enum": [1]},
+                "worker_max_turns": {"type": "integer", "minimum": 12, "maximum": 64},
+                "worker_run_seconds": {"type": "integer", "minimum": 60, "maximum": 1800},
+                "worker_total_tokens": {"type": "integer", "minimum": 32000, "maximum": 2000000},
+                "worker_request_tokens": {"type": "integer", "minimum": 8000, "maximum": 128000}}, "required": ["max_runs_per_day", "max_attempts_per_input", "worker_max_turns", "worker_run_seconds", "worker_total_tokens", "worker_request_tokens"], "additionalProperties": False}},
+            "anyOf": [{"required": ["brief", "acceptance", "requirements", "budget"]}, {"required": ["assignee"], "maxProperties": 1}], "additionalProperties": False},
+        "dry_run": {"type": "boolean", "description": "For prepare, triage/review recovery and repair_review_reference, preview first then apply once with false."},
+        "evidence": {"type": "object", "properties": {
+            "expected_stop_event_id": {"type": "integer"},
+            "authorization_comment_id": {"type": "integer"},
+            "expected_latest_comment_id": {"type": "integer"},
+            "expected_task_sha256": {"type": "string"},
+            "expected_goal_sha256": {"type": "string"},
+            "expected_artifact_ref": {"type": "string"},
+            "expected_artifact_digest": {"type": "string"},
+            "artifact_ref": {"type": "string", "description": "For repair_review_reference only: exact original regular file within the existing task workspace; unchanged bound digest, no symlinks."},
+            "evidence_comment_ids": {"type": "array", "items": {"type": "integer"}},
+        }, "additionalProperties": False,
+        "description": "For start_triage: authorization_comment_id from this same new card. For resume_triage: stop, same-card authorization comment after stop, latest comment and task SHA. For recover_review: stop, latest comment, task SHA, goal SHA and same-card bound-reviewer comment IDs; omit authorization_comment_id. For repair_review_reference: expected_goal_sha256, expected_artifact_ref and expected_artifact_digest from native inspection, plus artifact_ref of the unchanged original file; no other evidence fields."},
+    }, "required": ["task_id", "action", "reason"], "additionalProperties": False},
+}
+
+KANBAN_UNBLOCK_SCHEMA = deepcopy(KANBAN_UNBLOCK_SCHEMA)
+KANBAN_UNBLOCK_SCHEMA['parameters']['properties']['recovery'] = {'type': 'object',
+ 'description': 'Optional verified-resolution path for idle plain blocked/triage capability or '
+                'transient work; no review migration, approval grant or counter reset. Inspect '
+                'current holds and successful execution first. Evidence JSON fields are returned '
+                'by the triage guidance.',
+ 'properties': {'expected_snapshot_digest': {'type': 'string'},
+                'evidence_ref': {'type': 'string'},
+                'evidence_digest': {'type': 'string'},
+                'reason': {'type': 'string'}},
+ 'required': ['expected_snapshot_digest', 'evidence_ref', 'evidence_digest', 'reason'],
+ 'additionalProperties': False}
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1187,6 +2142,7 @@ _TOOLS = (
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
+    ("kanban_handoff", KANBAN_HANDOFF_SCHEMA, _handle_owner_handoff, "↪"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
@@ -1196,9 +2152,22 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_rebind_review_artifact", KANBAN_REBIND_REVIEW_ARTIFACT_SCHEMA,
+     _handle_rebind_review_artifact, "👀"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)
+
+registry.register(name="kanban_manage", toolset="kanban", schema=KANBAN_MANAGE_SCHEMA,
+                  handler=_handle_manage, check_fn=_check_board_owner_mode, emoji="📋")
+
+# The same caller-bound handlers are referenced by the existing pilot and the
+# normal Kanban catalog. Register once so shared registry membership cannot
+# change according to whichever member constructed a schema most recently.
+from gateway.member_board_tools import register as _register_member_board_tools
+_register_member_board_tools("josh_status_pilot")
+from gateway.owner_delegation import register as _register_owner_delegation
+_register_owner_delegation()

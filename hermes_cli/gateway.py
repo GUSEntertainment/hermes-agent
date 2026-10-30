@@ -3488,7 +3488,7 @@ from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-export
     _spawn_detached_gateway,
     _launchd_fallback_to_detached,
     _launchd_degrade_or_raise,
-    generate_launchd_plist,
+    generate_launchd_plist as _upstream_generate_launchd_plist,
     launchd_plist_is_current,
     _spawn_deferred_launchd_reload,
     refresh_launchd_plist_if_needed,
@@ -3506,6 +3506,24 @@ from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-export
     wait_for_launchd_gateway_supervision,
     launchd_status,
 )
+
+
+def generate_launchd_plist() -> str:
+    """Use an operator-owned profile pin if present; otherwise generate upstream service definition."""
+    pinned_path = get_hermes_home() / "gateway-service.plist"
+    if pinned_path.is_file():
+        import plistlib
+        pinned_text = pinned_path.read_text(encoding="utf-8")
+        pinned = plistlib.loads(pinned_text.encode("utf-8"))
+        pinned_home = pinned.get("EnvironmentVariables", {}).get("HERMES_HOME", "")
+        if (pinned.get("Label") != get_launchd_label()
+                or not pinned_home
+                or Path(pinned_home).resolve() != get_hermes_home().resolve()):
+            raise ValueError(f"Service pin does not belong to this profile: {pinned_path}")
+        if not pinned.get("ProgramArguments"):
+            raise ValueError(f"Service pin has no command: {pinned_path}")
+        return pinned_text
+    return _upstream_generate_launchd_plist()
 
 
 # Cached launchd domain — probe once per process invocation.

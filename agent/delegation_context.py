@@ -21,8 +21,19 @@ DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
-    "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS", "HERMES_KANBAN_ADMIN_TASK",
 )
+ADMIN_LOCATOR = "HERMES_KANBAN_ADMIN_TASK"
+
+
+def add_worker_admin_locator(env: dict) -> dict:
+    """t_043e2722: the dispatcher-owned worker's own terminal shell keeps a task locator so the
+    bounded administrative CLI (gateway.gus_admin_cli) can re-prove the live assignment. Never
+    added for delegate children or cron runs; the locator is a hint, not authority."""
+    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if task and is_dispatcher_owned_worker_context():
+        env[ADMIN_LOCATOR] = task
+    return env
 
 
 @contextmanager

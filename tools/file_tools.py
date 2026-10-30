@@ -26,6 +26,7 @@ from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
 from tools import file_state
+from tools.workspace_confinement import WorkspaceConfinementError, resolve_confined_path
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
@@ -34,6 +35,7 @@ from tools.file_tools_write_guards import (
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
+    _file_bookkeeping_key, _host_metadata_allowed,
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
     _file_metadata, _file_version,
     _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
@@ -44,6 +46,22 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+def _workspace_confinement_error(path: str, task_id: str, *, access: str = "write") -> str | None:
+    try:
+        from gateway.host_tool_authority import remote_required, terminal_environment
+        if remote_required():
+            terminal_environment()  # Unknown/misconfigured callers fail closed.
+            from tools.workspace_confinement import resolve_workspace
+            if resolve_workspace(task_id=task_id) is not None:
+                return "Remote caller cannot use a native host workspace admission"
+            return None  # Ordinary SSH paths are not host filesystem paths.
+        resolve_confined_path(path, task_id=task_id, access=access)
+    except (WorkspaceConfinementError, PermissionError) as exc:
+        return str(exc)
+    return None
+
 
 # Read-size guard. Model-agnostic, so characters proxy tokens: 100K chars is
 # ~25-35K tokens across typical tokenisers. Configurable: file_read_max_chars.
@@ -303,6 +321,22 @@ def _create_terminal_env_for_file_ops(raw_task_id: str, task_id: str):
     return env_type, terminal_env
 
 
+def _apply_workspace_confinement(file_ops, task_id: str):
+    """Bind local shell operations to the admitted workspace OS boundary."""
+    from tools.workspace_confinement import resolve_workspace
+
+    root = resolve_workspace(task_id=task_id)
+    from tools.terminal_tool import _private_worker_environment
+    if _private_worker_environment() is not None and not _file_ops_uses_host_paths(file_ops):
+        raise PermissionError("Private worker cannot reuse remote file operations")
+    if _file_ops_uses_host_paths(file_ops):
+        if root is not None:
+            file_ops.confinement_workspace = str(root)
+        elif hasattr(file_ops, "confinement_workspace"):
+            del file_ops.confinement_workspace
+    return file_ops
+
+
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """Get or create ShellFileOperations for the task's terminal environment.
 
@@ -326,7 +360,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         with _env_lock:
             if task_id in _active_environments:
                 _last_activity[task_id] = time.time()
-                return cached
+                return _apply_workspace_confinement(cached, raw_task_id)
             # Env was cleaned up: rescue its cwd into the session record FILL-ONLY
             # (``cached.cwd`` is the SHARED env's cwd, not this session's own).
             # Environment was cleaned up -- preserve the old cwd in the session record before invalidating
@@ -365,11 +399,15 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
-    return file_ops
+    return _apply_workspace_confinement(file_ops, raw_task_id)
 
 
 def clear_file_ops_cache(task_id: str = None):
     """Clear file-operation state for a finished task, or all tasks."""
+    from gateway.host_tool_authority import scope
+    if scope() is not None:
+        from tools.terminal_tool import _resolve_container_task_id
+        task_id = _resolve_container_task_id(task_id or "default")
     with _file_ops_lock:
         if task_id:
             _file_ops_cache.pop(task_id, None)
@@ -550,8 +588,9 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
         task_data["read_history"].add((path, offset, limit))
         count = _bump_consecutive(task_data, ("read", path, offset, limit))
         try:
-            _mtime_now = os.path.getmtime(resolved_str)
-            task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
+            if _host_metadata_allowed(task_id):  # [GUS] no host stat for remote callers
+                _mtime_now = os.path.getmtime(resolved_str)
+                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
         except OSError:
             pass
         baselines = task_data["full_write_baselines"]
@@ -604,6 +643,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
     → negative-result cache → dedup stub → real read.
     """
     try:
+        confinement_error = _workspace_confinement_error(path, task_id, access="read")
+        if confinement_error:
+            return json.dumps({"error": confinement_error}, ensure_ascii=False)
         offset, limit = normalize_read_pagination(offset, limit)
 
         # On the RAW model-supplied string, before any expanduser()/resolve():
@@ -614,8 +656,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if nt_err:
             return tool_error(nt_err)
 
-        device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
-        if _is_blocked_device(path, base_dir=device_base):
+        from gateway.host_tool_authority import remote_required
+        if remote_required():
+            blocked_device = _is_blocked_device_path(posixpath.normpath(path))
+        else:
+            device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
+            blocked_device = _is_blocked_device(path, base_dir=str(device_base) if device_base is not None else None)
+        if blocked_device:
             return tool_error(
                 f"Cannot read '{path}': this is a device file that would "
                 "block or produce infinite output.")
@@ -663,7 +710,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
             task_data = _task_data(task_id)
-            cached_version = task_data["dedup"].get(dedup_key)
+            cached_version = task_data["dedup"].get(dedup_key) if _host_metadata_allowed(task_id) else None
             # First unchanged read after a compaction boundary serves full content
             # (the summary may have dropped exact bytes); later ones get the stub.
             content_served_in_generation = dedup_key in task_data["dedup_generation_reads"]
@@ -730,7 +777,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                                         end_line=end_line, total_lines=total_lines,
                                         version_before=version_before,
                                         snapshot=getattr(result, "_snapshot", None))
-        if count >= 4:
+        if count >= 4 and _host_metadata_allowed(task_id):
             return tool_error(
                 f"BLOCKED: You have read this exact file region {count} times in a row. "
                 "The content has NOT changed. You already have this information. "
@@ -738,7 +785,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 path=path,
                 already_read=count,
                 **{GUARDRAIL_REFUSAL_KEY: True})
-        if count >= 3:
+        if count >= 3 and _host_metadata_allowed(task_id):
             result_dict["_warning"] = (
                 f"You have read this exact file region {count} times consecutively. "
                 "The content has not changed since your last read. Use the information you already have. "
@@ -859,6 +906,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
     """
+    confinement_error = _workspace_confinement_error(path, task_id)
+    if confinement_error:
+        return tool_error(confinement_error)
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
@@ -962,6 +1012,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
+    for _p in _paths_to_check:
+        confinement_error = _workspace_confinement_error(_p, task_id, access="patch")
+        if confinement_error:
+            return tool_error(confinement_error)
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
     if precheck_err:
         return tool_error(precheck_err)
@@ -1037,13 +1091,16 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        confinement_error = _workspace_confinement_error(path, task_id, access="search")
+        if confinement_error:
+            return tool_error(confinement_error)
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Pagination args (and order) are part of the key so paging through truncated
         # results doesn't trip the repeated-search guard.
         search_key = ("search", pattern, target, str(path), file_glob or "", limit, offset, order)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
+            task_data = _read_tracker.setdefault(_file_bookkeeping_key(task_id), {
                 "last_key": None, "consecutive": 0, "read_history": set()})
             count = _bump_consecutive(task_data, search_key)
 

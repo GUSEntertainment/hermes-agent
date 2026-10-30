@@ -12,6 +12,7 @@ tool calls or reasoning.
 """
 
 import logging
+import re
 import time
 import weakref
 from typing import Any, Dict, List, Optional
@@ -199,7 +200,24 @@ def _build_child_agent(
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
+    configured_toolsets = delegation_cfg.get("default_toolsets")
+    if configured_toolsets is not None:
+        if not isinstance(configured_toolsets, list) or any(
+            not isinstance(t, str) or not t.strip() for t in configured_toolsets
+        ):
+            raise ValueError("delegation.default_toolsets must be a list of toolset names")
+        if "delegation" not in configured_toolsets:
+            effective_role = "leaf"
+        # Trusted operator allowlist, still intersected with the parent's capabilities.
+        toolsets = [t for t in (configured_toolsets if toolsets is None else toolsets)
+                    if t in configured_toolsets]
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    if configured_toolsets is not None:
+        allowed = set(configured_toolsets)
+        child_toolsets = [t for t in child_toolsets if t in allowed]
+    from tools.delegate_tool_toolsets import _get_inherit_mcp_toolsets, _is_mcp_toolset_name
+    if not _get_inherit_mcp_toolsets():
+        child_toolsets = [t for t in child_toolsets if not _is_mcp_toolset_name(t)]
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -534,9 +552,51 @@ def delegate_task(
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────
 
+
+def _configured_child_model_description() -> str:
+    """Describe configured pins only; never resolve credentials or expose URLs.
+
+    A missing pin keeps the existing parent-inheritance semantics. Unknown or
+    malformed identifiers stay opaque instead of entering model-visible text.
+    """
+    try:
+        cfg = _load_config()
+    except Exception:
+        cfg = {}
+    def identifier(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        # Deliberately narrow public identifiers: never URLs, bearer tokens,
+        # arbitrary config objects or control characters. Provider/model values
+        # outside this grammar are configured but not displayed.
+        if not value or len(value) > 96 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value):
+            return None
+        if ":" in value or "//" in value or value.lower().startswith(("sk-", "bearer", "http")):
+            return None
+        return value
+    cfg = cfg if isinstance(cfg, dict) else {}
+    model = cfg.get("model")
+    provider = cfg.get("provider")
+    model = model.strip() if isinstance(model, str) else model
+    provider = provider.strip() if isinstance(provider, str) else provider
+    model_label = identifier(model)
+    provider_label = identifier(provider)
+    if not model and not provider:
+        return "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml. No per-call model selector is needed."
+    parts = []
+    if model:
+        parts.append("model=" + (model_label or "[configured identifier withheld]"))
+    else:
+        parts.append("model not pinned; resolved by the existing runtime")
+    if provider:
+        parts.append("provider=" + (provider_label or "[configured identifier withheld]"))
+    return "- Child defaults configured for this session: " + ", ".join(parts) + ". The runtime applies these defaults automatically; no per-call model selector is needed."
+
+
 def _build_top_level_description(*, independent_completions=None) -> str:
     """delegate_task description: ONLY guidance stated nowhere else in the schema
-    (limits live in the 'tasks' parameter description, rebuilt per get_definitions())."""
+    (limits live in the tasks parameter description, rebuilt per get_definitions())."""
     try:
         orchestration_available = _get_max_spawn_depth() >= 2 and _get_orchestrator_enabled()
     except Exception:
@@ -559,7 +619,7 @@ def _build_top_level_description(*, independent_completions=None) -> str:
         "each ungrouped task / `group` returns on its own"
         if independent_completions else "one message per call"
     )
-    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
+    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _configured_child_model_description()
 
 _DESCRIPTION_HEAD = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
@@ -760,7 +820,6 @@ import contextvars  # noqa: F401,E402
 import enum  # noqa: F401,E402
 import json  # noqa: F401,E402
 import os  # noqa: F401,E402
-import re  # noqa: F401,E402
 import threading  # noqa: F401,E402
 from urllib.parse import urlsplit  # noqa: F401,E402
 from urllib.parse import urlunsplit  # noqa: F401,E402

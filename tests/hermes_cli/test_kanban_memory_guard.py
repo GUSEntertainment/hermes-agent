@@ -202,6 +202,13 @@ def test_dispatch_unknown_pressure_imposes_no_restriction(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+    monkeypatch.setattr(
+        kb,
+        "_build_worker_admission",
+        lambda *a, **k: pytest.fail(
+            "public legacy callbacks must not require worker admission"
+        ),
+    )
     spawns = []
 
     def fake_spawn(task, workspace, board=None):

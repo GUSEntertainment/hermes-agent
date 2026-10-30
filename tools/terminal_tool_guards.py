@@ -141,37 +141,34 @@ def _foreground_background_guidance(command: str) -> str | None:
     return next((msg for hit, msg in _FOREGROUND_GUIDANCE if hit(unquoted)), None)
 
 
-def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int) -> Optional[str]:
-    """Best-effort script read: host filesystem first, then a bounded
-    ``env.execute('head -c ... < path')`` for remote backends. Binary content
-    (NUL byte) is not a script: feeding it to the guard tokenizes machine code
-    into bogus paths and crashes the scanner, so it yields None."""
+def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int,
+                           *, remote_only: bool = False) -> Optional[str]:
+    """Bounded read on the selected backend; never inspect a same-named host file."""
     if env is None:
-        return None
+        raise PermissionError("Script backend unavailable")
+
+    def remote_path(value: str) -> str:
+        if value == "~":
+            return '"$HOME"'
+        if value.startswith("~/"):
+            return '"$HOME"/' + shlex.quote(value[2:])
+        if value.startswith("~"):
+            raise PermissionError("Cannot safely resolve named remote home")
+        return shlex.quote(value)
+
     try:
-        local_path = Path(script_path).expanduser()
-        if not local_path.is_absolute():
-            local_path = Path(guard_cwd) / local_path
-        if local_path.is_file():
-            metadata = local_path.stat()
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes:
-                data = local_path.read_bytes()
-                if len(data) <= max_bytes:
-                    return None if b"\x00" in data else data.decode("utf-8", errors="replace")
-    except Exception:
-        pass
-    # Remote backend: bound the read at the source with `head -c` so an
-    # oversized binary never crosses the wire (an unbounded `cat` once
-    # pinned the gateway's tool thread for 30+ min on a shlex scan). One
-    # byte over budget is enough for lifecycle_guard to fail closed. The
-    # `< path` redirect keeps leading-dash paths out of argv.
-    try:
-        result = env.execute(f"head -c {max_bytes + 1} < {shlex.quote(script_path)}")
+        result = env.execute(
+            f"cd {remote_path(str(guard_cwd))} && "
+            f"head -c {max_bytes + 1} < {remote_path(script_path)}"
+        )
         if result.get("returncode", -1) == 0:
             output = result.get("output", "")
             return None if output and "\x00" in output else output
     except Exception:
-        pass
+        if remote_only:
+            raise
+    if remote_only:
+        raise PermissionError("Remote script could not be inspected")
     return None
 
 
@@ -232,7 +229,9 @@ def gateway_lifecycle_block(
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        read_remote_script=lambda p: _read_script_for_guard(
+            env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES, remote_only=env_type != "local"),
+        remote_only=env_type != "local",
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,

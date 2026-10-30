@@ -17,7 +17,8 @@
 
 import type * as HermesSdk from '@hermes/plugin-sdk'
 import { act, fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
 
 import { BotRow } from './bot-row'
 import { $groupChats } from './group-chat'
@@ -66,6 +67,7 @@ function renderRow(bot: RosterRow) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers()
   vi.clearAllMocks()
   ensureBotMetadata.mockResolvedValue({ pinned: true })
   openRosterBot.mockResolvedValue(true)
@@ -95,6 +97,10 @@ describe('group-turn presence', () => {
   })
 })
 
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe('pre-warm is hover-scoped, never roster-wide', () => {
   it('warms nothing on paint and exactly the hovered bot on pointer entry', async () => {
     const row = renderRow({ name: 'alpha' } as RosterRow)
@@ -102,9 +108,22 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     expect(warmProfile).not.toHaveBeenCalled()
 
     fireEvent.pointerEnter(row)
+    expect(warmProfile).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(349)
+    expect(warmProfile).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
 
     expect(warmProfile.mock.calls).toEqual([['alpha']])
     expect(warmAgent).not.toHaveBeenCalled()
+  })
+
+  it('cancels speculative pre-warm when the pointer leaves before dwell', () => {
+    const row = renderRow({ name: 'alpha' } as RosterRow)
+    fireEvent.pointerEnter(row)
+    vi.advanceTimersByTime(200)
+    fireEvent.pointerLeave(row)
+    vi.advanceTimersByTime(200)
+    expect(warmProfile).not.toHaveBeenCalled()
   })
 
   it('pre-dials a source-scoped row on its own source', async () => {
@@ -117,6 +136,7 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     } as RosterRow)
 
     fireEvent.pointerEnter(row)
+    vi.advanceTimersByTime(350)
 
     expect(warmAgent.mock.calls).toEqual([['work', 'research']])
     expect(warmProfile).not.toHaveBeenCalled()

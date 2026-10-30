@@ -281,8 +281,8 @@ def _finalize_child_env(env: dict) -> dict:
     _inject_session_context_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     _apply_windows_msys_bash_env_defaults(env)
-    from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.delegation_context import delegated_child_subprocess_env, add_worker_admin_locator
+    return add_worker_admin_locator(delegated_child_subprocess_env(env))
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -867,8 +867,11 @@ class LocalEnvironment(BaseEnvironment):
             name for name in merged
             if isinstance(name, str) and _matches_terminal_first_party_prefix(name)))
 
-    def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
-        super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env)
+    def __init__(self, cwd: str = "", timeout: int = 60,
+                 env: dict | None = None, replace_env: bool = False):
+        cwd = _resolve_local_initial_cwd(cwd)
+        self._replace_env = replace_env
+        super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -933,17 +936,69 @@ class LocalEnvironment(BaseEnvironment):
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
 
-    def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+
+    def _run_bash(self, cmd_string: str, *, login: bool = False,
+                  timeout: int = 120,
+                  stdin_data: str | None = None,
+                  env: Mapping[str, str] | None = None,
+                  replace_env: bool = False) -> subprocess.Popen:
         bash = _find_bash()
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
-        if login:
-            cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
-        self._recover_cwd()
+        effective_replace_env = replace_env or (env is None and self._replace_env)
+        launch_env = dict(self.env if env is None else env)
+        # For login-shell invocations (used by init_session to build the
+        # environment snapshot), prepend sources for the user's bashrc /
+        # custom init files so tools registered outside bash_profile
+        # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
+        # Non-login invocations are already sourcing the snapshot and
+        # don't need this.
+        if login and not effective_replace_env:
+            init_files = _resolve_shell_init_files()
+            if init_files:
+                cmd_string = _prepend_shell_init(cmd_string, init_files)
+        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if effective_replace_env:
+            # Workspace confinement requires replacement, not sanitization
+            # after an ambient merge: bash reads BASH_ENV while starting, so
+            # the sanitized mapping must already be installed at Popen.
+            run_env = launch_env
+        else:
+            configured_env = dict(self.env)
+            if env is not None:
+                configured_env.update(env)
+            run_env = _make_run_env(configured_env)
+
+        # Recover when the cwd has been deleted out from under us — usually by
+        # a previous tool call that ran ``rm -rf`` on its own working dir
+        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
+        # the cwd before bash starts, wedging every subsequent call until the
+        # gateway restarts.
+        #
+        # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
+        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
+        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
+        # and spammed as a warning on every command.
+        safe_cwd = _resolve_safe_cwd(self.cwd)
+        if safe_cwd != self.cwd:
+            # MSYS → Windows translation alone shouldn't surface as a warning
+            # (it's a benign normalization, not a recovery). Only warn when
+            # the directory really doesn't exist on disk.
+            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    self.cwd,
+                    safe_cwd,
+                )
+            self.cwd = safe_cwd
+
+        _popen_cwd = self.cwd
+
+        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8"  # [GUS] confinement/per-call env must reach the first shell
+           , errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
@@ -954,6 +1009,25 @@ class LocalEnvironment(BaseEnvironment):
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
+
+    def _run_bash_with_env(
+        self,
+        cmd_string: str,
+        *,
+        login: bool,
+        timeout: int,
+        stdin_data: str | None,
+        env: dict[str, str] | None,
+        replace_env: bool,
+    ) -> subprocess.Popen:
+        return self._run_bash(
+            cmd_string,
+            login=login,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            env=env,
+            replace_env=replace_env,
+        )
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""

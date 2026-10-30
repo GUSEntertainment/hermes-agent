@@ -19,9 +19,13 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     """Spin up a fresh HERMES_HOME with kanban DB + alpha/beta profiles."""
     test_home = tempfile.mkdtemp(prefix="kanban_per_profile_cap_test_")
     for prof in ("alpha", "beta", "default"):
-        os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
-        with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
-            fh.write("{}\n")  # identity marker: a bare dir is not a profile
+        profile_dir = os.path.join(test_home, "profiles", prof)
+        os.makedirs(profile_dir, exist_ok=True)
+        with open(os.path.join(profile_dir, "config.yaml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "model:\n  provider: anthropic\n  default: claude-test\n"
+                "platform_toolsets:\n  cli: [file]\n"
+            )
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":

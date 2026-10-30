@@ -47,9 +47,16 @@ def captured_ticks(monkeypatch):
         mgr._hooks = saved
 
 def test_active_tick_fires_hook_with_outcome_ok(
-    kanban_home, all_assignees_spawnable, captured_ticks,
+    kanban_home, all_assignees_spawnable, captured_ticks, monkeypatch,
 ):
     """A tick that spawns a worker fires the hook with outcome='ok'."""
+    monkeypatch.setattr(
+        kb,
+        "_build_worker_admission",
+        lambda *a, **k: pytest.fail(
+            "public legacy callbacks must not require worker admission"
+        ),
+    )
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")

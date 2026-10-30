@@ -647,7 +647,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     )
     captured: list[list[str]] = []
 
-    def spawn(task, workspace):
+    def spawn(task, workspace, admission_contract=None):
         captured.append(list(task.skills or []))
         return None
 
@@ -666,11 +666,14 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             summary="ready",
             expected_run_id=implementation.current_run_id,
         )
-        monkeypatch.setattr(
-            kbd,
-            "check_respawn_guard",
-            lambda _conn, _task_id, **_kw: "rate_limit_cooldown",
-        )
+        # Margot's customized guard lives in kanban_db (kbd re-exports it); the
+        # custom dispatch loop resolves it there, so patch both bindings.
+        for _mod in (kbd, kb):
+            monkeypatch.setattr(
+                _mod,
+                "check_respawn_guard",
+                lambda _conn, _task_id, **_kw: "rate_limit_cooldown",
+            )
         guarded = kbd.dispatch_once(conn, spawn_fn=spawn)
         assert guarded.respawn_guarded == [(task_id, "rate_limit_cooldown")]
         assert not guarded.spawned
@@ -678,7 +681,45 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         assert guarded_task is not None
         assert guarded_task.status == "review"
 
-        monkeypatch.setattr(kbd, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
+        for _mod in (kbd, kb):
+            monkeypatch.setattr(_mod, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
+        profile_digest = kb._profile_config_digest(str(kanban_home))
+
+        def admit(task, profile, **_kwargs):
+            board_database = kb._database_identity_contract(kb.kanban_db_path())
+            contract = {
+                "version": "hermes.worker-admission/v1",
+                "task": task.id,
+                "admission_nonce": "review-lifecycle-test-admission",
+                "board_database": board_database,
+                "profile": profile,
+                "profile_home": str(kanban_home),
+                "profile_config_digest": profile_digest,
+                "provider": "test",
+                "model": "test",
+                "fallbacks": [],
+                "reasoning": task.reasoning_effort,
+                "toolsets": ["file"],
+                "skills": [*(task.skills or []), "sdlc-review"],
+                "skill_dependencies": {
+                    "loaded": [*(task.skills or []), "sdlc-review"],
+                    "unavailable": [],
+                },
+                "privacy": {},
+                "tenant": task.tenant,
+                "workspace": kb._planned_workspace_contract(task, None),
+                "workspace_confinement": False,
+                "workspace_read_only_roots": [],
+                "workspace_read_only_root_identities": [],
+            }
+            return kb.WorkerAdmission(
+                contract,
+                "a" * 64,
+                kb._task_admission_snapshot(task),
+                profile_digest,
+            )
+
+        monkeypatch.setattr(kb, "_build_worker_admission", admit)
         result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert task_id in [task[0] for task in result.spawned]

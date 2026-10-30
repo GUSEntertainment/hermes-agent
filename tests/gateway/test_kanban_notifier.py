@@ -169,6 +169,107 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_unsafe_default_profile_block_notice_is_concise_and_exact_origin(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "unsafe-default-origin.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="default guard",
+            assignee="default",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_metadata={"thread_id": "topic-1"},
+        )
+        kb.block_task(
+            conn,
+            tid,
+            reason=kb.UNSAFE_ROOT_WORKER_REASON.format(assignee="default"),
+            kind="capability",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "unsafe default worker profile" in message
+    assert "root Hermes home" not in message
+    assert "interactive default gateway" not in message
+    assert all(
+        not key.startswith("_kanban_")
+        for key in adapter.sent[0]["metadata"]
+    )
+
+
+def test_inherited_unsafe_default_profile_block_is_suppressed_and_acknowledged(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "unsafe-default-inherited.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="old maintenance parent",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:music-chat",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="music-chat",
+            delivery_mode="notify+wake",
+        )
+        child = kb.create_task(
+            conn,
+            title="default guard child",
+            assignee="default",
+            parents=[parent],
+        )
+        kb.block_task(
+            conn,
+            child,
+            reason=kb.UNSAFE_ROOT_WORKER_REASON.format(assignee="default"),
+            kind="capability",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=child,
+            platform="telegram",
+            chat_id="music-chat",
+            kinds=["blocked"],
+        )
+        assert events == []
+    finally:
+        conn.close()
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):
@@ -796,3 +897,64 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_task_link_does_not_inherit_notify_wake_without_explicit_watch_authority(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "no-inherit-watch.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="parent from old topic",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:old-topic",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="old-topic",
+            delivery_mode="notify+wake",
+            delivery_metadata={"_kanban_inherit_to_children": True, "thread_id": "old"},
+        )
+        child = kb.create_task(conn, title="child business task", parents=[parent])
+        child_subs = kb.list_notify_subs(conn, task_id=child, include_internal_metadata=True)
+        parent_subs = kb.list_notify_subs(conn, task_id=parent, include_internal_metadata=True)
+    finally:
+        conn.close()
+
+    assert child_subs == []
+    assert parent_subs[0]["delivery_metadata"].get("_kanban_inherit_to_children") is None
+
+
+def test_task_link_can_inherit_notify_wake_with_trusted_internal_watch_authority(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "trusted-inherit-watch.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="trusted parent", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="ops-topic",
+            delivery_mode="notify+wake",
+            inherit_children=True,
+        )
+        child = kb.create_task(conn, title="trusted child", parents=[parent])
+        child_subs = kb.list_notify_subs(conn, task_id=child, include_internal_metadata=True)
+    finally:
+        conn.close()
+
+    assert len(child_subs) == 1
+    metadata = child_subs[0]["delivery_metadata"]
+    assert metadata["_kanban_inherited_subscription"] is True
+    assert metadata["_kanban_inherited_from_task_id"] == parent
+    assert metadata["_kanban_subscription_origin_task_id"] == parent

@@ -1,8 +1,7 @@
 """Regression tests for #27145 — kanban.default_assignee for unassigned ready tasks.
 
 When the dispatcher hits an unassigned ready task and ``kanban.default_assignee``
-is set, the dispatcher applies the assignment and spawns. Without the config,
-the task is skipped (existing behavior preserved).
+is set, it persists the assignment. Root ``default`` is then parked safely.
 """
 from __future__ import annotations
 
@@ -30,11 +29,20 @@ def _fake_spawn(*args, **kwargs):
 
 
 
-def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_home):
+def test_unassigned_task_auto_assigned_with_default_assignee(
+    isolated_kanban_home, monkeypatch
+):
     """Core #27145 contract: with default_assignee set, an unassigned ready
-    task gets the assignment applied and dispatched on the same tick. The
-    DB row is mutated (assignee column + an 'assigned' event)."""
+    task gets the assignment applied on the same tick. Root ``default`` is
+    parked rather than spawned."""
     kb, _home = isolated_kanban_home
+    monkeypatch.setattr(
+        kb,
+        "_build_worker_admission",
+        lambda *a, **k: pytest.fail(
+            "public legacy callbacks must not require worker admission"
+        ),
+    )
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect_closing() as conn:
@@ -47,9 +55,8 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         )
     assert res.auto_assigned_default == [task_id]
     assert not res.skipped_unassigned
-    assert len(res.spawned) == 1
-    assert res.spawned[0][0] == task_id
-    assert res.spawned[0][1] == "default"
+    assert res.spawned == []
+    assert res.blocked_unsafe_profile == [task_id]
 
     with kbc.connect_closing() as conn:
         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -87,6 +94,7 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
             default_assignee="someother",
         )
     assert task_id not in res.auto_assigned_default
-    assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
+    assert task_id in res.blocked_unsafe_profile
+    assert res.spawned == []
 
 

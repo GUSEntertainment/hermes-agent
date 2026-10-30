@@ -326,6 +326,13 @@ class SessionFtsSetupMixin:
                 pass
 
     def _ensure_fts_schema(self, cursor: sqlite3.Cursor, table_name: str, ddl: str) -> bool:
+        if table_name == "messages_fts_trigram" and not getattr(self, "_trigram_config_enabled", True):
+            # [GUS custom] operator opted out of trigram FTS: drop its triggers, keep the table
+            # (dropping a multi-GB index would itself hold the WAL writer for a long time).
+            from hermes_state_schema import _FTS_TRIGRAM_TRIGGERS
+            for trigger in _FTS_TRIGRAM_TRIGGERS:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            return False
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False

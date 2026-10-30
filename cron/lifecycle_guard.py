@@ -815,8 +815,14 @@ def _expand_candidate_path(candidate: str) -> Optional[Path]:
         return None
 
 
-def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
-    """Yield *candidate* anchored on *cwd* (or the process cwd) when it is a real path."""
+def _resolved_or_nothing(candidate: str, cwd: Optional[str], *, remote_only: bool = False) -> Iterator[Path]:
+    """Yield a lexical remote path or a locally anchored candidate."""
+    if remote_only:
+        if not candidate or "\x00" in candidate:
+            return
+        path = Path(candidate)
+        yield path if path.is_absolute() or candidate.startswith("~") else Path(cwd or ".") / path
+        return
     path = _expand_candidate_path(candidate)
     if path is None:
         return
@@ -871,7 +877,7 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
+def _references_at(segment: list[str], index: int, cwd: Optional[str], *, remote_only: bool = False) -> Iterator[Path]:
     """Yield the scripts the token at *index* executes, if any."""
     if index >= len(segment):
         return
@@ -880,7 +886,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
-            yield from _resolved_or_nothing(segment[index + 1], cwd)
+            yield from _resolved_or_nothing(segment[index + 1], cwd, remote_only=remote_only)
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -901,16 +907,16 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 continue
             break
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
-            yield from _resolved_or_nothing(arguments[arg_index], cwd)
+            yield from _resolved_or_nothing(arguments[arg_index], cwd, remote_only=remote_only)
         return
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
-        yield from _resolved_or_nothing(executable, cwd)
+        yield from _resolved_or_nothing(executable, cwd, remote_only=remote_only)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None, remote_only: bool = False) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
@@ -918,10 +924,10 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, remote_only=remote_only)
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, remote_only=remote_only)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -1084,7 +1090,7 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
-    read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True, remote_only: bool = False,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1100,7 +1106,7 @@ def _contains_unsafe_gateway_action(
     def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
-            read_remote_script=read_remote_script, executed=executed,
+            read_remote_script=read_remote_script, executed=executed, remote_only=remote_only,
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1118,11 +1124,27 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, remote_only=remote_only)]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd, remote_only=remote_only)]
 
     for script_path, candidate_executed in candidates:
+        if remote_only:
+            if script_path in visited:
+                continue
+            if not budget.charge_path():
+                return _budget_exhausted(budget, "paths", depth) if candidate_executed else False
+            visited.add(script_path)
+            if read_remote_script is None or not budget.charge_remote_read():
+                return _budget_exhausted(budget, "remote reads", depth) if candidate_executed else False
+            script_text, unsafe = _sanitize_remote_script_text(
+                read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
+            )
+            if unsafe:
+                return _refuse_unreadable(budget, script_path, "remote script exceeds scan cap") if candidate_executed else False
+            if script_text and recurse(script_text, str(script_path.parent), candidate_executed):
+                return True
+            continue
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
             if candidate_executed:
@@ -1176,6 +1198,7 @@ def _contains_unsafe_gateway_action(
 def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    remote_only: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
@@ -1195,6 +1218,7 @@ def scan_gateway_lifecycle(
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
             read_remote_script=read_remote_script,
+            remote_only=remote_only,
         )
         return unsafe, budget.refusal if unsafe else None
     except Exception:
@@ -1203,6 +1227,8 @@ def scan_gateway_lifecycle(
             "falling back to direct-scan verdict",
             exc_info=True,
         )
+        if remote_only:
+            return True, "remote lifecycle scan failed"
         try:
             return _direct_lifecycle_scan(command), None
         except Exception:
@@ -1214,10 +1240,14 @@ def scan_gateway_lifecycle(
 def contains_gateway_lifecycle_command_or_referenced_script(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    remote_only: bool = False,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts (see
-    ``scan_gateway_lifecycle`` for the contract)."""
-    return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script)[0]
+    ``scan_gateway_lifecycle`` for the contract). [GUS] ``remote_only`` never
+    resolves referenced scripts against the host filesystem."""
+    return scan_gateway_lifecycle(
+        command, cwd=cwd, read_remote_script=read_remote_script, remote_only=remote_only,
+    )[0]
 
 
 def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None) -> None:

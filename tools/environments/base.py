@@ -244,7 +244,7 @@ class BaseEnvironment(ABC):
         LocalEnvironment overrides for Termux where only ``TMPDIR`` is writable)."""
         return "/tmp"  # no-tmp: ok — sandbox-side (remote container) temp dir, not the host
 
-    def __init__(self, cwd: str, timeout: int, env: dict = None):
+    def __init__(self, cwd: str, timeout: int, env: dict | None = None):
         self.cwd = cwd
         self.timeout = timeout
         self.env = env or {}
@@ -266,6 +266,21 @@ class BaseEnvironment(ABC):
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*; every backend overrides this."""
         raise NotImplementedError(f"{type(self).__name__} must implement _run_bash()")
+
+    def _run_bash_with_env(
+        self,
+        cmd_string: str,
+        *,
+        login: bool,
+        timeout: int,
+        stdin_data: str | None,
+        env: dict[str, str] | None,
+        replace_env: bool,
+    ) -> ProcessHandle:
+        """Local-only first-process environment replacement capability."""
+        raise TypeError(
+            f"{type(self).__name__} does not support per-launch environment replacement"
+        )
 
     @abstractmethod
     def cleanup(self):
@@ -576,17 +591,31 @@ class BaseEnvironment(ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
-        """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
-        caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
-        tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
-        patch engine, RPC reads, log reads) MUST leave it False or data is corrupted. The wait is
-        bounded by ``agent.deadline.run_bounded_sync`` so a wedged poll loop cannot hang past
-        ``timeout`` and silently disable every asyncio timer in the process.
+        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        env: dict[str, str] | None = None,
+        replace_env: bool = False,
+    ) -> dict:
+        """Execute a command, return {"output": str, "returncode": int}.
 
-        ``bounded_capture=True`` caps stdout/stderr retention at ``tool_output.max_bytes`` WHILE the stream
-        is drained (head/tail window) instead of holding the full output in memory (#64435).
-        See #94285.
+        ``bounded_capture=True`` caps stdout/stderr retention at
+        ``tool_output.max_bytes`` WHILE the stream is drained (head/tail
+        window) instead of holding the full output in memory (#64435).
+        It must only be set by callers whose output is destined for the
+        model/tool payload (the foreground terminal tool). Internal
+        full-fidelity consumers — file operations ``cat`` reads that feed
+        the patch engine, code-execution RPC reads, log reads — MUST leave
+        it False: truncating those corrupts data, not just display.
+
+        The wait is bounded by ``agent.deadline.run_bounded_sync`` so a
+        wedged poll loop cannot hang past ``timeout`` and silently disable
+        every asyncio timer in the process (#94285).
+        ``env`` / ``replace_env`` are a local-backend launch capability used
+        by workspace confinement.  They are forwarded only when explicitly
+        requested, so ordinary and remote/container calls retain their
+        existing ``_run_bash`` contract.  With ``replace_env=True``, the local
+        backend installs exactly ``env`` on the first subprocess rather than
+        merging the ambient host environment.
+
         """
         self._before_execute()
 
@@ -624,9 +653,19 @@ class BaseEnvironment(ABC):
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                if env is not None or replace_env:
+                    spawned = self._run_bash_with_env(
+                        wrapped, login=login, timeout=effective_timeout,
+                        stdin_data=effective_stdin, env=env, replace_env=replace_env,
+                    )
+                else:
+                    spawned = self._run_bash(
+                        wrapped, login=login, timeout=effective_timeout,
+                        stdin_data=effective_stdin,
+                    )
             finally:
                 fenced = _leave_foreground_spawn(self, spawned)
+
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)

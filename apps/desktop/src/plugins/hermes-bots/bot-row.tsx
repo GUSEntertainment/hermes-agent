@@ -6,6 +6,8 @@
  * and the row decides only how it reads.
  */
 
+import { useEffect, useRef } from 'react'
+
 import {
   cn,
   coarseElapsed,
@@ -113,6 +115,7 @@ interface BotRowProps {
 
 export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandle }: BotRowProps) {
   const { t } = useI18n()
+  const warmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const b = useBots()
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
   const selectedRosterKey = useValue($selectedRosterKey)
@@ -221,6 +224,23 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
     }
   }
 
+  const cancelWarm = () => {
+    if (warmTimer.current !== null) {
+      clearTimeout(warmTimer.current)
+      warmTimer.current = null
+    }
+  }
+
+  const scheduleWarm = () => {
+    cancelWarm()
+    warmTimer.current = setTimeout(() => {
+      warmTimer.current = null
+      warm()
+    }, 350)
+  }
+
+  useEffect(() => cancelWarm, [])
+
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
   const open = () => void openRosterBot(bot)
@@ -254,7 +274,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
         event.dataTransfer.effectAllowed = 'move'
         $draggingBot.set(rosterKey)
       }}
-      onPointerEnter={warm}
+      onPointerEnter={scheduleWarm}
+      onPointerLeave={cancelWarm}
     >
       <div className={cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60')}>
         <BotFace

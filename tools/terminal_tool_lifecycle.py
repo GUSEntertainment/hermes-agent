@@ -177,8 +177,15 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
+    # [GUS privacy wall] A caller-scoped lane (remote member) must never fall back
+    # to the raw task_id: that key may be the owner's host environment.
+    from gateway.host_tool_authority import terminal_cache_key
+    caller_scoped = terminal_cache_key() is not None
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup)
+        if env is None and not caller_scoped:
+            env = _active_environments.get(task_id)
+        return env
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -300,6 +307,10 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     directly, so persist-mode idle envs are likewise no-op'd; only the orphan
     reaper at next startup reclaims them.
     """
+    from gateway.host_tool_authority import scope
+    if scope() is not None:
+        from tools.terminal_tool import _resolve_container_task_id
+        task_id = _resolve_container_task_id(task_id)
     env = _unregister_env(task_id)
     _clear_file_ops_cache(task_id)
     if env is None:

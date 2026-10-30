@@ -211,6 +211,7 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
         kbn.add_notify_sub(
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
+            inherit_children=True,
         )
         kb.block_task(conn, passive_tid, reason="passive block")
         kb.block_task(conn, active_tid, reason="active block")
@@ -329,6 +330,7 @@ async def test_notifier_notify_wake_does_not_wake_on_status_event(kanban_home):
         kbn.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
+            inherit_children=True,
         )
         kb._append_event(conn, tid, kind="status", payload={"status": "review"})
     finally:
@@ -1017,6 +1019,7 @@ def _add_full_parent_sub(kb, conn, parent):
         chat_type="dm", notifier_profile="default",
         delivery_mode="notify+wake",
         delivery_metadata={"reply_fallback": "general", "topic_name": "ops"},
+        inherit_children=True,
     )
 
 

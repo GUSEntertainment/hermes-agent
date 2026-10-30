@@ -77,6 +77,8 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
 
+    if str(task_id).startswith("chrome_current:"):
+        return {"success": False, "error": "Chrome Current is not attached (is Chrome running with its debugging port?)"}
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_session import _run_browser_command
 
@@ -99,6 +101,9 @@ def _ensure_supervisor(task_id: str):
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
+    if str(task_id).startswith("chrome_current:"):
+        from tools.browser_vault_targets import chrome_current_supervisor
+        return chrome_current_supervisor(str(task_id).split(":", 1)[1])
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
     from tools.browser_tool_session import _run_browser_command
@@ -181,8 +186,8 @@ def _current_page_origin(task_id: str) -> Optional[str]:
     if not res.get("success"):
         return None
     href = str(res.get("result") or "").strip().strip('"').strip("'")
-    if not href or href == "about:blank":
-        return None
+    if not href.startswith(("http://", "https://")):
+        return None  # chrome://, about:, devtools pages are never a vault origin
     try:
         from agent.vault_store import normalize_origin
 
@@ -217,6 +222,26 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _payment_fp(backend, handle: str) -> Optional[str]:
+    """Server-side duplicate key for a card (digest only; the card data never leaves this function)."""
+    try:
+        from agent.vault_store import _card_fingerprint
+        return _card_fingerprint(backend.resolve_secret(handle))
+    except Exception:
+        return None
+
+
+def _record_approved_checkout(backend, handle: str, origin: str) -> None:
+    """Remember a checkout Chris just confirmed for this card (local vault only; others are read-only)."""
+    if getattr(backend, "name", "") != "local":
+        return
+    try:
+        from agent.vault_store import get_vault_store
+        get_vault_store().allow_payment_origin(handle, origin)
+    except Exception as exc:
+        logger.debug("vault: could not record approved checkout (%s)", type(exc).__name__)
+
+
 def browser_vault_list() -> str:
     """List login handles + metadata across every enabled backend. Passwords are never included.
 
@@ -227,6 +252,7 @@ def browser_vault_list() -> str:
     from agent.vault_backends.unlock import can_prompt_here
 
     items, locked, errors = [], [], []
+    seen_cards: Dict[str, Dict[str, Any]] = {}
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
             locked.append({"backend": backend.name, "display_name": backend.display_name,
@@ -239,9 +265,20 @@ def browser_vault_list() -> str:
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
-                     "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+                     "origin": meta.origin, "available": meta.kind in ("login", "payment") or bool(meta.origin)}
+            if meta.kind == "payment":
+                # Never hide a saved card because it was first saved on another site (t_78bb3d31).
+                fp = _payment_fp(backend, meta.id)
+                if fp and fp in seen_cards:
+                    seen_cards[fp].setdefault("also_saved_as", []).append(meta.id)
+                    continue
+                if meta.origin:
+                    entry["status"] = "saved, other site"
+                entry["fill_scope"] = "any checkout the user confirms at fill time"
+                if fp:
+                    seen_cards[fp] = entry
             if len(meta.allowed_origins) > 1:
-                entry["allowed_origins"] = list(meta.allowed_origins)
+                entry["allowed_origins" if meta.kind != "payment" else "approved_checkouts"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
@@ -297,15 +334,20 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
+    # Bind ONLY to the tab that actually holds a password form; never fall back to whatever tab the
+    # supervisor attached to first (that is how a save once bound to chrome://new-tab-page).
+    if _focus_bound_origin(effective_task_id, "", "login") is None and str(effective_task_id).startswith("chrome_current:"):
+        return json.dumps({"success": False, "error": "No open Chrome tab with a password field; open the form first."})
+    origin = _current_page_origin(effective_task_id)  # http(s) only; chrome:// never binds
     if not origin:
-        return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
+        return json.dumps({"success": False, "error": "No open http(s) tab with a password field; open the site's login page first."})
     prompt = get_save_login_prompt_callback()
     if prompt is None or not can_prompt_here():
         return json.dumps({"success": False, "error_type": "prompt_unavailable",
-                           "error": (f"This session cannot ask the user for a login (headless/cron/API). Tell them to run "
-                                     f"`hermes vault add` or use Desktop → Settings → Passwords & Logins for {origin}.")})
+                           "error": (f"This session cannot ask the user for an existing password (headless/cron/API). For a NEW "
+                                     f"account Chris asked for, call browser_vault_create_login: it generates the password "
+                                     f"server-side, stores it in the vault and /accounts, and fills it. Otherwise ask Chris to "
+                                     f"save it in Margot /accounts or `hermes vault add` for {origin}.")})
     host = origin.split("://", 1)[-1]
     site = label.strip() or host
     answer = prompt(origin, host)  # the prompt names the site by host: the user recognises URLs, not agent labels
@@ -326,6 +368,63 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
                        "identifier_type": id_type, "fill": filled,
                        "next": "Type the identifier into the username field if the form has one, then submit."},
                       ensure_ascii=False)
+
+
+def browser_vault_create_login(identifier: str, label: str = "", task_id: Optional[str] = None) -> str:
+    """NEW-account signup without a human prompt: generate a strong password server-side, save it encrypted
+    (Hermes vault bound to the page origin + mirrored into Margot /accounts), then fill every password field
+    of the signup form (password + confirm). The value never enters args, results, logs or chat."""
+    from agent.redact import register_vault_redaction_value
+    from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js
+    from agent.vault_store import get_vault_store
+    from tools.browser_vault_targets import generate_password, store_in_accounts_vault
+
+    identifier = str(identifier or "").strip()
+    if not identifier:
+        return json.dumps({"success": False, "error": "identifier (the email/username for the new account) is required."})
+    effective_task_id = task_id or "default"
+    # Bind ONLY to the tab that actually holds a password form; never fall back to whatever tab the
+    # supervisor attached to first (that is how a save once bound to chrome://new-tab-page).
+    if _focus_bound_origin(effective_task_id, "", "login") is None and str(effective_task_id).startswith("chrome_current:"):
+        return json.dumps({"success": False, "error": "No open Chrome tab with a password field; open the form first."})
+    origin = _current_page_origin(effective_task_id)  # http(s) only; chrome:// never binds
+    if not origin:
+        return json.dumps({"success": False, "error": "No open http(s) tab with a password field; open the signup form first."})
+    nonce = secrets.token_hex(8)
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    raw = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
+    if isinstance(raw, str):
+        raw = _parse_json_result(raw)
+    controls = [LoginControl.from_dict(r) for r in (raw or []) if isinstance(r, dict)]
+    pw_controls = [c for c in controls if c.type == "password"]
+    if not pw_controls:
+        return json.dumps({"success": False, "error": "No password field on the signup form."})
+    password = generate_password()
+    register_vault_redaction_value(password)
+    host = origin.split("://", 1)[-1]
+    site = label.strip() or host
+    id_type = "email" if "@" in identifier else ("phone" if identifier.lstrip("+").isdigit() else "username")
+    try:
+        meta = get_vault_store().add_item("login", site, {"identifier_type": id_type, "identifier": identifier,
+                                                         "password": password}, origin=origin)
+    except Exception as exc:
+        return json.dumps({"success": False, "error_type": "save_failed", "error": type(exc).__name__})
+    account_id = None
+    try:
+        account_id = store_in_accounts_vault(site, origin, identifier, password)
+    except Exception as exc:  # the Hermes vault copy is enough to log in later
+        logger.warning("vault create: /accounts mirror unavailable (%s)", type(exc).__name__)
+    fills = [{"index": c.index, "token": "current-password", "value": password} for c in pw_controls[:2]]
+    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    del password, fills
+    parsed = _parse_json_result(result.get("result")) if result.get("success") else None
+    if isinstance(parsed, str):
+        parsed = _parse_json_result(parsed)
+    filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
+    return json.dumps({"success": True, "handle": meta.id, "origin": origin, "identifier": identifier,
+                       "accounts_vault_id": account_id, "filled_fields": filled,
+                       "next": ("Type the identifier and other non-secret fields yourself, then submit. To log in later "
+                                "use browser_vault_fill with this handle.")}, ensure_ascii=False)
 
 
 _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
@@ -442,19 +541,31 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
-    if meta.kind != "login" and not meta.origin:
+    # Payment cards fill at ANY checkout Chris approves (t_12a85d17): the card is not locked to the site it
+    # was first saved on. Chris confirms every fill, and the prompt names the exact checkout origin; that
+    # confirmed origin then becomes the only allowed target and is re-checked atomically inside the fill JS.
+    any_checkout = meta.kind == "payment"
+    if meta.kind == "address" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+    if any_checkout:
+        checkout_origin = _focus_bound_origin(effective_task_id, "", "payment")
+        checkout_origin = checkout_origin if (checkout_origin or "").startswith(("http://", "https://")) else None
+        checkout_origin = _current_page_origin(effective_task_id) or checkout_origin
+        if not checkout_origin:
+            return json.dumps({"success": False, "error": "No open http(s) checkout page with card fields; open the checkout first."})
+        if not _confirm_payment_fill(meta.label, checkout_origin):
+            return json.dumps({"success": False, "error_type": "payment_declined",
+                               "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+        _record_approved_checkout(backend, handle, checkout_origin)
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
     # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
-    allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+    allowed = ([checkout_origin] if any_checkout else
+               (list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])))
     page_origin = None
     for candidate in allowed:
         page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
@@ -625,8 +736,9 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
         "fills the address fields. Values are resolved server-side and never appear in the conversation. "
-        "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
+        "Logins/addresses: refused unless the page origin exactly matches the item's bound origin. Payment "
+        "cards (including ones listed as 'saved, other site') fill on any checkout the user confirms in the "
+        "per-fill prompt; the confirmed origin is re-checked atomically at fill time. If a password manager is locked the user is prompted to unlock first. Never retry a "
         "payment_declined result."
     ),
     "parameters": {
@@ -635,7 +747,9 @@ BROWSER_VAULT_FILL_SCHEMA = {
             "handle": {
                 "type": "string",
                 "description": "Handle from browser_vault_list (vault_… local, op:… 1Password, bw:… Bitwarden)",
-            }
+            },
+            "browser": {"type": "string", "enum": ["browser_use", "chrome_current"],
+                        "description": "Which browser holds the page: browser_use (default, browser_exec session) or chrome_current (Chris's real Chrome, the chrome_current tools)."}
         },
         "required": ["handle"],
     },
@@ -655,7 +769,9 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {"label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."}},
+        "properties": {"label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."},
+                       "browser": {"type": "string", "enum": ["browser_use", "chrome_current"],
+                        "description": "Which browser holds the page: browser_use (default, browser_exec session) or chrome_current (Chris's real Chrome, the chrome_current tools)."}},
         "required": [],
     },
 }
@@ -673,10 +789,36 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {"handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."}},
+        "properties": {"handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."},
+                       "browser": {"type": "string", "enum": ["browser_use", "chrome_current"],
+                        "description": "Which browser holds the page: browser_use (default, browser_exec session) or chrome_current (Chris's real Chrome, the chrome_current tools)."}},
         "required": [],
     },
 }
+
+
+BROWSER_VAULT_CREATE_LOGIN_SCHEMA = {
+    "name": "browser_vault_create_login",
+    "description": (
+        "Creating a NEW account Chris asked for (signup form open): Hermes generates a strong password server-side, "
+        "stores it encrypted in the vault (bound to the page origin) and in Margot /accounts, and fills the password "
+        "and confirm-password fields. Works headless; no prompt. You never see the password: type the email/username "
+        "and other fields yourself, then submit. Never use this to replace an existing account's password."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "identifier": {"type": "string", "description": "Email or username the new account uses."},
+        "label": {"type": "string", "description": "Short site name (default: the host)."},
+        "browser": {"type": "string", "enum": ["browser_use", "chrome_current"],
+                        "description": "Which browser holds the page: browser_use (default, browser_exec session) or chrome_current (Chris's real Chrome, the chrome_current tools)."}}, "required": ["identifier"]},
+}
+
+
+def _target_tid(args: Dict[str, Any], tid: Optional[str]) -> Optional[str]:
+    """Route to Chrome Current through its own supervisor key; Browser Use keeps the session task id."""
+    from tools.browser_vault_targets import CHROME_CURRENT, normalize_target, supervisor_key
+    if normalize_target(args.get("browser")) == CHROME_CURRENT:
+        return supervisor_key(tid or "default", CHROME_CURRENT)
+    return tid
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
@@ -698,13 +840,19 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
 
 
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
-    tid = kwargs.get("task_id")
+    tid = _target_tid(args, kwargs.get("task_id"))
     return _fenced_page_op(tid, lambda: browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=tid))
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
-    tid = kwargs.get("task_id")
+    tid = _target_tid(args, kwargs.get("task_id"))
     return _fenced_page_op(tid, lambda: browser_vault_save_login(label=str(args.get("label") or ""), task_id=tid))
+
+
+def _handle_vault_create_login(args: Dict[str, Any], **kwargs) -> str:
+    tid = _target_tid(args, kwargs.get("task_id"))
+    return _fenced_page_op(tid, lambda: browser_vault_create_login(identifier=str(args.get("identifier") or ""),
+                                                                  label=str(args.get("label") or ""), task_id=tid))
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
@@ -716,7 +864,7 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
-    tid = kwargs.get("task_id")
+    tid = _target_tid(args, kwargs.get("task_id"))
     return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
 
 
@@ -765,6 +913,15 @@ registry.register(
     toolset="browser",
     schema=BROWSER_VAULT_FILL_SCHEMA,
     handler=_handle_vault_fill,
+    check_fn=_check_vault_available,
+    emoji="🔐",
+)
+
+registry.register(
+    name="browser_vault_create_login",
+    toolset="browser",
+    schema=BROWSER_VAULT_CREATE_LOGIN_SCHEMA,
+    handler=_handle_vault_create_login,
     check_fn=_check_vault_available,
     emoji="🔐",
 )

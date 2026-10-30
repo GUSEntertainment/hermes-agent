@@ -39,6 +39,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        logical_message_id=kw.get("logical_message_id"),
+        message_kind=kw.get("message_kind", "text"),
     )
 
 
@@ -808,3 +810,67 @@ class TestOwnerAlivePidProbe:
 
         monkeypatch.setattr(status, "_pid_exists", boom)
         assert dl._owner_alive(12345, 999) is False
+
+
+class TestPhotonRecoveryPolicy:
+    @pytest.mark.parametrize("state", ["attempting", "failed"])
+    def test_ambiguous_photon_obligation_is_reconciled_without_redelivery(self, state):
+        _record(platform="photon", chat_id="iMessage;-;+15550000001")
+        if state == "attempting":
+            dl.mark_attempting("ob-1")
+        else:
+            dl.mark_failed("ob-1", "ack lost after delivery")
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"photon"})
+
+        assert len(claimed) == 1
+        assert claimed[0]["suppress_send"] is True
+        assert claimed[0]["logical_message_id"] == "ob-1"
+        assert claimed[0]["recipient_key"] == "dm:+15550000001"
+        assert _row("ob-1")["state"] == "delivery_unknown"
+
+    @pytest.mark.parametrize("message_kind", ["text", "link", "attachment", "poll", "voice"])
+    @pytest.mark.asyncio
+    async def test_runner_performs_zero_second_transport_for_ambiguous_photon(
+        self, message_kind
+    ):
+        from gateway.config import Platform
+
+        _record(
+            platform="photon",
+            chat_id="any;-;+15550000001",
+            message_kind=message_kind,
+        )
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        runner = TestGatewayRedeliverySweep._runner()
+        runner.adapters = {Platform("photon"): adapter}
+
+        assert await runner._redeliver_pending_obligations() == 0
+        adapter.send.assert_not_awaited()
+        runner._async_session_store.clear_resume_pending.assert_awaited_once()
+
+    def test_pending_photon_claim_carries_stable_logical_identity(self):
+        _record(platform="photon", chat_id="+15550000001")
+        _orphan("ob-1")
+        claimed = dl.sweep_recoverable(deliverable_platforms={"photon"})
+        assert claimed[0]["suppress_send"] is False
+        assert claimed[0]["logical_message_id"] == "ob-1"
+        assert claimed[0]["recipient_key"] == "dm:+15550000001"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("any;-;+15550000001", "dm:+15550000001"),
+        ("iMessage;-;User@Example.COM", "dm:user@example.com"),
+        ("dm:+15550000001", "dm:+15550000001"),
+        ("+15550000001", "dm:+15550000001"),
+        ("group-guid", "group-guid"),
+    ],
+)
+def test_photon_recipient_identity_matches_transport_guards(raw, expected):
+    assert dl.canonical_recipient("photon", raw) == expected

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.kanban_stop import (
@@ -87,7 +89,7 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": '{"ok": true, "task_id": "t_abc"}'},
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -130,7 +132,11 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
                 }
             ],
         },
-        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
+        # [GUS] the customized guard only accepts a confirmed same-task result
+        # (unconfirmed / failed attempts are covered by the tests below).
+        {"role": "tool", "name": tool_name, "tool_call_id": "1",
+         "content": json.dumps({"ok": True, "task_id": "t_handoff",
+                                "status": "review" if tool_name == "kanban_request_review" else "ready"})},
     ]
     assert session_called_kanban_terminal(messages) is True, who
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -159,3 +165,44 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     # The nudge offers every worker exit, not just close-out; a card that must go
     # through review must never be steered to ``kanban_complete`` alone.
     assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+@pytest.mark.parametrize('named', [True, False])
+def test_successful_review_ends_worker_without_false_running_nudge(clear_kanban_env, named):
+    import json
+    clear_kanban_env.setenv('HERMES_KANBAN_TASK', 't_review')
+    messages = [
+        {'role': 'assistant', 'tool_calls': [{'id': 'handoff', 'function': {'name': 'kanban_request_review'}}]},
+        {'role': 'tool', 'tool_call_id': 'handoff',
+         'content': json.dumps({'task_id': 't_review', 'status': 'review', 'ok': True})},
+    ]
+    if named:
+        messages[-1]['name'] = 'kanban_request_review'
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize('result', [
+    None,
+    'not JSON',
+    '{"error": "missing binding"}',
+    '{"task_id": "t_review", "status": "review", "success": false}',
+    '{"task_id": "another_task", "status": "review"}',
+    '{"task_id": "t_review", "status": "running"}',
+])
+def test_review_attempt_or_failure_cannot_suppress_recovery(clear_kanban_env, result):
+    clear_kanban_env.setenv('HERMES_KANBAN_TASK', 't_review')
+    messages = [{'role': 'assistant', 'tool_calls': [{'id': 'handoff', 'function': {'name': 'kanban_request_review'}}]}]
+    if result is not None:
+        messages.append({'role': 'tool', 'tool_call_id': 'handoff', 'content': result})
+    nudge = build_kanban_stop_nudge(messages=messages)
+    assert nudge is not None
+    assert 'kanban_show' in nudge
+    assert 'still `running`' not in nudge
+
+
+@pytest.mark.parametrize('name', ['kanban_complete', 'kanban_block', 'kanban_handoff', 'kanban_request_changes'])
+@pytest.mark.parametrize('content', ['{"ok":false,"task_id":"t_abc","error":"failed"}', '{"ok":true,"task_id":"different"}'])
+def test_unsuccessful_terminal_attempt_does_not_end_work(clear_kanban_env, name, content):
+    clear_kanban_env.setenv('HERMES_KANBAN_TASK', 't_abc')
+    messages = [{'role':'tool', 'name':name, 'content':content}]
+    assert build_kanban_stop_nudge(messages=messages) is not None

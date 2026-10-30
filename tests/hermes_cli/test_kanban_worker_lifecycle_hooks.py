@@ -12,6 +12,8 @@ dispatcher.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -38,6 +40,46 @@ def kanban_home(tmp_path, monkeypatch):
     # Crash detection acts immediately in these tests (no launch grace).
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # These tests isolate lifecycle observers, not capability preflight.
+    def test_admission(task, profile, *, board=None, extra_skills=()):
+        profile_digest = kb._profile_config_digest(str(home))
+        skills = list(dict.fromkeys([*(task.skills or []), *extra_skills]))
+        contract = {
+            "version": "hermes.worker-admission/v1",
+            "task": task.id,
+            "admission_nonce": f"lifecycle-test-{task.id}",
+            "board_database": kb._database_identity_contract(
+                kb.kanban_db_path(board=board)
+            ),
+            "profile": profile,
+            "profile_home": str(home.resolve()),
+            "profile_config_digest": profile_digest,
+            "provider": "test",
+            "model": "test",
+            "fallbacks": [],
+            "reasoning": task.reasoning_effort,
+            "toolsets": [],
+            "skills": skills,
+            "skill_dependencies": {"loaded": skills, "unavailable": []},
+            "privacy": {},
+            "tenant": task.tenant,
+            "workspace": kb._planned_workspace_contract(task, board),
+            "workspace_confinement": False,
+            "workspace_read_only_roots": [],
+            "workspace_read_only_root_identities": [],
+        }
+        encoded = json.dumps(
+            contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return kb.WorkerAdmission(
+            contract,
+            hashlib.sha256(encoded.encode()).hexdigest(),
+            kb._task_admission_snapshot(task),
+            profile_digest,
+        )
+
+    monkeypatch.setattr(kb, "_build_worker_admission", test_admission)
+    monkeypatch.setattr(kb, "_admission_still_current", lambda *_args: True)
     kb.init_db()
     return home
 
@@ -58,7 +100,7 @@ def captured_hooks(monkeypatch):
         mgr._hooks = saved
 
 def test_dispatch_spawn_fires_worker_spawned(
-    kanban_home, all_assignees_spawnable, captured_hooks,
+    kanban_home, all_assignees_spawnable, captured_hooks, monkeypatch,
 ):
     """A dispatched spawn fires the hook AFTER the PID is durably persisted."""
     pid_at_fire_time: list = []
@@ -77,12 +119,14 @@ def test_dispatch_spawn_fires_worker_spawned(
 
     mgr = get_plugin_manager()
     mgr._hooks.setdefault("on_kanban_worker_spawned", []).append(_read_pid)
+    monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (pid, 1.0))
 
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
         assert any(row[0] == tid for row in result.spawned)
+
     finally:
         conn.close()
 
@@ -104,7 +148,9 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     try:
         tid = kb.create_task(conn, title="t", assignee="worker")
         kb.claim_task(conn, tid)
+        monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (pid, 1.0))
         kbd._set_worker_pid(conn, tid, 98765)
+
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
     finally:
@@ -163,12 +209,14 @@ def test_raising_callbacks_never_break_worker_lifecycle(
 
     for hook in WORKER_HOOKS:
         mgr._hooks.setdefault(hook, []).append(_boom)
+    monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (pid, 1.0))
     try:
         conn = kbc.connect()
         try:
             tid = kb.create_task(conn, title="t", assignee="alice")
             result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
+
 
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
             assert kbd.detect_crashed_workers(conn) == [tid]
@@ -186,4 +234,29 @@ def test_raising_callbacks_never_break_worker_lifecycle(
     finally:
         mgr._hooks = saved
 
+
+def test_no_subscriber_short_circuits_worker_hooks(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """With nothing registered, the new observers are never invoked at all."""
+    from hermes_cli import lifecycle
+
+    invoked: list[str] = []
+    real_invoke = lifecycle.invoke_hook
+
+    def _spy(hook_name, **kw):
+        invoked.append(hook_name)
+        return real_invoke(hook_name, **kw)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
+    monkeypatch.setattr(kb, "_worker_process_identity", lambda pid: (pid, 1.0))
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="t", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 222)
+    finally:
+        conn.close()
+    assert "on_kanban_worker_spawned" not in invoked
+    # The shipped claimed hook has no short-circuit and still fires.
+    assert "kanban_task_claimed" in invoked
 

@@ -211,92 +211,268 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         description="Start an interactive chat session with Hermes Agent")
     add, inherited, SUPPRESS = chat_parser.add_argument, _inherited_flag, argparse.SUPPRESS
     _query_group = chat_parser.add_mutually_exclusive_group()
-    _query_group.add_argument("-q", "--query", help=(
-        "Query to run. On a real TTY the prompt seeds an interactive "
-        "session (submitted literally as the first turn); combined with "
-        "--oneshot or -Q, or on a non-TTY, it answers and exits."))
-    _query_group.add_argument("--query-file", metavar="PATH", help=(
-        "Read the single query from a file instead of the command line "
-        "('-' reads stdin). Safe for arbitrary text: nothing is shell-"
-        "interpreted, so quotes, $(...), and backticks are preserved "
-        "verbatim. Mutually exclusive with -q."))
-    # Distinct dest: the top-level `-z/--oneshot PROMPT` is value-taking and its dispatch sites do
-    # `if args.oneshot: _run_and_exit_oneshot(args.oneshot)` — a shared boolean dest would be
-    # passed as the prompt.
-    add("--oneshot", dest="oneshot_exit", action="store_true", default=False, help=(
-        "With -q/--query-file: answer the query and exit (legacy "
-        "single-query behavior) instead of seeding an interactive "
-        "session. Implied on non-TTY stdio and by -Q/--quiet."))
-    add("--image", help="Optional local image path to attach to a single query")
-    inherited(chat_parser, "-m", "--model", default=SUPPRESS,
-              help="Model to use (e.g., anthropic/claude-sonnet-4)")
-    add("-t", "--toolsets", default=SUPPRESS, help="Comma-separated toolsets to enable")
-    inherited(chat_parser, "--reasoning", default=SUPPRESS, metavar="LEVEL", help=(
-        "Reasoning effort for this session: none, minimal, low, medium, "
-        "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "
-        "this run only (same levels as the /reasoning slash command)."))
-    inherited(chat_parser, "-s", "--skills", action="append", default=SUPPRESS,
-              help="Preload one or more skills for the session (repeat flag or comma-separate)")
-    # No `choices=` on --provider: user-defined providers from config.yaml `providers:` are valid
-    # too; runtime resolution (resolve_runtime_provider) validates, same as the top-level flag.
-    inherited(chat_parser, "--provider", default=SUPPRESS,
-              help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.")
-    add("-v", "--verbose", action="store_true", default=SUPPRESS, help="Verbose output")
-    add("-Q", "--quiet", action="store_true",
-        help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.")
-    add("--format", choices=["text", "stream-json"], default="text", dest="output_format", help=(
-        "Output format for single-query mode (-q). 'text' prints the final response as plain text (default). "
-        "'stream-json' emits newline-delimited JSON events (JSONL), implies --quiet, and cannot be combined with --tui."))
-    add("--resume", "-r", metavar="SESSION_ID", default=SUPPRESS, help=(
-        "Resume a previous session by ID (shown on exit), or 'latest' "
-        "for the most recent session"))
-    add("--no-restore-cwd", action="store_true", default=SUPPRESS,
-        help="Don't cd into a resumed session's recorded working directory.")
-    add("--in", dest="in_dir", metavar="DIR", default=SUPPRESS, help=(
-        "Change into DIR before starting or resuming (scopes "
-        "'--resume latest' / -c lookups to DIR's workspace)."))
-    add("--continue", "-c", dest="continue_last", nargs="?", const=True, default=SUPPRESS,
-        metavar="SESSION_NAME", help="Resume a session by name, or the most recent if no name given")
-    add("--create-if-missing", action="store_true", default=SUPPRESS, help=(
-        "With -c/--continue <name>: if no session matches the name, "
-        "create a new session with that title and proceed (instead of "
-        "failing with a not-found error). Programmatic callers that "
-        "want 'send to this named thread, making it if needed'."))
-    add("--worktree", "-w", action="store_true", default=SUPPRESS,
-        help="Run in an isolated git worktree (for parallel agents on the same repo)")
-    inherited(chat_parser, "--accept-hooks", action="store_true", default=SUPPRESS, help=(
-        "Auto-approve any unseen shell hooks declared in config.yaml "
-        "without a TTY prompt (see also HERMES_ACCEPT_HOOKS env var and "
-        "hooks_auto_accept: in config.yaml)."))
-    add("--checkpoints", action="store_true", default=False,
-        help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)")
-    add("--max-turns", type=int, default=None, metavar="N",
-        help="Maximum tool-calling iterations per conversation turn (default: 500, or agent.max_turns in config)")
-    add("--run-budget", type=float, default=None, metavar="SECONDS", dest="run_budget", help=(
-        "Optional wall-clock budget in seconds for each conversation run. "
-        "At 80%% elapsed the agent gets a one-time wrap-up notice, and "
-        "implicit provider stale timeouts are capped to the remaining "
-        "budget so one hung call can't consume the run. Unset = off. "
-        "Also configurable as agent.run_budget_seconds in config.yaml. "
-        "Intended for one-shot/eval invocations with a hard ceiling."))
-    inherited(chat_parser, "--yolo", action="store_true", default=SUPPRESS,
-              help="Bypass all dangerous command approval prompts (use at your own risk)")
-    inherited(chat_parser, "--pass-session-id", action="store_true", default=SUPPRESS,
-              help="Include the session ID in the agent's system prompt")
-    inherited(chat_parser, "--ignore-user-config", action="store_true", default=SUPPRESS,
-              help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env are still loaded). Useful for isolated CI runs, reproduction, and third-party integrations.")
-    inherited(chat_parser, "--ignore-rules", action="store_true", default=SUPPRESS,
-              help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.")
-    inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
-              help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
-    add("--source", default=None,
-        help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
-    inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,
-              help="Launch the modern TUI instead of the classic REPL")
-    inherited(chat_parser, "--cli", action="store_true", default=SUPPRESS,
-              help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)")
-    inherited(chat_parser, "--dev", dest="tui_dev", action="store_true", default=SUPPRESS,
-              help="With --tui: run TypeScript sources via tsx (skip dist build)")
+    _query_group.add_argument(
+        "-q", "--query",
+        help=(
+            "Query to run. On a real TTY the prompt seeds an interactive "
+            "session (submitted literally as the first turn); combined with "
+            "--oneshot or -Q, or on a non-TTY, it answers and exits."
+        ),
+    )
+    _query_group.add_argument(
+        "--query-file",
+        metavar="PATH",
+        help=(
+            "Read the single query from a file instead of the command line "
+            "('-' reads stdin). Safe for arbitrary text: nothing is shell-"
+            "interpreted, so quotes, $(...), and backticks are preserved "
+            "verbatim. Mutually exclusive with -q."
+        ),
+    )
+    _query_group.add_argument(
+        "--private-worker-intake",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    chat_parser.add_argument(
+        "--oneshot",
+        dest="oneshot_exit",
+        action="store_true",
+        # Distinct dest: the top-level `-z/--oneshot PROMPT` is value-taking
+        # and its dispatch sites do `if args.oneshot: _run_and_exit_oneshot(
+        # args.oneshot)` — a shared boolean dest would be passed as the
+        # prompt. `oneshot_exit` keeps the surfaces independent.
+        default=False,
+        help=(
+            "With -q/--query-file: answer the query and exit (legacy "
+            "single-query behavior) instead of seeding an interactive "
+            "session. Implied on non-TTY stdio and by -Q/--quiet."
+        ),
+    )
+    chat_parser.add_argument(
+        "--image", help="Optional local image path to attach to a single query"
+    )
+    # `default=argparse.SUPPRESS` on flags that are ALSO declared on the
+    # top-level parser: when the user writes `hermes -m foo chat`, argparse
+    # first sets `args.model = "foo"` from the top-level parser, then
+    # dispatches to the chat subparser. Without SUPPRESS the chat subparser's
+    # own default (`None`) would silently clobber the top-level value because
+    # the subparser shares the same namespace and `dest`. SUPPRESS keeps the
+    # subparser action a no-op unless the user actually passes the flag after
+    # the subcommand. Matches the pattern already used for `-s/--skills` and
+    # the relaunch-inherited flags `-r/--resume`, `-c/--continue`,
+    # `-w/--worktree`, `--yolo`, etc. (see tests/hermes_cli/
+    # test_argparse_flag_propagation.py).
+    _inherited_flag(
+        chat_parser,
+        "-m", "--model",
+        default=argparse.SUPPRESS,
+        help="Model to use (e.g., anthropic/claude-sonnet-4)",
+    )
+    chat_parser.add_argument(
+        "-t", "--toolsets",
+        default=argparse.SUPPRESS,
+        help="Comma-separated toolsets to enable",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--reasoning",
+        default=argparse.SUPPRESS,
+        metavar="LEVEL",
+        help=(
+            "Reasoning effort for this session: none, minimal, low, medium, "
+            "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "
+            "this run only (same levels as the /reasoning slash command)."
+        ),
+    )
+    _inherited_flag(
+        chat_parser,
+        "-s",
+        "--skills",
+        action="append",
+        default=argparse.SUPPRESS,
+        help="Preload one or more skills for the session (repeat flag or comma-separate)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--provider",
+        # No `choices=` here: user-defined providers from config.yaml `providers:`
+        # are also valid values, and runtime resolution (resolve_runtime_provider)
+        # handles validation/error reporting consistently with the top-level
+        # `--provider` flag.
+        default=argparse.SUPPRESS,
+        help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    chat_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Verbose output",
+    )
+    chat_parser.add_argument(
+        "-Q",
+        "--quiet",
+        action="store_true",
+        help="Quiet mode for programmatic use: suppress banner, spinner, and tool previews. Only output the final response and session info.",
+    )
+    chat_parser.add_argument(
+        "--resume",
+        "-r",
+        metavar="SESSION_ID",
+        default=argparse.SUPPRESS,
+        help=(
+            "Resume a previous session by ID (shown on exit), or 'latest' "
+            "for the most recent session"
+        ),
+    )
+    chat_parser.add_argument(
+        "--no-restore-cwd",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Don't cd into a resumed session's recorded working directory.",
+    )
+    chat_parser.add_argument(
+        "--in",
+        dest="in_dir",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help=(
+            "Change into DIR before starting or resuming (scopes "
+            "'--resume latest' / -c lookups to DIR's workspace)."
+        ),
+    )
+    chat_parser.add_argument(
+        "--continue",
+        "-c",
+        dest="continue_last",
+        nargs="?",
+        const=True,
+        default=argparse.SUPPRESS,
+        metavar="SESSION_NAME",
+        help="Resume a session by name, or the most recent if no name given",
+    )
+    chat_parser.add_argument(
+        "--create-if-missing",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "With -c/--continue <name>: if no session matches the name, "
+            "create a new session with that title and proceed (instead of "
+            "failing with a not-found error). Programmatic callers that "
+            "want 'send to this named thread, making it if needed'."
+        ),
+    )
+    chat_parser.add_argument(
+        "--worktree",
+        "-w",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Run in an isolated git worktree (for parallel agents on the same repo)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--accept-hooks",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Auto-approve any unseen shell hooks declared in config.yaml "
+            "without a TTY prompt (see also HERMES_ACCEPT_HOOKS env var and "
+            "hooks_auto_accept: in config.yaml)."
+        ),
+    )
+    chat_parser.add_argument(
+        "--checkpoints",
+        action="store_true",
+        default=False,
+        help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)",
+    )
+    chat_parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum tool-calling iterations per conversation turn (default: 500, or agent.max_turns in config)",
+    )
+    chat_parser.add_argument(
+        "--run-budget",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        dest="run_budget",
+        help=(
+            "Optional wall-clock budget in seconds for each conversation run. "
+            "At 80%% elapsed the agent gets a one-time wrap-up notice, and "
+            "implicit provider stale timeouts are capped to the remaining "
+            "budget so one hung call can't consume the run. Unset = off. "
+            "Also configurable as agent.run_budget_seconds in config.yaml. "
+            "Intended for one-shot/eval invocations with a hard ceiling."
+        ),
+    )
+    _inherited_flag(
+        chat_parser,
+        "--yolo",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Bypass all dangerous command approval prompts (use at your own risk)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--pass-session-id",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Include the session ID in the agent's system prompt",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--ignore-user-config",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Ignore ~/.hermes/config.yaml and fall back to built-in defaults (credentials in .env are still loaded). Useful for isolated CI runs, reproduction, and third-party integrations.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--ignore-rules",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--safe-mode",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.",
+    )
+    chat_parser.add_argument(
+        "--source",
+        default=None,
+        help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--tui",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Launch the modern TUI instead of the classic REPL",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--cli",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--dev",
+        dest="tui_dev",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="With --tui: run TypeScript sources via tsx (skip dist build)",
+    )
+    # [GUS v0.21.5 port] restore the return lost in the merge (a stray copy of
+    # HermesArgumentParser._check_value sat here, so every CLI entry crashed).
     return chat_parser
 
 

@@ -1245,3 +1245,18 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
+
+
+# [GUS v0.21.5 port] One implementation per name across kanban_db and this split
+# module. Names Margot customized (vs upstream eea312f8) keep the custom kanban_db
+# version; uncustomized names keep this upstream v0.21.5 version and kanban_db
+# rebinds to it (see bottom of kanban_db.py). Prevents signature drift.
+_GUS_CUSTOM_NAMES = ('_migrate_add_optional_columns',)
+_GUS_UPSTREAM_NAMES = ('KanbanDbCorruptError', 'RepairResult', '_attempt_index_reindex_repair', '_backup_corrupt_db', '_check_file_length_invariant', '_cross_process_init_lock', '_dispatch_tick_lock', '_execute_boundary_with_retry', '_guard_existing_db_is_healthy', '_integrity_messages_ok', '_is_busy_error', '_looks_like_tls_record_at', '_maybe_checkpoint_wal', '_prune_corrupt_backups', '_rebuild_drifted_tables', '_repairable_index_names', '_resolve_busy_timeout_ms', '_run_integrity_check', '_schema_is_present', '_sqlite_connect', '_table_has_drifted', '_validate_sqlite_header', 'connect', 'connect_closing', 'init_db', 'repair_db', 'write_txn')
+for _gus_name in _GUS_CUSTOM_NAMES:
+    globals()[_gus_name] = getattr(_kb, _gus_name)
+
+# [GUS] Bind into kanban_db if this module finished importing after it.
+if hasattr(_kb, "_gus_bind_split_module"):
+    import sys as _gus_sys
+    _kb._gus_bind_split_module(_gus_sys.modules[__name__])

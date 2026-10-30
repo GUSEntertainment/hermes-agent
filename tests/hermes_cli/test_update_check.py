@@ -7,6 +7,7 @@ policy that keeps the API traffic to one request a day per install.
 """
 
 import json
+from pathlib import Path
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -78,7 +79,9 @@ def test_cache_is_daily_but_invalidated_when_head_moves(git_repo, monkeypatch):
 
     def write_cache(*, ts, head, behind):
         cache_file.write_text(json.dumps(
-            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head}))
+            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head,
+             # [GUS] cache is also keyed by the install root (release dirs never share it)
+             "install_root": str(Path(banner.__file__).parent.parent.resolve())}))
 
     write_cache(ts=time.time() - banner._UPDATE_CHECK_CACHE_SECONDS + 60, head=SHA_A, behind=3)
     assert banner.check_for_updates() == 3
@@ -158,3 +161,30 @@ def test_upstream_main_sha_ls_remote_fallback_disables_git_prompts(monkeypatch):
     assert kwargs["stdin"] is banner.subprocess.DEVNULL
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"
+
+
+# --- [GUS] custom tests carried from v0.21.0 release ---
+
+# [GUS] test_check_for_updates_uses_cache: superseded by upstream v0.21.5 HEAD-keyed cache + bounded failure-window
+# retry (covered by test_cache_is_daily_but_invalidated_when_head_moves). See CUTOVER/REPORT.md.
+
+
+
+# [GUS] test_check_via_local_git_fetch_failure_returns_none: superseded - upstream v0.21.5 passive check never runs git fetch
+# (GitHub API tip compare); fetch-failure paths no longer exist. See CUTOVER/REPORT.md.
+
+
+
+# [GUS] test_check_via_local_git_fetch_failure_keeps_positive_stale_count: superseded - upstream v0.21.5 passive check never runs git fetch
+# (GitHub API tip compare); fetch-failure paths no longer exist. See CUTOVER/REPORT.md.
+
+
+
+# [GUS] test_check_via_local_git_fetch_failure_rev_list_error_returns_none: superseded - upstream v0.21.5 passive check never runs git fetch
+# (GitHub API tip compare); fetch-failure paths no longer exist. See CUTOVER/REPORT.md.
+
+
+
+# [GUS] test_check_for_updates_does_not_cache_none: superseded by upstream v0.21.5 HEAD-keyed cache + bounded failure-window
+# retry (covered by test_cache_is_daily_but_invalidated_when_head_moves). See CUTOVER/REPORT.md.
+

@@ -126,6 +126,7 @@ from agent.auxiliary_health import (
 )
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
+    pool_cooldown_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -2104,31 +2105,26 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Valid, non-expired Codex OAuth access token; an exhausted pool falls back to the profile's auth.json token."""
+    """Resolve auxiliary Codex auth through the same OAuth lifecycle as chat.
+
+    Keep pool selection first. A missing/invalidated singleton or an expired
+    token must use Hermes's existing recovery/refresh path rather than look
+    for a fictitious OPENAI-CODEX_API_KEY. The runtime resolver respects the
+    active Hermes home, preserves refresh locking, and can adopt an already
+    valid Codex CLI login without modifying that CLI's credential file.
+    """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
     try:
-        from hermes_cli.auth import _read_codex_tokens
-        access_token = _read_codex_tokens().get("tokens", {}).get("access_token")
-        if not isinstance(access_token, str) or not access_token.strip():
-            return None
-        # Expired JWTs would block the auto chain and prevent fallback to working providers.
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error — use as-is
-        return access_token.strip()
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+        runtime = resolve_codex_runtime_credentials()
+        token = runtime.get("api_key")
+        return token.strip() if isinstance(token, str) and token.strip() else None
     except Exception as exc:
-        logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
+        logger.debug("Could not resolve Codex OAuth for auxiliary client: %s", exc)
         return None
 
 
@@ -7219,6 +7215,14 @@ def _resolve_call_client(
                     task, _explicit)
                 if fb_client is None:
                     nous_detail = nous_credential_failure_detail() if _explicit == "nous" else None
+                    if _explicit == "openai-codex" and not pool_cooldown_message(_explicit):
+                        # [GUS custom, carried from compression-oauth-recovery] Codex runs on
+                        # the existing ChatGPT login: reconnect it, never add a second
+                        # credential or ask for an API key nothing reads.
+                        raise AuxiliaryClientUnavailable(
+                            "Codex OAuth login is unavailable for the auxiliary task. "
+                            "Run `hermes auth` to reconnect the existing ChatGPT login, "
+                            "or select another auxiliary provider.")
                     raise AuxiliaryClientUnavailable(
                         nous_detail or missing_provider_credentials_message(_explicit))
                 client, final_model = fb_client, fb_model
@@ -7804,12 +7808,21 @@ def call_llm(
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
-        semaphore.acquire()
+        # A cancelled compressor must leave the queue without consuming a
+        # future permit or dispatching a stale summary request.
+        while True:
+            if _aux_interrupt_protected() and _aux_interrupt_cancel_requested():
+                raise AuxiliaryExplicitCancellation()
+            if semaphore.acquire(timeout=0.1):
+                break
     request_started_at = time.monotonic()
     if latency_info is not None:
         latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
     prior_progress_hook = getattr(_aux_progress, "hook", None)
     try:
+        # Cancellation can race permit acquisition. Release via finally.
+        if _aux_interrupt_protected() and _aux_interrupt_cancel_requested():
+            raise AuxiliaryExplicitCancellation()
         with (
             scoped_runtime_main(main_runtime),
             aux_progress_hook(

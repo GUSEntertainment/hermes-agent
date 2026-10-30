@@ -1195,3 +1195,143 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_create_inherits_authorization_from_current_parent_task(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "planner")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        body = kb.append_authorization_continuity_to_body(
+            "Parent task body.",
+            {
+                "authorized": True,
+                "scope": "Complete the staged Kanban fix only.",
+                "authorized_by": "Chris",
+                "allowed_actions": ["implementation", "verification"],
+                "blocked_actions": ["live restart"],
+            },
+        )
+        parent = kb.create_task(conn, title="parent", body=body, assignee="planner")
+        kb.claim_task(conn, parent)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    out = json.loads(kt._handle_create({
+        "title": "child",
+        "assignee": "worker",
+        "body": "Implement a bounded subpiece.",
+        "parents": [parent],
+    }))
+
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        child = kb.get_task(conn, out["task_id"])
+        assert "kanban_authorization_continuity" in child.body
+        ctx = kb.build_worker_context(conn, child.id)
+    assert "Chris already authorized this outcome chain" in ctx
+    assert "Complete the staged Kanban fix only." in ctx
+    assert f"Inherited from task(s): {parent}" in ctx
+
+
+def test_create_rejects_authorization_scope_expansion(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "planner")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        kb.claim_task(conn, parent)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    out = json.loads(kt._handle_create({
+        "title": "child",
+        "assignee": "worker",
+        "body": "This widens the audience.",
+        "parents": [parent],
+        "authorization_continuity": {
+            "authorized": True,
+            "scope": "Original private staging work.",
+            "scope_expansion": True,
+        },
+    }))
+
+    assert "error" in out
+    assert "scope expansion" in out["error"]
+
+
+def test_generated_readiness_show_is_bounded_without_hiding_authority(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        original = kb.create_task(
+            conn, title="original", body="authoritative requirements " * 200,
+            assignee="test-worker", tenant="private",
+        )
+        prep = kb.create_task(
+            conn,
+            title="Prepare worker access: " + original,
+            body='repair\n```worker-requirements\n{"toolsets":["file","kanban"]}\n```',
+            assignee="test-worker", created_by="worker-readiness", tenant="private",
+        )
+        conn.execute(
+            "INSERT INTO task_links(parent_id,child_id,edge_role) VALUES(?,?,'dependency')",
+            (prep, original),
+        )
+        kb._append_event(conn, prep, "readiness_preparation_for", {"task_id": original})
+        for index in range(30):
+            kb._append_event(conn, prep, "diagnostic", {"index": index, "detail": "x" * 300})
+            kb.add_comment(conn, prep, "test-worker", f"comment {index} " + "y" * 200)
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", prep)
+    monkeypatch.delenv("HERMES_KANBAN_REQUEST_TOKEN_LIMIT", raising=False)
+    full_raw = kt._handle_show({"task_id": prep})
+    full = json.loads(full_raw)
+
+    monkeypatch.setenv("HERMES_KANBAN_REQUEST_TOKEN_LIMIT", "32000")
+    bounded_raw = kt._handle_show({"task_id": prep})
+    bounded = json.loads(bounded_raw)
+
+    assert bounded["task"] == full["task"]
+    assert bounded["owner_cell"] == full["owner_cell"]
+    assert bounded["owner_workflow"] == full["owner_workflow"]
+    assert bounded["parents"] == full["parents"]
+    assert bounded["children"] == full["children"]
+    assert bounded["history_window"]["readiness_binding"] == {"task_id": original}
+    assert bounded["history_window"]["truncated"] is True
+    assert bounded["history_window"]["events"] == {"shown": 10, "total": 62}
+    assert bounded["history_window"]["comments"] == {"shown": 3, "total": 30}
+    assert bounded["worker_context"] is None
+    assert len(bounded_raw) < len(full_raw) * 0.5
+
+
+def test_request_limit_does_not_compact_ordinary_worker_show(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_REQUEST_TOKEN_LIMIT", raising=False)
+    ordinary = kt._handle_show({})
+    monkeypatch.setenv("HERMES_KANBAN_REQUEST_TOKEN_LIMIT", "32000")
+    still_ordinary = kt._handle_show({})
+    assert still_ordinary == ordinary
+

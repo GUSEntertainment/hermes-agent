@@ -8,10 +8,31 @@ Usage:
     hermes <cmd> --help        # Per-command help
 """
 
-# hermes_bootstrap must be the very first import — it sets up UTF-8 stdio on
-# Windows (no-op on POSIX). Guarded: after a ``git pull`` / interrupted
-# ``hermes update`` the editable install's ``.pth`` may not list it yet; crashing
-# here would block ``hermes update``.
+# Pin this checkout before importing any Hermes module. In direct-script
+# mode sys.path[0] is hermes_cli/, and a shared venv may still have an
+# editable install pointing at an older release. Pinning later leaves that
+# old package cached and can run incompatible database migrations.
+import os
+import sys
+
+_bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _bootstrap_root in sys.path:
+    sys.path.remove(_bootstrap_root)
+sys.path.insert(0, _bootstrap_root)
+
+# IMPORTANT: hermes_bootstrap is the first Hermes import — it sets up
+# UTF-8 stdio on Windows so print()/subprocess children don't hit
+# UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
+#
+# Guarded against ModuleNotFoundError because ``hermes_bootstrap`` is a
+# top-level module registered via pyproject.toml's ``py-modules`` list.
+# When the user upgrades code via ``git pull`` (or ``hermes update``
+# crashes between ``git reset --hard`` and ``uv pip install -e .``), the
+# new code references ``hermes_bootstrap`` but the editable install's
+# ``.pth`` file still points at the old set of top-level modules.  Without
+# this guard, hermes crashes on import and the user can't run
+# ``hermes update`` to recover.  Missing the bootstrap means UTF-8 stdio
+# setup is skipped on Windows — degraded, not broken.  POSIX is unaffected.
 try:
     import hermes_bootstrap  # noqa: F401
 except ModuleNotFoundError:
@@ -34,15 +55,8 @@ from hermes_cli._subprocess_compat import suppress_platform_ver_console
 
 suppress_platform_ver_console()
 
-import os
 import re
-import sys
-
-# Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
-# is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
-_bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
-if _bootstrap_root not in sys.path:
-    sys.path.insert(0, _bootstrap_root)
+# Startup fast-path helpers use the checkout pinned above.
 from hermes_cli import _startup_fast  # noqa: E402
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute
@@ -1789,6 +1803,10 @@ _CHAT_PASSTHROUGH = (
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    if getattr(args, "private_worker_intake", False):
+        # Suppress before reading/parsing private bytes.
+        from agent.private_worker_mode import consume_private_worker_intake
+        args.query = consume_private_worker_intake()
     _apply_safe_mode(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)

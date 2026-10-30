@@ -254,6 +254,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
+            if part.lower().startswith("margot-app:"):
+                continue  # local app store; owner-checked at send time (t_9f210be5)
             platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None

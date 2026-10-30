@@ -22,6 +22,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import pytest
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -93,6 +94,44 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
     return agent
 
 
+@pytest.mark.parametrize('compression_succeeds', [True, False])
+def test_kanban_request_guard_compresses_before_exit(monkeypatch, tmp_path, compression_succeeds):
+    agent = _make_agent(monkeypatch, tmp_path, max_attempts=2)
+    monkeypatch.setenv('HERMES_KANBAN_TASK','t_synthetic')
+    monkeypatch.setenv('HERMES_KANBAN_TOTAL_TOKEN_LIMIT','120000')
+    monkeypatch.setenv('HERMES_KANBAN_REQUEST_TOKEN_LIMIT','32000')
+    pressure = {'tokens': 40000}
+    attempts = []
+    def compact(messages, system_message, **kwargs):
+        attempts.append(pressure['tokens'])
+        if compression_succeeds:
+            pressure['tokens'] = 1000
+        return list(messages), 'Preserved system instructions'
+    history = [{'role':'user' if i % 2 == 0 else 'assistant', 'content':f'context {i}'} for i in range(60)]
+    agent.client.chat.completions.create.return_value = _stop_response()
+    with (
+        patch('agent.turn_context.estimate_request_tokens_rough',return_value=1000),
+        patch('agent.conversation_loop._midturn_request_pressure_tokens',side_effect=lambda *a:pressure['tokens']),
+        patch('agent.conversation_loop.anchored_context_tokens',return_value=None),
+        patch.object(agent.context_compressor,'should_compress',side_effect=lambda n:n>=25600),
+        patch.object(agent.context_compressor,'should_defer_preflight_to_real_usage',return_value=False),
+        patch.object(agent,'_compress_context',side_effect=compact),
+        patch.object(agent,'_persist_session'),patch.object(agent,'_save_trajectory'),
+        patch.object(agent,'_cleanup_task_resources'),
+        patch('agent.kanban_stop.build_kanban_stop_nudge',return_value=None),
+        patch('hermes_cli.kanban_completion.record_worker_budget_exit') as exited,
+    ):
+        result=agent.run_conversation('Continue the task',conversation_history=history)
+    assert attempts and len(attempts)<=2
+    if compression_succeeds:
+        assert result['completed'] is True
+        exited.assert_not_called()
+        assert agent.client.chat.completions.create.call_count == 1
+    else:
+        agent.client.chat.completions.create.assert_not_called()
+        exited.assert_called_once_with('kanban_request_token_budget')
+
+
 def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
     # Config-driven attach seam (agent_init) resolved the raised cap.
@@ -148,5 +187,3 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
         f"got {len(compress_calls)} passes"
     )
     assert len(compress_calls) == 6
-
-

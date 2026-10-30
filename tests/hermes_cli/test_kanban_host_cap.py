@@ -49,6 +49,30 @@ def _fake_spawn_factory(spawns: list):
     return fake_spawn
 
 
+def _admission_spawn_factory(spawns: list):
+    def fake_spawn(task, workspace, board=None, admission_contract=None):
+        assert admission_contract is not None
+        spawns.append(task.id)
+        return 42
+    return fake_spawn
+
+
+def _install_worker_profile(home: Path, name: str, *, reviewer: bool = False) -> None:
+    profile = home / "profiles" / name
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "model:\n  provider: anthropic\n  default: claude-test\n",
+        encoding="utf-8",
+    )
+    if reviewer:
+        skill = profile / "skills" / "sdlc-review"
+        skill.mkdir(parents=True)
+        skill.joinpath("SKILL.md").write_text(
+            "---\nname: sdlc-review\ndescription: Review tests.\n---\nReview.\n",
+            encoding="utf-8",
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. Standalone daemon resolves max_in_progress (P1a)
 # ---------------------------------------------------------------------------
@@ -168,9 +192,18 @@ def test_count_running_tasks_other_boards_fails_open(
     assert kbd.count_running_tasks_other_boards() == 0
 
 
-def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
+def test_max_spawn_stays_per_board(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")
+    monkeypatch.setattr(
+        kb,
+        "_build_worker_admission",
+        lambda *a, **k: pytest.fail(
+            "public legacy callbacks must not require worker admission"
+        ),
+    )
     with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
@@ -206,6 +239,8 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
         cfgmod, "load_config",
         lambda *a, **k: {"kanban": {"review_dispatch": True}},
     )
+    _install_worker_profile(kanban_home, "alice")
+    _install_worker_profile(kanban_home, "reviewer", reviewer=True)
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -348,6 +383,8 @@ def test_review_budget_still_bounded_by_shared_cap(
         cfgmod, "load_config",
         lambda *a, **k: {"kanban": {"review_dispatch": True}},
     )
+    _install_worker_profile(kanban_home, "alice")
+    _install_worker_profile(kanban_home, "reviewer", reviewer=True)
 
     spawns: list = []
     with kbc.connect() as conn:

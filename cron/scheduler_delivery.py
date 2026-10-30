@@ -219,6 +219,26 @@ def _maybe_mirror_cron_delivery(
     if not text:
         return
     try:
+        from gateway.mirror import find_owner_dm_session, mirror_proactive_message
+
+        # [GUS custom] Owner 1:1 DM (Photon/iMessage, Telegram private, app): the cron text is
+        # Margot speaking to the owner, so it lands as an ASSISTANT turn with a hidden provenance
+        # note in the exact live DM session (live failure 2026-09-30, job 777fb73703cc).
+        dm_session = find_owner_dm_session(platform_name, str(chat_id), thread_id)
+        if dm_session:
+            ok = mirror_proactive_message(
+                platform_name, str(chat_id), text,
+                source="cron job",
+                ref=f"'{job.get('name') or job.get('id', 'cron')}' ({job.get('id', '?')})",
+                thread_id=thread_id, session_id=dm_session,
+            )
+            if ok:
+                logger.info(
+                    "Job '%s': mirrored proactive delivery into owner DM session %s",
+                    job.get("id", "?"), dm_session,
+                )
+                return
+
         from gateway.mirror import mirror_to_session
         # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
         # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
@@ -621,8 +641,21 @@ def _resolve_single_delivery_target(
     bot_chat_profile = parse_bot_chat_deliver_token(deliver_value)
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
+    # t_9f210be5: Margot app thread (owner-bound; checked again at send time).
+    from cron import margot_app_delivery as _mad
+    try:
+        _app = _mad.parse_token(deliver_value)
+    except ValueError as exc:
+        logger.warning("Invalid cron delivery target '%s': %s", deliver_value, exc)
+        return None
+    if _app is not None:
+        return {"platform": _mad.MARGOT_APP_PLATFORM, "chat_id": _app[0], "thread_id": _app[1],
+                "_resolved_from": "explicit"}
 
     if deliver_value == "origin":
+        if origin and str(origin.get("platform") or "").lower() == _mad.MARGOT_APP_PLATFORM:
+            return {"platform": _mad.MARGOT_APP_PLATFORM, "chat_id": str(origin["chat_id"]),
+                    "thread_id": str(origin.get("thread_id") or ""), "_resolved_from": "origin"}
         if origin:
             return {
                 "platform": origin["platform"],
@@ -1800,6 +1833,15 @@ def _prepare_target_delivery(
     origin_target = _target_matches_origin(origin, platform_name, chat_id, thread_id)
     mirror_this_target = mirror_enabled and _target_mirror_eligible(
         job, target, global_mirror=mirror_enabled, origin_match=origin_target)
+    # [GUS custom] Owner DM targets ALWAYS receive the proactive transcript entry (unless the job
+    # opts out with attach_to_session=false): a proactive message the owner can reply to must be in context.
+    if not mirror_this_target and job.get("attach_to_session") is not False:
+        try:
+            from gateway.mirror import find_owner_dm_session
+            if find_owner_dm_session(platform_name, str(chat_id), thread_id):
+                mirror_this_target = True
+        except Exception:
+            pass
     # Resolved for ANY origin match (not just mirror-enabled): the in_channel seed needs it too.
     origin_user_id = origin.get("user_id") if origin_target else None
 
@@ -1925,7 +1967,7 @@ def _deliver_result(
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
+            and any(target["platform"] not in (BOT_CHAT_PLATFORM, "margot-app") for target in targets)):
         from cron.delivery_queue import enqueue_and_wait
 
         _record_delivery_verification(job, [])
@@ -2028,6 +2070,14 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            continue
+
+        # t_9f210be5: post straight into the owner's Margot app thread.
+        if target["platform"] == "margot-app":
+            from cron import margot_app_delivery as _mad
+            app_error = _mad.deliver(job, content, target["chat_id"], target.get("thread_id") or "")
+            if app_error:
+                delivery_errors.append(app_error)
             continue
 
         t = _prepare_target_delivery(

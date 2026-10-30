@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import pytest
 
+# Explicit dedicated fake control-plane lane: every lifecycle command in this
+# file is routed to tmp_path scandirs and monkeypatched subprocess fixtures.
+pytestmark = pytest.mark.fake_control_plane
+
 from hermes_cli.service_manager import (
     S6ServiceManager,
 )

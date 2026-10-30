@@ -78,6 +78,14 @@ def terminal_env(name: str, default: str = "") -> str:
     No scope: process env, then *default*. Refusal scope: raise. Policy scope: ONLY the
     policy; a missing key yields *default*, never os.environ.
     """
+    # [GUS v0.21.5 port] Caller-scoped (Connor/Josh) host-tool authority wins over
+    # both the upstream profile scope and ambient env; it fails closed with
+    # PermissionError for unknown/misconfigured callers (privacy wall).
+    from gateway.host_tool_authority import terminal_environment
+    caller = terminal_environment()
+    if caller is not None:
+        value = caller.get(name)
+        return default if value is None else str(value)
     scope = _terminal_scope_var.get()
     if scope is None:
         return os.environ.get(name, default)

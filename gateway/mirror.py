@@ -73,8 +73,102 @@ def mirror_to_session(
         return False
 
 
-def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
-    """Active session_id for a platform + chat_id pair.
+def format_proactive_note(source: str, ref: Optional[str] = None) -> str:
+    """Short hidden provenance note prefixed to a mirrored proactive message.
+
+    Kept terse and bracketed so the model reads it as metadata about where the
+    message came from (job / thread / email id) rather than text it said aloud.
+    """
+    src = str(source or "proactive").strip()
+    tail = f" {str(ref).strip()}" if ref else ""
+    return f"[sent proactively via {src}{tail}; not a reply to the previous message]"
+
+
+def find_owner_dm_session(
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return the live 1:1 (dm) gateway session for this chat, else None.
+
+    Proactive messages to an owner's DM (Photon/iMessage, Telegram private
+    chat, app) must land in that conversation regardless of how a cron or
+    background job addressed the chat (origin, home channel, bare platform,
+    explicit id). Restricting to ``chat_type='dm'`` keeps group/broadcast
+    targets out — those still follow the opt-in rules.
+    """
+    if not platform or chat_id in (None, ""):
+        return None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            session_id = db.find_session_by_origin(
+                platform=platform, chat_id=str(chat_id), thread_id=thread_id,
+            )
+            if not session_id:
+                return None
+            with db._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT chat_type FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+            if row and str(row[0] or "").lower() == "dm":
+                return str(session_id)
+            return None
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug("Owner DM session lookup failed for %s:%s: %s", platform, chat_id, e)
+        return None
+
+
+def mirror_proactive_message(
+    platform: str,
+    chat_id: str,
+    message_text: str,
+    *,
+    source: str,
+    ref: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> bool:
+    """Write an outbound proactive message into the owner's live session.
+
+    Used by cron deliveries, delegated-work (Kanban) return notes and email
+    alerts so the owner's next reply on that channel has the message in
+    context. Lands as an ASSISTANT turn (it is Margot speaking); consecutive
+    assistant turns are merged by repair_message_sequence pass 0, so this is
+    alternation-safe. Never creates a session and never raises.
+    """
+    try:
+        text = (message_text or "").strip()
+        if not text:
+            return False
+        return mirror_to_session(
+            platform,
+            str(chat_id),
+            f"{format_proactive_note(source, ref)}\n{text}",
+            source_label=f"proactive:{source}",
+            thread_id=thread_id,
+            user_id=user_id,
+            role="assistant",
+            session_id=session_id,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Proactive mirror failed for %s:%s: %s", platform, chat_id, e)
+        return False
+
+
+def _find_session_id(
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Find the active session_id for a platform + chat_id pair.
 
     state.db is primary; sessions.json is the pre-migration fallback.  DM keys
     don't embed the chat_id ("agent:main:telegram:dm"), so match on the persisted

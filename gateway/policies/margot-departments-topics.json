@@ -1,0 +1,832 @@
+{
+  "schema_version": 3,
+  "routing_version": "margot-os-inbound-v2",
+  "updated_at": "2026-07-10T22:15:00Z",
+  "generated_by": "t_2188e257",
+  "chat_title": "Margot OS",
+  "chat_id": "-1004479003480",
+  "purpose": "Canonical generated source for Margot OS inbound topic routing and outbound report-back projection. Topic ID is authoritative; aliases are display/search-only.",
+  "tenant": "chris-home",
+  "canonical_key_fields": [
+    "chat_id",
+    "message_thread_id"
+  ],
+  "source_route_template": {
+    "source_surface": "telegram_topic",
+    "source_chat_id": "-1004479003480",
+    "source_thread_id": "{topic_id}",
+    "source_message_id": "{message_id}"
+  },
+  "return_route_template": {
+    "return_surface": "telegram:-1004479003480:{topic_id}",
+    "callback_chat_id": "-1004479003480",
+    "callback_thread_id": "{topic_id}",
+    "desk_first": true
+  },
+  "routing_invariants": {
+    "topic_id_over_alias": true,
+    "specialist_work_on_default_forbidden": true,
+    "unknown_topic_behavior": "fail_closed_to_minimal_routing_issue_without_raw_text",
+    "unverified_topic_behavior": "fail_closed_pending_chris_ping",
+    "missing_required_profile_or_reviewer_behavior": "draft_or_evidence_only_unapproved",
+    "post_review_substantive_edit_reopens_review": true,
+    "legacy_aliases_are_migration_read_only": true,
+    "silent_fallback_for_critical_paths": false
+  },
+  "privacy_policy": {
+    "sensitive_tiers": [
+      "legal",
+      "finance",
+      "personnel",
+      "family",
+      "restricted"
+    ],
+    "raw_sensitive_input_storage": "minimum-retention private intake handle only",
+    "raw_sensitive_team_topic_mirroring": false,
+    "team_topic_callback_content": "redacted status or approval packet only",
+    "privacy_wall_change_requires_human_approval": true
+  },
+  "blocked_on_chris_ping": [
+    {
+      "topic_id": 49,
+      "department_id": "watchdog_health",
+      "required_action": "one harmless inbound ping to verify message_thread_id"
+    },
+    {
+      "topic_id": 50,
+      "department_id": "personal_family",
+      "required_action": "one harmless inbound ping to verify message_thread_id"
+    },
+    {
+      "topic_id": 51,
+      "department_id": "claude_review",
+      "required_action": "one harmless inbound ping to verify message_thread_id"
+    }
+  ],
+  "report_back_policy": {
+    "canonical_surface": "Desk/Kanban",
+    "telegram_mirror_events": [
+      "completed",
+      "blocked",
+      "needs_approval"
+    ],
+    "suppress": [
+      "heartbeat",
+      "retry",
+      "child_created",
+      "internal_comment",
+      "worker_churn"
+    ],
+    "sensitive_default": "redacted_summary_only"
+  },
+  "owner_cell_v1": {
+    "enabled": false,
+    "shadow_router": true,
+    "legacy_topic_projection": "unchanged while disabled",
+    "owner_fields": [
+      "role_alias",
+      "runtime_profile",
+      "security_realm",
+      "capability_bundle"
+    ],
+    "frontstage_events": [
+      "goal_blocked",
+      "decision_required",
+      "goal_completed",
+      "long_running_milestone"
+    ],
+    "internal_events_suppressed_when_enabled": [
+      "created",
+      "claimed",
+      "heartbeat",
+      "review_requested",
+      "request_changes",
+      "worker_churn"
+    ],
+    "privacy_rule": "route and callback must remain in the source security realm"
+  },
+  "topics": [
+    {
+      "topic_id": 1,
+      "department_id": "general",
+      "department": "General",
+      "aliases": [
+        "Margot OS General"
+      ],
+      "voice_label": "Margot",
+      "front_door_profile": "default",
+      "runtime_assignee": "default",
+      "maker_profiles": [
+        "default"
+      ],
+      "required_reviewers": [
+        "default"
+      ],
+      "tier_path": [
+        "Astra"
+      ],
+      "privacy_tier": "founders",
+      "approval_gates": [
+        "external_send",
+        "payment",
+        "signature",
+        "deploy",
+        "restart",
+        "config",
+        "destructive"
+      ],
+      "workflow": {
+        "kind": "command_only",
+        "default_may_execute": "bounded_command_work_only"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 7,
+      "department_id": "chief_of_staff",
+      "department": "Chief of Staff",
+      "aliases": [
+        "Margot",
+        "Hub"
+      ],
+      "voice_label": "Margot",
+      "front_door_profile": "default",
+      "runtime_assignee": "default",
+      "maker_profiles": [
+        "default"
+      ],
+      "required_reviewers": [
+        "claire"
+      ],
+      "tier_path": [
+        "Astra"
+      ],
+      "privacy_tier": "founders",
+      "approval_gates": [
+        "external_send",
+        "payment",
+        "signature",
+        "deploy",
+        "restart",
+        "config",
+        "destructive"
+      ],
+      "workflow": {
+        "kind": "command_router",
+        "default_may_execute": "bounded_intake_only",
+        "complex_package_profile": "claire"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 9,
+      "department_id": "research",
+      "department": "Research",
+      "aliases": [
+        "Intelligence",
+        "Riley"
+      ],
+      "voice_label": "Riley",
+      "front_door_profile": "riley",
+      "runtime_assignee": "riley",
+      "maker_profiles": [
+        "riley"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "logged_in_private_pull",
+        "external_send"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "citation_verification_required": true
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 11,
+      "department_id": "engineering_systems",
+      "department": "Engineering + Systems",
+      "aliases": [
+        "Engineering",
+        "Systems",
+        "Scarlett"
+      ],
+      "voice_label": "Scarlett",
+      "front_door_profile": "scarlett",
+      "runtime_assignee": "scarlett",
+      "maker_profiles": [
+        "scarlett"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "deploy",
+        "restart",
+        "config",
+        "destructive",
+        "package_update"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "live_reliability_reviewer": "ingrid"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 13,
+      "department_id": "content_social",
+      "department": "Content + Social",
+      "aliases": [
+        "Content",
+        "Social",
+        "Geneva"
+      ],
+      "voice_label": "Geneva",
+      "front_door_profile": "geneva",
+      "runtime_assignee": "geneva",
+      "maker_profiles": [
+        "geneva",
+        "dakota"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "public_post",
+        "paid_boost",
+        "brand_sensitive_claim",
+        "external_send"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "post_media_maker": "dakota"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 15,
+      "department_id": "creative_media",
+      "department": "Creative + Media",
+      "aliases": [
+        "Creative",
+        "Media",
+        "Dakota"
+      ],
+      "voice_label": "Dakota",
+      "front_door_profile": "dakota",
+      "runtime_assignee": "dakota",
+      "maker_profiles": [
+        "dakota",
+        "geneva"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "public_post",
+        "external_delivery",
+        "delete_or_move_originals",
+        "paid_render"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "strategy_maker": "geneva"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 17,
+      "department_id": "assistant_ops",
+      "department": "Assistant Ops",
+      "aliases": [
+        "Admin",
+        "Logistics",
+        "Lauren",
+        "Ops"
+      ],
+      "voice_label": "Lauren",
+      "front_door_profile": "lauren",
+      "runtime_assignee": "lauren",
+      "maker_profiles": [
+        "lauren"
+      ],
+      "required_reviewers": [
+        "claire"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "external_send",
+        "external_calendar_invite",
+        "purchase",
+        "account_change",
+        "sensitive_personal_data"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "routine_bypass_claire": true
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 19,
+      "department_id": "hiring_people",
+      "department": "Hiring + People",
+      "aliases": [
+        "People",
+        "Hiring",
+        "Harper"
+      ],
+      "voice_label": "Harper",
+      "front_door_profile": "harper",
+      "runtime_assignee": "harper",
+      "maker_profiles": [
+        "harper",
+        "lauren"
+      ],
+      "required_reviewers": [
+        "claire"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "personnel",
+      "approval_gates": [
+        "offer",
+        "rejection",
+        "compensation",
+        "spend",
+        "external_outreach_send"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "callbacks": "redacted_only"
+      },
+      "report_back_policy": "redacted_summary_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 21,
+      "department_id": "finance",
+      "department": "Finance",
+      "aliases": [
+        "Accounting",
+        "Maya",
+        "Jennifer"
+      ],
+      "voice_label": "Maya",
+      "front_door_profile": "maya",
+      "runtime_assignee": "maya",
+      "maker_profiles": [
+        "maya",
+        "riley",
+        "lauren"
+      ],
+      "required_reviewers": [
+        "claude-review"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "finance",
+      "approval_gates": [
+        "payment",
+        "banking",
+        "tax_claim",
+        "share_full_financials",
+        "external_send"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "callbacks": "redacted_only",
+        "visibility_gate": "Chris/Connor"
+      },
+      "report_back_policy": "redacted_summary_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 23,
+      "department_id": "legal",
+      "department": "Legal",
+      "aliases": [
+        "Legal Assistant",
+        "Compliance",
+        "Steven",
+        "Signer"
+      ],
+      "voice_label": "Steven",
+      "front_door_profile": "steven",
+      "runtime_assignee": "steven",
+      "maker_profiles": [
+        "legal-drafter"
+      ],
+      "required_reviewers": [
+        "steven",
+        "claude-review"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "legal",
+      "approval_gates": [
+        "legal_commitment",
+        "signature",
+        "counsel_send",
+        "external_send"
+      ],
+      "workflow": {
+        "kind": "legal_senior_junior_senior",
+        "steps": [
+          {
+            "profile": "steven",
+            "role": "package_author"
+          },
+          {
+            "profile": "legal-drafter",
+            "role": "draft_maker",
+            "display_identity": "Avery"
+          },
+          {
+            "profile": "steven",
+            "role": "exact_artifact_reviewer"
+          }
+        ],
+        "optional_claude_review": "policy_required_redacted_only",
+        "optional_fable": "explicit_manual_redacted_only",
+        "human_gate": "Chris/counsel"
+      },
+      "report_back_policy": "redacted_summary_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 25,
+      "department_id": "data_analytics",
+      "department": "Data + Analytics",
+      "aliases": [
+        "Data",
+        "Analytics",
+        "Sydney"
+      ],
+      "voice_label": "Riley",
+      "front_door_profile": "riley",
+      "runtime_assignee": "riley",
+      "maker_profiles": [
+        "riley",
+        "geneva",
+        "scarlett"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "private_data_exposure",
+        "financial_data_exposure",
+        "personnel_data_exposure"
+      ],
+      "workflow": {
+        "kind": "subtype_specialist",
+        "subtypes": {
+          "provenance_heavy": "riley",
+          "content_analytics": "geneva",
+          "analytics_tooling": "scarlett"
+        }
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 27,
+      "department_id": "mission_control",
+      "department": "Mission Control",
+      "aliases": [
+        "Operations",
+        "Claire",
+        "Ops"
+      ],
+      "voice_label": "Claire",
+      "front_door_profile": "claire",
+      "runtime_assignee": "claire",
+      "maker_profiles": [
+        "claire",
+        "lauren",
+        "scarlett",
+        "ingrid",
+        "maya",
+        "harper",
+        "geneva",
+        "dakota"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol or existing deterministic utility",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "deploy",
+        "restart",
+        "config",
+        "destructive",
+        "external_send"
+      ],
+      "workflow": {
+        "kind": "package_and_route",
+        "routine_workers": [
+          "lauren",
+          "scarlett",
+          "ingrid",
+          "maya",
+          "harper",
+          "geneva",
+          "dakota"
+        ]
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 29,
+      "department_id": "agent_infrastructure",
+      "department": "Agent Infrastructure",
+      "aliases": [
+        "Infra",
+        "Agents",
+        "Infrastructure"
+      ],
+      "voice_label": "Scarlett",
+      "front_door_profile": "scarlett",
+      "runtime_assignee": "scarlett",
+      "maker_profiles": [
+        "scarlett",
+        "ingrid"
+      ],
+      "required_reviewers": [
+        "grace",
+        "ingrid"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "config",
+        "restart",
+        "deploy",
+        "system_update",
+        "destructive"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "incident_evidence": "ingrid"
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 31,
+      "department_id": "approvals",
+      "department": "Approvals",
+      "aliases": [
+        "Approval Queue"
+      ],
+      "voice_label": "Margot",
+      "front_door_profile": "default",
+      "runtime_assignee": "default",
+      "maker_profiles": [
+        "default"
+      ],
+      "required_reviewers": [
+        "default"
+      ],
+      "tier_path": [
+        "Astra"
+      ],
+      "privacy_tier": "approval_gate",
+      "approval_gates": [
+        "human_approval_required"
+      ],
+      "workflow": {
+        "kind": "command_only",
+        "default_may_execute": "resume_owned_task_after_human_decision"
+      },
+      "report_back_policy": "approval_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 33,
+      "department_id": "reports",
+      "department": "Reports",
+      "aliases": [
+        "Digests",
+        "Report"
+      ],
+      "voice_label": "Margot",
+      "front_door_profile": "default",
+      "runtime_assignee": "default",
+      "maker_profiles": [
+        "default"
+      ],
+      "required_reviewers": [
+        "default"
+      ],
+      "tier_path": [
+        "Astra"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "sensitive_raw_artifact"
+      ],
+      "workflow": {
+        "kind": "command_only",
+        "default_may_execute": "approved_summary_aggregation_only"
+      },
+      "report_back_policy": "digest_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "verified"
+    },
+    {
+      "topic_id": 49,
+      "department_id": "watchdog_health",
+      "department": "Watchdog Health",
+      "aliases": [
+        "Health",
+        "Monitor",
+        "Ingrid"
+      ],
+      "voice_label": "Ingrid",
+      "front_door_profile": "ingrid",
+      "runtime_assignee": "ingrid",
+      "maker_profiles": [
+        "ingrid",
+        "scarlett"
+      ],
+      "required_reviewers": [
+        "grace"
+      ],
+      "tier_path": [
+        "existing lightweight monitor",
+        "Astra owner / Sol repair"
+      ],
+      "privacy_tier": "team",
+      "approval_gates": [
+        "restart",
+        "config",
+        "destructive"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "engineering_repair": "scarlett",
+        "autonomous_broad_restart": false
+      },
+      "report_back_policy": "milestone_only",
+      "auto_topic_post_allowed": true,
+      "discovery_confidence": "candidate_requires_ping"
+    },
+    {
+      "topic_id": 50,
+      "department_id": "personal_family",
+      "department": "Personal Logistics",
+      "aliases": [
+        "Family",
+        "Sienna",
+        "Julia"
+      ],
+      "voice_label": "Julia",
+      "front_door_profile": "julia",
+      "runtime_assignee": "julia",
+      "maker_profiles": [
+        "julia"
+      ],
+      "required_reviewers": [
+        "default"
+      ],
+      "tier_path": [
+        "Astra",
+        "Sol",
+        "Astra"
+      ],
+      "privacy_tier": "family",
+      "approval_gates": [
+        "Chris_privacy_gate",
+        "external_send",
+        "purchase",
+        "delete"
+      ],
+      "workflow": {
+        "kind": "direct_specialist",
+        "minimum_context_handoff": "lauren",
+        "callbacks": "private_redacted_only"
+      },
+      "report_back_policy": "redacted_summary_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "candidate_requires_ping"
+    },
+    {
+      "topic_id": 51,
+      "department_id": "claude_review",
+      "department": "Claude Review",
+      "aliases": [
+        "Claude/Opus Review",
+        "Secondary Review"
+      ],
+      "voice_label": "Claude Review",
+      "front_door_profile": "claude-review",
+      "runtime_assignee": "claude-review",
+      "maker_profiles": [
+        "claude-review"
+      ],
+      "required_reviewers": [],
+      "tier_path": [
+        "bounded Claude wrapper"
+      ],
+      "privacy_tier": "restricted",
+      "approval_gates": [
+        "redacted_packet",
+        "external_send",
+        "legal_commitment",
+        "payment"
+      ],
+      "workflow": {
+        "kind": "bounded_review_wrapper",
+        "primary_execution_forbidden": true,
+        "return_to_source_department_owner": true,
+        "missing_source_department_owner": "fail_closed_unapproved",
+        "fable": "explicit_Chris_approval_only"
+      },
+      "report_back_policy": "redacted_summary_only",
+      "auto_topic_post_allowed": false,
+      "discovery_confidence": "candidate_requires_ping"
+    }
+  ],
+  "model_policy_version": "margot-astra-sol-2026-09-04-v1"
+}

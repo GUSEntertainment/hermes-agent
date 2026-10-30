@@ -593,3 +593,18 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
+
+
+# [GUS v0.21.5 port] One implementation per name across kanban_db and this split
+# module. Names Margot customized (vs upstream eea312f8) keep the custom kanban_db
+# version; uncustomized names keep this upstream v0.21.5 version and kanban_db
+# rebinds to it (see bottom of kanban_db.py). Prevents signature drift.
+_GUS_CUSTOM_NAMES = ('_cleanup_workspace', '_ensure_git_worktree', '_resolve_worktree_workspace', '_try_cleanup_parent_workspaces')
+_GUS_UPSTREAM_NAMES = ('_cleanup_worker_tmux', '_cleanup_worktree_workspace', '_git_branch_exists', '_git_common_dir', '_git_current_branch', '_git_dir', '_git_toplevel', '_is_linked_worktree_checkout', '_is_managed_scratch_path', '_managed_scratch_path_info', '_mark_scratch_tip_shown', '_maybe_emit_scratch_tip', '_nearest_existing_path', '_repo_root_for_worktree_target', '_scratch_tip_sentinel_path', '_scratch_tip_shown', 'resolve_workspace', 'set_branch_name', 'set_workspace_path')
+for _gus_name in _GUS_CUSTOM_NAMES:
+    globals()[_gus_name] = getattr(_kb, _gus_name)
+
+# [GUS] Bind into kanban_db if this module finished importing after it.
+if hasattr(_kb, "_gus_bind_split_module"):
+    import sys as _gus_sys
+    _kb._gus_bind_split_module(_gus_sys.modules[__name__])

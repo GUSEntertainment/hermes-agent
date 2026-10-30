@@ -313,6 +313,13 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    if author == "auto-decomposer":
+        with kbc.connect_closing() as conn:
+            if not kb.is_initial_triage(conn, task_id):
+                return DecomposeOutcome(
+                    task_id, False,
+                    "not initial triage; automatic rewrite refused (stop/hold preserved)",
+                )
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
@@ -338,9 +345,10 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
+    # Only initial triage: loop-stopped, held, resumed or already-specified
+    # cards are never auto-rewritten (t_4359056c).
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return kb.list_initial_triage_ids(conn, tenant=tenant)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

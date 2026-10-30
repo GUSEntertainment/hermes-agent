@@ -54,6 +54,9 @@ class _LimitAgent:
     def _emit_status(self, *_args, **_kwargs):
         pass
 
+    def _emit_diagnostic_status(self, message):  # GUS diagnostic rail (agent/status_output.py)
+        self._emit_status(message)
+
     def _safe_print(self, *_args, **_kwargs):
         pass
 
@@ -417,3 +420,14 @@ def test_finalize_turn_starts_the_title_upgrade_the_prologue_held_back():
     _finalize(agent, final_response="done", exit_reason="text_response(1)", api_call_count=1)
     assert ran.wait(timeout=5), "deferred title upgrade never started"
     assert agent._deferred_title_upgrade is None
+
+
+def test_bounded_kanban_exit_never_requests_an_extra_model_summary(monkeypatch):
+    import agent.turn_finalizer as finalizer
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_budget')
+    monkeypatch.setenv('HERMES_KANBAN_TOTAL_TOKEN_LIMIT', '120000')
+    monkeypatch.setattr(finalizer, '_record_kanban_budget_exhausted', lambda *args: None)
+    agent = _LimitAgent()
+    result = _finalize(agent, final_response=None, exit_reason='budget_exhausted')
+    assert not agent._handle_max_iterations_called
+    assert 'budget reached' in result['final_response']

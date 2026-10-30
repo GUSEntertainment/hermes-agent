@@ -314,7 +314,11 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
                 "or rewrite the script as Python (.py)."
             )
         return [_bash, str(path)], {}, None
-    python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+    _exe = sys.executable
+    _venv = os.environ.get("VIRTUAL_ENV")
+    if _venv and os.path.isfile(os.path.join(_venv, "bin", "python")):
+        _exe = os.path.join(_venv, "bin", "python")  # local: keep venv site-packages for user scripts
+    python_exe, env_overlay = _windows_cron_python_invocation(_exe)
     if env_overlay:
         return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None
     return [python_exe, str(path)], env_overlay, None

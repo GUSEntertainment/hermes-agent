@@ -54,10 +54,9 @@ class SSHEnvironment(BaseEnvironment):
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
     _sudo_nopasswd_probe_supported = True
-
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False, sync_files: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
@@ -77,12 +76,19 @@ class SSHEnvironment(BaseEnvironment):
             self._sync_manager = None
             return
         self._remote_home = self._detect_remote_home()
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
-        self._sync_manager.sync(force=True)
+
+        self._sync_manager = None
+        if sync_files:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
+
         self.init_session()
 
     def _control_socket_for(self, send_env: tuple[str, ...]) -> Path:
@@ -268,8 +274,9 @@ class SSHEnvironment(BaseEnvironment):
                               f"Remote file cleanup on {self.host}")
 
     def _before_execute(self) -> None:
+        """Sync files to remote via FileSyncManager (rate-limited internally)."""
         if self._sync_manager is not None:
-            self._sync_manager.sync()  # rate-limited internally
+            self._sync_manager.sync()
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

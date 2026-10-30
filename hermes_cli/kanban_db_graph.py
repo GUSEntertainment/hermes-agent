@@ -212,3 +212,19 @@ def _insert_decomposed_child(
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id
+
+
+# [GUS v0.21.5 port] One implementation per name across kanban_db and this split
+# module. Names Margot customized (vs upstream eea312f8) keep the custom kanban_db
+# version; uncustomized names keep this upstream v0.21.5 version and kanban_db
+# rebinds to it (see bottom of kanban_db.py). Prevents signature drift.
+from hermes_cli import kanban_db as _kb  # noqa: E402,F811
+_GUS_CUSTOM_NAMES = ()
+_GUS_UPSTREAM_NAMES = ('decompose_triage_task',)
+for _gus_name in _GUS_CUSTOM_NAMES:
+    globals()[_gus_name] = getattr(_kb, _gus_name)
+
+# [GUS] Bind into kanban_db if this module finished importing after it.
+if hasattr(_kb, "_gus_bind_split_module"):
+    import sys as _gus_sys
+    _kb._gus_bind_split_module(_gus_sys.modules[__name__])

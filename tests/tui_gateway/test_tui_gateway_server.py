@@ -815,6 +815,36 @@ def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
     assert seen == [str(profile_home)]
 
 
+def _run_scheduling_delayed_profile_build(sid, session, built):
+    """Run a profile build with deterministic scheduler delay and clean it up.
+
+    Holding the registry lock keeps the new thread at its first synchronization
+    boundary. This proves the assertion does not require immediate scheduling,
+    while the bounded finally join prevents a failed assertion from stranding
+    the file behind a still-running build thread.
+    """
+    build_thread = None
+    try:
+        server._sessions[sid] = session
+        with server._sessions_lock:
+            server._start_agent_build(sid, session)
+            build_thread = session.get("_agent_build_thread")
+            assert build_thread is not None
+            assert build_thread.is_alive()
+            assert not built.is_set()
+
+        assert built.wait(timeout=60), "agent build thread never called _make_agent"
+        assert session["agent_ready"].wait(timeout=30), (
+            "agent_ready never set after build"
+        )
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        if build_thread is not None:
+            build_thread.join(timeout=30)
+            assert not build_thread.is_alive(), "agent build thread did not settle"
+
+
 def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch, tmp_path
 ):
@@ -861,13 +891,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         "profile_home": str(profile_home),
     }
 
-    server._sessions[sid] = session
-    try:
-        server._start_agent_build(sid, session)
-        assert built.wait(timeout=15), "agent build thread never called _make_agent"
-        assert ready.wait(timeout=5), "agent_ready never set after build"
-    finally:
-        server._sessions.pop(sid, None)
+    _run_scheduling_delayed_profile_build(sid, session, built)
 
     assert seen == [str(profile_home)]
 
@@ -923,13 +947,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
         "profile_home": str(profile_home),
     }
 
-    server._sessions[sid] = session
-    try:
-        server._start_agent_build(sid, session)
-        assert built.wait(timeout=15), "agent build thread never called _make_agent"
-        assert ready.wait(timeout=5), "agent_ready never set after build"
-    finally:
-        server._sessions.pop(sid, None)
+    _run_scheduling_delayed_profile_build(sid, session, built)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
 
@@ -15261,7 +15279,8 @@ def test_handoff_request_uses_session_profile_home(monkeypatch, tmp_path):
     def profile_db(_session):
         yield ProfileDB()
 
-    monkeypatch.setattr("gateway.config.load_gateway_config", load_config)
+    import gateway.config as _gw_config
+    monkeypatch.setattr(_gw_config, "load_gateway_config", load_config)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_session_db", profile_db)
     server._sessions["handoff-profile"] = {

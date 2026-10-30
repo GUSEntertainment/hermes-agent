@@ -64,6 +64,15 @@ def _origin_from_env(
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if not (origin_platform and origin_chat_id):
         return None
+    # t_9f210be5: an authenticated Margot app conversation is a real delivery surface.
+    if origin_platform == "api_server":
+        try:
+            from cron.margot_app_delivery import origin_for_session
+            app_origin = origin_for_session(get_session_env("HERMES_SESSION_ID") or origin_chat_id)
+        except Exception:
+            app_origin = None
+        if app_origin:
+            return app_origin
     # A non-push surface (api_server: request/response, ``send()`` is a stub) cannot receive a
     # fire-time report, so an origin stamp would make ``deliver=origin`` fail silently on every
     # fire (#69304). No origin => the home-channel fallback + creation-time notice apply.

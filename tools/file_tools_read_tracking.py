@@ -31,6 +31,22 @@ logger = logging.getLogger("tools.file_tools")
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
 
+
+def _file_bookkeeping_key(task_id):
+    """Keep authenticated authority/backend state separate from raw task IDs."""
+    from gateway.host_tool_authority import terminal_cache_key
+    authority = terminal_cache_key()
+    return (authority, task_id) if authority is not None else task_id
+
+
+def _host_metadata_allowed(task_id="default") -> bool:
+    from gateway.host_tool_authority import remote_required
+    if remote_required():
+        return False
+    from tools.file_tools_paths import _terminal_env_type_for_task
+    return _terminal_env_type_for_task(task_id) == "local"
+
+
 # Consecutive patch failures per (task_id, resolved_path); escalates the hint
 # when the model keeps failing the same file. Reset on a successful patch.
 _patch_failure_lock = threading.Lock()
@@ -50,7 +66,7 @@ _NOT_FOUND_TTL_SECONDS = 60.0  # a path that didn't exist may be created soon
 def _task_data(task_id: str) -> dict:
     """Get-or-create the tracker entry for *task_id*, back-filling missing containers
     (search_tool / tests create partial entries). Lock must be held."""
-    task_data = _read_tracker.setdefault(task_id, {
+    task_data = _read_tracker.setdefault(_file_bookkeeping_key(task_id), {
         "last_key": None, "consecutive": 0, "read_history": set()})
     for key in ("dedup", "dedup_hits", "read_timestamps", "read_coverage", "full_write_baselines"):
         task_data.setdefault(key, {})
@@ -61,7 +77,7 @@ def _task_data(task_id: str) -> dict:
 def _record_patch_failure(task_id: str, resolved_path: str) -> int:
     """Increment and return the consecutive-failure count for this path."""
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.setdefault(task_id, {})
+        task_failures = _patch_failure_tracker.setdefault(_file_bookkeeping_key(task_id), {})
         # Evict the oldest entry once a task has failed on many distinct files.
         if resolved_path not in task_failures:
             _evict_oldest(task_failures, _PATCH_FAILURE_PATHS_CAP - 1)
@@ -74,7 +90,7 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
     if not resolved_paths:
         return
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(task_id)
+        task_failures = _patch_failure_tracker.get(_file_bookkeeping_key(task_id))
         for rp in resolved_paths if task_failures else ():
             task_failures.pop(rp, None)
 
@@ -105,7 +121,7 @@ def _resolved_or_none(filepath: str, task_id: str) -> str | None:
 
 def _pop_not_found(op: str, resolved_str: str, task_id: str) -> None:
     """Drop the negative-cache entry for *(op, resolved_str)*. Lock must be held."""
-    task_data = _read_tracker.get(task_id)
+    task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
     nf = task_data.get("not_found") if task_data else None
     if nf:
         nf.pop((op, resolved_str), None)
@@ -117,8 +133,10 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     *op* is "read" or "search" (different error JSON shapes). Evicted by TTL,
     by write_file/patch on the path, or by any other tool call.
     """
+    if not _host_metadata_allowed(task_id):
+        return None
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
         entry = (task_data.get("not_found") or {}).get((op, resolved_str)) if task_data else None
         if entry is None:
             return None
@@ -138,6 +156,8 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
 
 def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
     """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
+    if not _host_metadata_allowed(task_id):
+        return
     with _read_tracker_lock:
         task_data = _task_data(task_id)
         task_data.setdefault("not_found", {})[(op, resolved_str)] = (time.monotonic(), error_json)
@@ -165,9 +185,12 @@ def reset_file_dedup(task_id: str = None):
     stamp this task recorded; byte identity is checked before overwriting. A baseline
     whose file changed underneath is dropped
     (the stat runs outside the lock so a hung mount cannot stall other tasks)."""
+    from gateway.host_tool_authority import scope
+    if task_id is None and scope() is not None:
+        task_id = "default"
     with _read_tracker_lock:
         if task_id:
-            targets = [_read_tracker[task_id]] if _read_tracker.get(task_id) else []
+            targets = [_read_tracker[_file_bookkeeping_key(task_id)]] if _read_tracker.get(_file_bookkeeping_key(task_id)) else []
         else:
             targets = list(_read_tracker.values())
         for task_data in targets:
@@ -193,7 +216,7 @@ def notify_other_tool_call(task_id: str = "default"):
     have created a previously-missing path (or flipped its permissions).
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
         if task_data:
             task_data["last_key"] = None
             task_data["consecutive"] = 0
@@ -209,7 +232,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     if resolved is None:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
         if task_data is None:
             return
         dedup = task_data.get("dedup")
@@ -228,6 +251,8 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     (fixes #13144).
     """
     _invalidate_dedup_for_path(filepath, task_id)
+    if not _host_metadata_allowed(task_id):
+        return
     resolved = _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
@@ -236,7 +261,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     except OSError:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
             _cap_read_tracker_data(task_data)
@@ -275,6 +300,8 @@ def _mark_full_write_baseline(resolved: str, task_id: str, expected_sha256: str 
     """Record that *task_id* saw the whole current content of *resolved* (full
     unredacted read_file, or its own successful write_file), so a later
     write_file may replace the file. Acquires the lock itself."""
+    if not _host_metadata_allowed(task_id):
+        return  # [GUS] remote caller: the host file is not the written file
     version = _file_version(resolved)
     if version is None or (expected_sha256 is not None and version[-1].hex() != expected_sha256):
         return
@@ -286,7 +313,7 @@ def _mark_full_write_baseline(resolved: str, task_id: str, expected_sha256: str 
 
 def _has_full_write_baseline(resolved: str, task_id: str) -> bool:
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id) or {}
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id)) or {}
         baseline = task_data.get("full_write_baselines", {}).get(str(resolved))
     return baseline is not None and _file_version(resolved) == baseline
 
@@ -322,11 +349,13 @@ def _note_read_coverage(task_data: dict, resolved: str, version: tuple, start: i
 def _read_mtime_drifted(filepath: str, task_id: str) -> bool:
     """True when the file's mtime changed since this task last read it. False when
     never read, fresh, or unstattable (a deleted file is the write's problem)."""
+    if not _host_metadata_allowed(task_id):
+        return False  # [GUS] never stat host for remote caller paths
     resolved = _resolved_or_none(filepath, task_id)
     if resolved is None:
         return False
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_file_bookkeeping_key(task_id))
         read_mtime = task_data.get("read_timestamps", {}).get(resolved) if task_data else None
     if read_mtime is None:
         return False
@@ -353,8 +382,8 @@ def _mark_verification_stale(task_id: str, resolved_paths: list[str],
     from pathlib import Path
 
     paths = [p for p in resolved_paths if p]
-    if not paths:
-        return
+    if not paths or not _host_metadata_allowed(task_id):
+        return  # [GUS] remote caller paths are not host paths
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited

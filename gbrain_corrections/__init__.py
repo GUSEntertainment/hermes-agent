@@ -1,0 +1,1 @@
+"""Immediate, transport-authenticated corrections."""

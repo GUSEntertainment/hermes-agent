@@ -179,13 +179,46 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-# Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/
-# desktop bind HERMES_SESSION_SOURCE, so both are consulted).  Default-deny: an unrecognized
-# identity counts as messaging.  Mirrors LOCAL_SESSION_SOURCE_IDS in apps/desktop session-source.ts.
-NON_MESSAGING_SESSION_SURFACES = frozenset({
-    "", "api_server", "cli", "codex", "desktop", "gateway", "kanban", "local",
-    "msgraph_webhook", "tool", "tui", "webhook",
-})
+def get_bound_session_env(name: str, default: str = "") -> str:
+    """Read only a task-local gateway binding, never process environment.
+
+    Security-sensitive tools use this when an environment fallback must not
+    be mistaken for a currently authenticated gateway turn.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    return default if value is _UNSET else value
+
+
+# Surfaces that are not a human chat channel. The gateway binds a platform
+# value (``telegram``) to HERMES_SESSION_PLATFORM, while the CLI, TUI, and
+# desktop bind HERMES_SESSION_SOURCE (``cli``, ``tui``, ``desktop``) and leave
+# the platform empty — so both have to be consulted. ``local``, ``api_server``,
+# ``webhook``, and ``msgraph_webhook`` are real Platform values that reach
+# HERMES_SESSION_PLATFORM but have no attachment channel behind them.
+# Default-deny: an unrecognized identity counts as messaging so a newly added
+# chat platform is never treated as a private surface before this set is
+# updated. Mirrors LOCAL_SESSION_SOURCE_IDS in
+# apps/desktop/src/lib/session-source.ts; keep roughly in sync when adding a
+# local or programmatic surface.
+NON_MESSAGING_SESSION_SURFACES = frozenset(
+    {
+        "",
+        "api_server",
+        "cli",
+        "codex",
+        "desktop",
+        "gateway",
+        "kanban",
+        "local",
+        "msgraph_webhook",
+        "tool",
+        "tui",
+        "webhook",
+    }
+)
 
 
 def session_is_messaging_surface() -> bool:

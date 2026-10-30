@@ -29,7 +29,7 @@ from hermes_cli.kanban_output import (
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
+    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 
@@ -132,11 +132,21 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
             "default); your task will be picked up on the next tick after "
             "the gateway comes up.")
 
-
 # --- Command dispatch ---
 
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
+    from gateway.gus_admin_cli import admission
+    try:
+        with admission(args):
+            return _admitted_kanban_command(args)
+    except PermissionError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
+
+
+def _admitted_kanban_command(args: argparse.Namespace) -> int:
+
     action = getattr(args, "kanban_action", None)
     if not action:
         parser = getattr(args, "_kanban_parser", None)
@@ -207,7 +217,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "archive", "restore", "rebind-review-artifact", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -359,6 +369,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    capability_contract = None
+    capability_contract_path = getattr(args, "capability_contract", None)
+    if capability_contract_path:
+        try:
+            capability_contract = json.loads(
+                Path(capability_contract_path).expanduser().read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"kanban: --capability-contract: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(capability_contract, dict):
+            print("kanban: --capability-contract must contain a JSON object", file=sys.stderr)
+            return 2
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -370,12 +393,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            capability_contract=capability_contract,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -487,12 +512,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        owner_cell_state = kb.owner_cell_read_state(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task_to_dict(task), "latest_summary": latest_summary, "owner_cell": owner_cell_state, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -505,6 +531,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
     field("assignee", task.assignee or "-")
+    if owner_cell_state:
+        print(f"  owner cell state version: {owner_cell_state['current_state_version']} ({owner_cell_state['phase']})")
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
@@ -824,8 +852,8 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
-    """Goal judge for every terminal worker handoff (including review).
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, phase: str = "completion"):
+    """Goal judge for final completion; deterministic native checks govern review.
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
     unachievable; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
@@ -836,6 +864,10 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     disambiguates the guidance the caller gives the worker (``continue`` = not done yet, ``blocked`` =
     judged unachievable — see #100954).
     """
+    if phase not in {"completion", "review"}:
+        raise ValueError("unknown goal handoff phase")
+    if phase == "review":
+        return ("done", None)
     if task is None or not task.goal_mode:
         return ("done", None)
     try:
@@ -848,6 +880,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         return ("done", None)
 
     from hermes_cli.goals import judge_goal
+    from hermes_cli.kanban_judgment import handoff_goal
 
     verdict, reason, transport_failed = "done", "", False
     try:
@@ -857,7 +890,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                goal=handoff_goal(task, phase=phase),
                 last_response=evidence.strip())
         finally:
             if affinity_token is not None:
@@ -1000,9 +1033,33 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        def op(tid):
+            try:
+                task_reason = kb.authorized_block_reason(
+                    conn, tid, kind=kind, reason=reason,
+                    authorization_checked=getattr(args, "authorization_checked", False),
+                    new_decision=getattr(args, "new_decision", None),
+                )
+            except ValueError as exc:
+                raise ValueError(f"cannot block {tid}: {exc}") from exc
+            if task_reason:
+                kb.add_comment(conn, tid, author=author, body=f"BLOCKED: {task_reason}")
+            return kb.block_task(conn, tid, reason=task_reason, kind=kind,
+                                 expected_run_id=_worker_run_id_for(tid))
+        failed = False
+        for tid in ids:
+            try:
+                ok = op(tid)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                failed = True
+                continue
+            if ok:
+                print(ok_msg(tid))
+            else:
+                print(f"cannot block {tid}", file=sys.stderr)
+                failed = True
+        return 1 if failed else 0
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1017,7 +1074,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_PROFILE") not in {"claire", "scarlett", "steven", "riley", "lauren", "grace", "quinn"}:
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
@@ -1026,7 +1083,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid, preserve_failure_history=getattr(args, "preserve_failure_history", False)))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
@@ -1038,12 +1095,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        gate_err = _goal_gate_error(
-            conn, tid, summary or "", "review handoff",
-            "Record the block with kanban block instead of requesting review.",
-            "Provide acceptance evidence matching the task.")
-        if gate_err:
-            return _err(gate_err)
+        # Native reviewer/artifact/claim checks admit review; final completion retains its judge.
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
             expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
@@ -1063,6 +1115,28 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
+    return 0
+
+
+def _cmd_rebind_review_artifact(args: argparse.Namespace) -> int:
+    # An ordinary terminal subprocess cannot impersonate its parent reviewer.
+    # The same kernel enforces exact PID/start/claim even if a token is copied.
+    from agent.review_authority import decision_token
+    tid = args.task_id
+    run_id = _worker_run_id_for(tid)
+    try:
+        with kb.connect_closing() as conn:
+            kb.rebind_review_artifact_task(
+                conn, tid, **{name: getattr(args, name) for name in (
+                    "state_version", "expected_artifact_ref", "expected_artifact_digest",
+                    "artifact_ref", "artifact_digest", "reason",
+                )}, expected_run_id=run_id,
+                review_decision_capability=decision_token(tid, run_id),
+            )
+    except (ValueError, PermissionError) as exc:
+        print(f"cannot rebind review evidence for {tid}: {exc}; use the native reviewer tool", file=sys.stderr)
+        return 1
+    print(f"Refreshed review evidence for {tid}; fresh review required")
     return 0
 
 
@@ -1129,8 +1203,21 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, reason=getattr(args, "reason", None)),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    failed = []
+    with kbc.connect_closing() as conn:
+        for tid in args.task_ids:
+            status = kb.restore_task(conn, tid, reason=getattr(args, "reason", None))
+            if status is None:
+                failed.append(tid)
+                print(f"cannot restore {tid} (not archived)", file=sys.stderr)
+            else:
+                print(f"Restored {tid} -> {status}")
+    return 0 if not failed else 1
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -1271,6 +1358,21 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     else:
         return _err(f"kanban: {verb} requires a task id or --all", 2)
 
+    from gateway.gus_admin_cli import active as _admin_active
+    if _admin_active():
+        # Guarded native-worker path: triage -> todo with no LLM rewrite of
+        # someone else's card; the normal ready pass then applies parent
+        # gating exactly as the dispatcher would. Reason recorded as evidence.
+        from hermes_cli import kanban_db as _kb
+        tid = ids[0]
+        with _kb.connect_closing() as conn:
+            if not _kb.specify_triage_task(conn, tid, author=author):
+                print(f"kanban: specify {tid}: not in triage", file=sys.stderr)
+                return 1
+            _kb.add_comment(conn, tid, author, f"Moved triage -> todo by guarded cleanup: {args.reason}")
+        print(f"Specified {tid} → todo")
+        return 0
+
     ok_count = 0
     for tid in ids:
         outcome = run_one(tid, author=author)
@@ -1300,6 +1402,57 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "new_title"),
                              lambda o: f"Specified {o.task_id} → todo{_retitled_suffix(o)}")
 
+def _cmd_gc(args: argparse.Namespace) -> int:
+    """Remove scratch workspaces of archived tasks, prune old events, and
+    delete old worker logs."""
+    import shutil
+    scratch_root = kb.workspaces_root()
+    removed_ws = 0
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+            "WHERE status = 'archived'"
+        ).fetchall()
+        rows = [row for row in rows if not kb.workspace_preserved(conn, row["id"])]
+    for row in rows:
+        if row["workspace_kind"] == "worktree":
+            # Backstop for worktrees that escaped the completion/archive hook
+            # (e.g. tasks archived before that hook existed). Same safety
+            # predicate: only clean, fully-pushed worktrees are removed.
+            wt_path = row["workspace_path"]
+            if wt_path and Path(wt_path).is_dir():
+                kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                if not Path(wt_path).is_dir():
+                    removed_ws += 1
+            continue
+        if row["workspace_kind"] != "scratch":
+            continue
+        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        try:
+            path.relative_to(scratch_root.resolve())
+        except ValueError:
+            # Safety: never delete outside the scratch root.
+            continue
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed_ws += 1
+
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    with kb.connect_closing() as conn:
+        removed_events = kb.gc_events(
+            conn, older_than_seconds=event_days * 24 * 3600,
+        )
+    removed_logs = kb.gc_worker_logs(
+        older_than_seconds=log_days * 24 * 3600,
+    )
+    print(f"GC complete: {removed_ws} workspace(s), "
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
 
 def _decompose_ok_line(o) -> str:
     if o.fanout and o.child_ids:
@@ -1329,7 +1482,8 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "rebind-review-artifact": _cmd_rebind_review_artifact,
+    "archive": _cmd_archive, "restore": _cmd_restore, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

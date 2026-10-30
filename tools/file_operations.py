@@ -12,6 +12,7 @@ import binascii
 import os
 import re
 import sys
+import subprocess
 import difflib
 import hashlib
 import json
@@ -198,6 +199,41 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             kwargs['timeout'] = timeout
         if stdin_data is not None:
             kwargs['stdin_data'] = stdin_data
+
+        confinement_workspace = getattr(self, "confinement_workspace", None)
+        if confinement_workspace:
+            from tools.workspace_confinement import prepare_sandbox_launch
+
+            launch = prepare_sandbox_launch(command, confinement_workspace)
+            input_bytes = (
+                stdin_data.encode("utf-8", "surrogateescape")
+                if stdin_data is not None
+                else None
+            )
+            try:
+                completed = subprocess.run(
+                    launch.args,
+                    cwd=launch.cwd,
+                    env=launch.env,
+                    input=input_bytes,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout or 120,
+                    check=False,
+                )
+                return ExecuteResult(
+                    stdout=completed.stdout.decode("utf-8", "replace"),
+                    exit_code=completed.returncode,
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = (exc.stdout or b"").decode("utf-8", "replace")
+                return ExecuteResult(
+                    stdout=f"{output}\n[Command timed out after {timeout or 120}s]",
+                    exit_code=124,
+                )
+
+        # Resolve cwd from the live env so `cd` commands are picked up.
+        # Fall through to init-time self.cwd only if the env doesn't track cwd.
         effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         exit_code = result.get("returncode", 0)
@@ -687,6 +723,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         turns the fast path off."""
         flag = os.environ.get("HERMES_NATIVE_FILE_READ", "1").strip().lower()
         if flag in ("0", "false", "no", "off"):
+            return False
+        # [GUS] Confined workers must go through the sandboxed shell path; the
+        # native fast path would follow a swapped symlink outside the workspace.
+        if getattr(self, "confinement_workspace", None):
             return False
         # Same "is this env the local host" test the LSP path uses; isinstance is
         # microseconds and self.env is never rebound, so nothing to memoize.
@@ -1299,6 +1339,53 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         if verify_error is not None:
             return verify_error
 
+        # Bytes written — computed from the exact bytes we just wrote (len
+        # matches wc -c) instead of spawning a ``wc -c`` subprocess. The
+        # encode happened up front with surrogateescape — the inverse of the
+        # decode that produces surrogate content — so content_bytes == what
+        # rode stdin == what is on disk, and the sha256 below compares like
+        # with like.
+        bytes_written = len(content_bytes)
+
+        # Post-write content verification (cheap, one shell call): compare
+        # the on-disk sha256 to the intended content's hash. Production
+        # mining shows models re-reading files right after writing them to
+        # confirm persistence (154 verify-reads in a 400k-msg window) —
+        # an explicit verified flag makes that turn unnecessary, and a
+        # mismatch is surfaced as a hard error instead of silent corruption
+        # (mirrors patch_replace's post-write verification).
+        content_verified: Optional[bool] = None
+        try:
+            hash_cmd = f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null"
+            hash_result = self._exec(hash_cmd)
+            if hash_result.exit_code == 0 and hash_result.stdout.strip():
+                disk_sha = hash_result.stdout.strip().split()[0]
+                expected_sha = hashlib.sha256(content_bytes).hexdigest()
+                content_verified = disk_sha == expected_sha
+                if not content_verified:
+                    return WriteResult(
+                        error=(
+                            f"Post-write verification failed for {path}: on-disk "
+                            "content hash differs from the intended write. The "
+                            "write did not persist correctly — re-read the file "
+                            "and retry."
+                        )
+                    )
+        except Exception:
+            content_verified = None
+        if (
+            getattr(self, "confinement_workspace", None)
+            and content_verified is not True
+        ):
+            return WriteResult(
+                error=(
+                    f"Post-write verification failed for confined path {path}: "
+                    "the operation could not prove that the intended workspace "
+                    "file received the bytes. The write is treated as denied."
+                )
+            )
+
+        # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
         # clean (no point asking an LSP about a file that won't parse).

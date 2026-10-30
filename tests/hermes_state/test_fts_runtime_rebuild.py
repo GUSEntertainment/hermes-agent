@@ -622,6 +622,41 @@ class TestRuntimeFtsRebuild:
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
+    def test_large_db_corruption_stays_fail_open_without_automatic_rebuild(
+        self, db, tmp_path, monkeypatch
+    ):
+        """Large stores preserve canonical writes and defer FTS repair offline."""
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        db._FTS_LIVE_MERGE_MAX_DB_BYTES = 1
+        rebuild_calls = []
+        original_rebuild = db.rebuild_fts
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: rebuild_calls.append(True) or original_rebuild(),
+        )
+
+        db.append_message("s1", "user", "canonical survives large corruption")
+
+        assert rebuild_calls == []
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()
+        db.close()
+
+        monkeypatch.setattr(SessionDB, "_FTS_LIVE_MERGE_MAX_DB_BYTES", 1)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_stale is True
+            assert reopened._fts_enabled is False
+            assert reopened.search_messages("canonical survives large corruption")
+        finally:
+            reopened.close()
+
     def test_stale_search_preserves_not_semantics(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")

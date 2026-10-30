@@ -129,5 +129,114 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_preclaim_cas_race_removes_new_materialization(kanban_home, tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="raced", assignee="worker", workspace_kind="worktree"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        real_resolve = kb._resolve_worktree_workspace
+
+        def resolve_then_race(candidate, **kwargs):
+            resolved = real_resolve(candidate, **kwargs)
+            other = kb.connect()
+            try:
+                with kb.write_txn(other):
+                    other.execute(
+                        "UPDATE tasks SET model_override='concurrent-model' WHERE id=?",
+                        (tid,),
+                    )
+            finally:
+                other.close()
+            return resolved
+
+        admission_calls = []
+        spawn_calls = []
+        monkeypatch.setattr(kb, "_resolve_worktree_workspace", resolve_then_race)
+        monkeypatch.setattr(
+            kb, "_build_worker_admission", lambda *a, **k: admission_calls.append(1)
+        )
+
+        def spawn(*args, admission_contract=None, **kwargs):
+            spawn_calls.append(1)
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        current = kb.get_task(conn, tid)
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+        event_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?", (tid,)
+            ).fetchall()
+        ]
+
+    target = repo / ".worktrees" / tid
+    assert result.spawned == []
+    assert admission_calls == []
+    assert spawn_calls == []
+    assert current is not None and current.status == "ready"
+    assert current.current_run_id is None
+    assert run_count == 0
+    assert "claimed" not in event_kinds
+    assert "spawned" not in event_kinds
+    assert not target.exists()
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", f"wt/{tid}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch == ""
+
+
+def test_failed_worktree_add_cleans_partial_target_and_branch(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "partial"
+    task = kb.Task(
+        id="partial",
+        title="partial",
+        body=None,
+        assignee="worker",
+        status="ready",
+        priority=0,
+        created_by="user",
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="worktree",
+        workspace_path=str(target),
+        branch_name="wt/partial",
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+
+    def partial_add(repo_root, worktree_target, branch_name):
+        worktree_target.mkdir(parents=True)
+        (worktree_target / "partial-file").write_text("partial", encoding="utf-8")
+        _git(repo_root, "branch", branch_name)
+        raise RuntimeError("injected partial add")
+
+    monkeypatch.setattr(kb, "_run_git_worktree_add", partial_add)
+    with pytest.raises(RuntimeError, match="injected partial add"):
+        kb._resolve_worktree_workspace(task)
+
+    assert not target.exists()
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "wt/partial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch == ""
+
+
 
 

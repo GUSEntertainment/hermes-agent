@@ -42,6 +42,25 @@ def _handoff_path_for(nonce: str) -> Path:
     return _HANDOFF_DIR / f"grandchild-{nonce}.json"
 
 
+def test_slow_file_timeout_budget_preserves_explicit_overrides() -> None:
+    """The oversized TUI file gets a bounded default-only slow-file budget."""
+    from scripts import run_tests_parallel as runner
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tui_file = repo_root / "tests" / "test_tui_gateway_server.py"
+    ordinary_file = repo_root / "tests" / "test_pty_session.py"
+
+    assert runner._slow_file_default_timeout(
+        tui_file, repo_root, configured=300.0, explicit=False
+    ) == 600.0
+    assert runner._slow_file_default_timeout(
+        ordinary_file, repo_root, configured=300.0, explicit=False
+    ) == 300.0
+    assert runner._slow_file_default_timeout(
+        tui_file, repo_root, configured=42.0, explicit=True
+    ) == 42.0
+
+
 def _pid_alive(pid: int) -> bool:
     """POSIX: send signal 0 to probe whether ``pid`` is still alive.
 
@@ -100,7 +119,7 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert "1 tests passed" in proc.stdout
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="authenticated process-group containment is Linux-only")
 @pytest.mark.live_system_guard_bypass
 def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
     """Run the parallel runner over a probe file and verify cleanup.

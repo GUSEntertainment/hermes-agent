@@ -432,6 +432,7 @@ build-backend = "setuptools.build_meta"
 hermes = "hermes_cli.main:main"
 hermes-agent = "agent.legacy_cli:main"
 hermes-acp = "acp_adapter.entry:main"
+hermes-imsg = "hermes_cli.imessage_send_guard:main"
 
 [tool.uv]
 override-dependencies = [

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import secrets
 import shutil
 import signal
@@ -496,6 +497,15 @@ class PhotonAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
         extra = config.extra or {}
+        # Operator metadata independent of fallible owner route/enrollment files.
+        self._josh_exclusive_sender_digest = str(extra.get("josh_exclusive_sender_digest") or "")
+        if self._josh_exclusive_sender_digest and not re.fullmatch(r"[0-9a-f]{64}", self._josh_exclusive_sender_digest):
+            raise ValueError("Invalid exclusive sender admission")
+        extra_digests = extra.get("owner_exclusive_sender_digests", [])
+        if type(extra_digests) is not list or len(extra_digests)>100 or any(type(x) is not str or not re.fullmatch(r"[0-9a-f]{64}",x) for x in extra_digests):
+            raise ValueError("Invalid owner exclusive sender admission")
+        self._owner_exclusive_sender_digests = frozenset(extra_digests) | ({self._josh_exclusive_sender_digest} if self._josh_exclusive_sender_digest else set())
+
         # Project credentials: env wins, then config.extra, then auth.json.
         stored_id, stored_sec = load_project_credentials()
         self._project_id: str = _get_scoped_secret("PHOTON_PROJECT_ID") or extra.get("project_id") or stored_id or ""
@@ -603,6 +613,16 @@ class PhotonAdapter(BasePlatformAdapter):
                 return False
         else:
             logger.warning("[photon] sidecar autostart disabled — inbound + outbound will fail")
+        # Preserve an existing immutable sender binding across reconnect failure.
+        if getattr(self, "_josh_owner_handler", None) is None:
+            try:
+                from .josh_onboarding.operator_factory import build_operator_handler
+                candidate = await asyncio.to_thread(build_operator_handler, self._owner_exclusive_sender_digests)
+                if candidate.digests != self._owner_exclusive_sender_digests:
+                    raise ValueError("Owner enrollment differs from exclusive admission")
+                self._josh_owner_handler = candidate
+            except Exception:
+                logger.warning("Josh owner route unavailable; existing admission unchanged")
         loop = asyncio.get_event_loop()
         self._inbound_running = True
         self._inbound_task = loop.create_task(self._inbound_loop())
@@ -615,10 +635,27 @@ class PhotonAdapter(BasePlatformAdapter):
         self._mark_connected()
         logger.info("[photon] connected — sidecar on %s:%d, streaming inbound over gRPC",
                     self._sidecar_bind, self._sidecar_port)
+        if getattr(self, "_josh_owner_handler", None) is not None:
+            from .josh_onboarding.adapter_hook import recover_owner_replies_after_connect
+            await recover_owner_replies_after_connect(self._josh_owner_handler, self)
+            from .josh_onboarding.native_runs_lifecycle import start_for_adapter as start_native_returns
+            start_native_returns(self, self._josh_owner_handler)
         self._wire_plugin_handlers(None)  # ctx.register_platform_handler natives
+        # Owned durable-call recovery, separate from appointment/return jobs.
+        if os.environ.get("PHONE_PHOTON_OUTBOUND_ENABLED") == "1":
+            from tools.phone_call_tool import PROCESSORS
+            import sys
+            if str(PROCESSORS) not in sys.path: sys.path.insert(0, str(PROCESSORS))
+            from photon_call_lifecycle import start_for_adapter
+            await start_for_adapter(self)
         return True
 
     async def disconnect(self) -> None:
+        from .josh_onboarding.native_runs_lifecycle import stop_for_adapter as stop_native_returns
+        await stop_native_returns(self)
+        lifecycle = getattr(self, "_photon_call_lifecycle", None)
+        if lifecycle is not None:
+            await lifecycle.stop()
         self._inbound_running = False
         await self._stop_watchdog()  # first, so it can't respawn while we tear the sidecar down
         task, self._sidecar_health_task = self._sidecar_health_task, None
@@ -745,6 +782,21 @@ class PhotonAdapter(BasePlatformAdapter):
             prev[1].cancel()
         return live
 
+    async def _handle_with_josh(self, event):
+        source = getattr(event, "source", None)
+        sender = getattr(source, "user_id", None)
+        enrolled = getattr(self, "_owner_exclusive_sender_digests", frozenset())
+        exclusive = bool(enrolled and isinstance(sender, str) and
+                         hashlib.sha256(sender.encode()).hexdigest() in enrolled)
+        if exclusive:
+            handler = getattr(self, "_josh_owner_handler", None)
+            if handler is not None:
+                from .josh_onboarding.adapter_hook import dispatch_owner_event
+                await dispatch_owner_event(handler, self, event)
+            # Missing/corrupt route or enrollment NEVER falls through to root.
+            return
+        await self.handle_message(event)
+
     async def _dispatch_inbound(self, event: Dict[str, Any]) -> None:
         """Normalize a sidecar inbound event ``{messageId, space: {id, type: dm|group, phone},
         sender: {id}, content: {type: text|attachment|voice|reaction|richlink|group|
@@ -761,6 +813,22 @@ class PhotonAdapter(BasePlatformAdapter):
         sender_id = sender.get("id") or space.get("phone") or space_id
         timestamp = _parse_timestamp(event.get("timestamp") or "")
         message_id = event.get("messageId")
+        # Replies carry the user's new content, not merely the quoted target.
+        # Keep the transport-verified caller/space; a quoted message grants no access.
+        reply_info = {}
+        for _ in range(4):
+            if content.get("type") != "reply":
+                break
+            if not reply_info and content.get("targetSpaceId") == space_id:
+                target_id = content.get("targetMessageId")
+                if isinstance(target_id, str) and 0 < len(target_id) <= 256:
+                    reply_info = {
+                        "reply_to_message_id": target_id,
+                        "reply_to_text": str(content.get("targetText") or "")[:2000] or None,
+                        "reply_to_is_own_message": content.get("targetDirection") == "outbound",
+                    }
+            inner = content.get("content")
+            content = inner if isinstance(inner, dict) else {}
         ctype = content.get("type")
 
         def _event(text: str, mtype: MessageType = MessageType.TEXT, **kwargs: Any) -> MessageEvent:
@@ -782,7 +850,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 return
             # reply_to_is_own_message holds by construction, so the gateway injects
             # `[Replying to your previous message: "..."]` when targetText is present.
-            await self.handle_message(_event(
+            await self._handle_with_josh(_event(
                 f"reaction:added:{content.get('emoji') or ''}", reply_to_message_id=target_id,
                 reply_to_text=content.get("targetText") or None, reply_to_is_own_message=True))
             return
@@ -814,7 +882,7 @@ class PhotonAdapter(BasePlatformAdapter):
             if not choice:
                 logger.debug("[photon] ignoring poll vote with empty title")
                 return
-            await self.handle_message(_event(choice))
+            await self._handle_with_josh(_event(choice))
             return
         # Mention gate BEFORE normalising: _normalize_content persists inline attachment
         # bytes to the media cache, and a dropped group message must not leave files behind.
@@ -830,7 +898,26 @@ class PhotonAdapter(BasePlatformAdapter):
         if gated:
             text = self._clean_mention_text(text)
         self._record_recent_richlink(space_id, _richlink_url_from_content(content) or text)
-        await self.handle_message(_event(text, mtype, media_urls=media_urls, media_types=media_types))
+        # A transport-bound reply can resume the sender's own delivered document.
+        if ctype == "text" and reply_info.get("reply_to_message_id") and chat_type == "dm":
+            try:
+                from .continuation import capture
+                eligible = await asyncio.to_thread(
+                    capture, space=space_id, sender=sender_id, message_id=message_id,
+                    chat_type=chat_type, target=reply_info["reply_to_message_id"], text=text,
+                )
+            except Exception:
+                eligible = False
+                logger.warning("[photon] document continuation binding unavailable")
+            if eligible:
+                text += ("\n\n[Private delivery context: This reply is bound to your own delivered document. "
+                         "If the new message requests an edit, use photon_continue_document with no arguments "
+                         "before claiming work has started. Do not use generic kanban_create or an untooled "
+                         "temporary delegate. For questions or thanks, reply normally.]")
+        message_event = _event(text, mtype, media_urls=media_urls, media_types=media_types, **reply_info)
+        from plugins.platforms.photon.secure_intake.composition import capture as capture_secure_intake
+        capture_secure_intake(message_event, content)
+        await self._handle_with_josh(message_event)
 
     # -- Sidecar lifecycle ---------------------------------------------------------
 
@@ -1142,7 +1229,15 @@ class PhotonAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        return await self._sidecar_send(chat_id, self.format_message(content))
+        logical_id = str((metadata or {}).get("logical_message_id") or "") or None
+        if (metadata or {}).get("_interim_send"):
+            from .continuation import pending_current
+            if await asyncio.to_thread(pending_current):
+                content = "I’m checking your request."
+        return await self._sidecar_send(
+            chat_id, self.format_message(content), logical_message_id=logical_id,
+            reply_to=reply_to,
+        )
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -1153,12 +1248,17 @@ class PhotonAdapter(BasePlatformAdapter):
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
         from tools.clarify_gateway import mark_awaiting_text
         mark_awaiting_text(clarify_id)
-        result = await self._sidecar_send_poll(chat_id, question, list(choices))
+        result = await self._sidecar_send_poll(
+            chat_id, question, list(choices), logical_message_id=clarify_id,
+        )
         if not result.success:
-            # Old sidecar without /send-poll or a send error: numbered-text clarify fallback
-            # (base also calls mark_awaiting_text; harmless).
-            logger.warning("[photon] poll clarify failed (%s); falling back to text list", result.error)
-            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+            # A failure can be an ambiguous acknowledgement after iMessage
+            # accepted the poll. A numbered-text fallback would be a second
+            # visible attempt, so report the failure without another send.
+            logger.warning(
+                "[photon] poll clarify failed (%s); suppressing text fallback",
+                result.error,
+            )
         return result
 
     # -- Outbound media (parity with BlueBubbles): URL-based helpers cache to a local path
@@ -1171,27 +1271,27 @@ class PhotonAdapter(BasePlatformAdapter):
             local_path = await cache_image_from_url(image_url)
         except Exception:  # couldn't fetch — send the URL as text
             return await super().send_image(chat_id, image_url, caption, reply_to)
-        return await self._sidecar_send_attachment(chat_id, local_path, caption=caption)
+        return await self._sidecar_send_attachment(chat_id, local_path, caption=caption, reply_to=reply_to, logical_message_id=str((metadata or {}).get("logical_message_id") or "") or None)
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
                               **kwargs) -> SendResult:
-        return await self._sidecar_send_attachment(chat_id, image_path, caption=caption)
+        return await self._sidecar_send_attachment(chat_id, image_path, caption=caption, reply_to=reply_to, logical_message_id=str((metadata or {}).get("logical_message_id") or "") or None)
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
                          **kwargs) -> SendResult:
-        return await self._sidecar_send_attachment(chat_id, audio_path, caption=caption, kind="voice")
+        return await self._sidecar_send_attachment(chat_id, audio_path, caption=caption, kind="voice", reply_to=reply_to, logical_message_id=str((metadata or {}).get("logical_message_id") or "") or None)
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
                          **kwargs) -> SendResult:
-        return await self._sidecar_send_attachment(chat_id, video_path, caption=caption)
+        return await self._sidecar_send_attachment(chat_id, video_path, caption=caption, reply_to=reply_to, logical_message_id=str((metadata or {}).get("logical_message_id") or "") or None)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
                             metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
-        return await self._sidecar_send_attachment(chat_id, file_path, name=file_name, caption=caption)
+        return await self._sidecar_send_attachment(chat_id, file_path, name=file_name, caption=caption, reply_to=reply_to, logical_message_id=str((metadata or {}).get("logical_message_id") or "") or None)
 
     # send_animation: base falls back to send_image (iMessage renders GIFs inline as images).
 
@@ -1336,6 +1436,31 @@ class PhotonAdapter(BasePlatformAdapter):
         return (isinstance(raw, dict) and raw.get("retryable") is False
                 and raw.get("error_class") in ("auth_or_config", "target_not_allowed"))
 
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 0,
+        base_delay: float = 0.0,
+    ) -> SendResult:
+        """Make exactly one Photon transport attempt.
+
+        iMessage acknowledgements are ambiguous: retrying a timed-out request
+        (or sending a fallback body) can create another visible bubble. The
+        sidecar's persistent intent guard independently prevents an identical
+        payload, but this adapter must not issue a second transport attempt.
+        ``max_retries`` and ``base_delay`` remain accepted for the base-adapter
+        interface and are deliberately ignored.
+        """
+        return await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     def _send_retry_is_final(self, result: SendResult) -> bool:
         return self._is_permanent_sidecar_failure(result)  # already carries the user-facing explanation
 
@@ -1344,6 +1469,12 @@ class PhotonAdapter(BasePlatformAdapter):
         richlink() so a rich-link outage doesn't strand a sendable URL."""
         return await self._sidecar_send(
             chat_id, self.format_message(content)[: self.MAX_MESSAGE_LENGTH], richlink=False, markdown=False)
+
+    async def _sidecar_send_richlink(self, space_id: str, url: str, *, logical_message_id: Optional[str] = None) -> SendResult:
+        body = {"spaceId": space_id, "url": url}
+        if logical_message_id:
+            body["logicalMessageId"] = logical_message_id
+        return await self._post_send("/send-richlink", body)
 
     async def _post_send(self, path: str, body: Dict[str, Any], *, structured: bool = False) -> SendResult:
         """POST a send-like body and wrap the outcome as a SendResult. ``structured`` carries
@@ -1362,14 +1493,11 @@ class PhotonAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=data.get("messageId"))
 
     async def _sidecar_send(self, space_id: str, text: str, *, richlink: bool = True,
-                            markdown: bool = True) -> SendResult:
-        rich_url = _richlink_candidate(text) if richlink else None
+                            markdown: bool = True, logical_message_id: Optional[str] = None,
+                            reply_to: Optional[str] = None) -> SendResult:
+        rich_url = _richlink_candidate(text) if richlink and not reply_to else None
         if rich_url:
-            rich_result = await self._post_send("/send-richlink", {"spaceId": space_id, "url": rich_url})
-            if rich_result.success:
-                return rich_result
-            logger.warning("[photon] rich-link send failed, falling back to plain text: %s", rich_result.error)
-            markdown = False
+            return await self._sidecar_send_richlink(space_id, rich_url, logical_message_id=logical_message_id)
         send_markdown = markdown and _markdown_enabled()
         # The format key stays even when the text is stripped: the sidecar owns the builder choice,
         # and an older sidecar without chooseSendFormat must keep rendering natively.
@@ -1378,11 +1506,16 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.warning("[photon] truncating outbound from %d to %d chars", len(text), self.MAX_MESSAGE_LENGTH)
             text = text[: self.MAX_MESSAGE_LENGTH]
         body: Dict[str, Any] = {"spaceId": space_id, "text": text}
+        if reply_to:
+            body["replyTo"] = reply_to
         if send_markdown:  # key omitted when disabled: pre-`format` sidecars still accept
             body["format"] = "markdown"
+        if logical_message_id:
+            body["logicalMessageId"] = logical_message_id
         return await self._post_send("/send", body, structured=True)
 
-    async def _sidecar_send_poll(self, space_id: str, title: str, options: list) -> SendResult:
+    async def _sidecar_send_poll(self, space_id: str, title: str, options: list, *,
+                                 logical_message_id: Optional[str] = None) -> SendResult:
         """POST a native poll to ``/send-poll`` (degrades to a numbered list elsewhere)."""
         opts = [str(o).strip() for o in (options or []) if str(o).strip()]
         if not title or not title.strip():
@@ -1390,11 +1523,14 @@ class PhotonAdapter(BasePlatformAdapter):
         if len(opts) < 2:
             return SendResult(success=False, error="poll needs at least two options")
         body = {"spaceId": space_id, "title": title.strip()[: self.MAX_MESSAGE_LENGTH], "options": opts}
+        if logical_message_id:
+            body["logicalMessageId"] = logical_message_id
         return await self._post_send("/send-poll", body)
 
     async def _sidecar_send_attachment(self, space_id: str, path: str, *, name: Optional[str] = None,
                                        mime_type: Optional[str] = None, caption: Optional[str] = None,
-                                       kind: str = "attachment") -> SendResult:
+                                       kind: str = "attachment", logical_message_id: Optional[str] = None,
+                                       reply_to: Optional[str] = None) -> SendResult:
         """POST a local file to ``/send-attachment``. ``kind="voice"`` sends audio as a voice
         note (downgrades to a plain audio attachment where unsupported)."""
         safe_path = self.validate_media_delivery_path(str(path))  # send_*_file / cron may pass arbitrary strings
@@ -1402,6 +1538,10 @@ class PhotonAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"unsafe or missing attachment path: {path}")
         body = _attachment_body(
             space_id, safe_path, kind=kind, name=name, mime_type=mime_type or _guess_mime(safe_path), caption=caption)
+        if reply_to:
+            body["replyTo"] = reply_to
+        if logical_message_id:
+            body["logicalMessageId"] = logical_message_id
         return await self._post_send("/send-attachment", body, structured=True)
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1538,8 +1678,10 @@ async def _standalone_send(
                 rich_url = _richlink_candidate(message)
                 data = None
                 if rich_url:
-                    _resp, data = await _post("/send-richlink", {"spaceId": chat_id, "url": rich_url})
-                if not data:  # no URL-only message, or the rich-link send failed: plain text
+                    resp, data = await _post("/send-richlink", {"spaceId": chat_id, "url": rich_url})
+                    if not data:
+                        return _standalone_error(resp)
+                else:
                     send_markdown = _markdown_enabled() and not rich_url
                     send_body: Dict[str, Any] = {
                         "spaceId": chat_id, "text": _sidecar_payload_text(message, send_markdown)[:_MAX_MESSAGE_LENGTH]}
